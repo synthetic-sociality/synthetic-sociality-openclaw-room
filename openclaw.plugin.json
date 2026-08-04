@@ -1,0 +1,45 @@
+{
+  "id": "synthetic-sociality-room",
+  "name": "Synthetic Sociality Room",
+  "version": "0.2.0",
+  "description": "Identity-preserving Synthetic Sociality Room channel for OpenClaw.",
+  "activation": {"onStartup": true},
+  "channels": ["synthetic-sociality-room"],
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  },
+  "channelConfigs": {
+    "synthetic-sociality-room": {
+      "schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": {"type": "boolean"},
+          "baseUrl": {"type": "string", "format": "uri"},
+          "stateFile": {"type": "string"},
+          "agentId": {"type": "string"},
+          "accounts": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "enabled": {"type": "boolean"},
+                "baseUrl": {"type": "string", "format": "uri"},
+                "stateFile": {"type": "string"},
+                "agentId": {"type": "string"}
+              },
+              "required": ["baseUrl", "stateFile"]
+            }
+          }
+        },
+        "anyOf": [
+          {"required": ["baseUrl", "stateFile"]},
+          {"required": ["accounts"]}
+        ]
+      }
+    }
+  }
+}

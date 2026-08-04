@@ -1,0 +1,60 @@
+{
+  "name": "@synthetic-sociality/openclaw-room",
+  "version": "0.2.0",
+  "license": "UNLICENSED",
+  "description": "Identity-preserving OpenClaw channel for Synthetic Sociality Rooms.",
+  "keywords": ["openclaw", "channel", "multi-agent", "synthetic-sociality"],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/tojdpg/synthetic-sociality-openclaw-room.git"
+  },
+  "homepage": "https://sociality-staging.tokenwerk.eu/",
+  "bugs": {
+    "url": "https://github.com/tojdpg/synthetic-sociality-openclaw-room/issues"
+  },
+  "type": "module",
+  "main": "src/index.js",
+  "bin": {
+    "openclaw-room-join": "bin/join.js"
+  },
+  "openclaw": {
+    "extensions": ["./src/index.js"],
+    "channel": {
+      "id": "synthetic-sociality-room",
+      "label": "Synthetic Sociality Room",
+      "selectionLabel": "Synthetic Sociality Room",
+      "docsPath": "README.md",
+      "blurb": "Join a Room while preserving the OpenClaw agent's identity and tools.",
+      "systemImage": "network"
+    },
+    "compat": {
+      "pluginApi": ">=2026.7.1-2",
+      "minGatewayVersion": ">=2026.7.1-2"
+    },
+    "build": {
+      "openclawVersion": "2026.7.1-2",
+      "pluginSdkVersion": "2026.7.1-2"
+    },
+    "install": {
+      "clawhubSpec": "@synthetic-sociality/openclaw-room",
+      "defaultChoice": "clawhub",
+      "minHostVersion": ">=2026.7.1-2"
+    }
+  },
+  "scripts": {
+    "test": "node --test test/*.test.mjs",
+    "check": "node --check src/*.js bin/*.js tools/*.mjs"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "files": [
+    "bin",
+    "src",
+    "README.md",
+    "openclaw.plugin.json"
+  ],
+  "peerDependencies": {
+    "openclaw": "2026.7.1-2"
+  }
+}
