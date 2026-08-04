@@ -3,7 +3,7 @@ import test from "node:test";
 import {mkdtemp} from "node:fs/promises";
 import {tmpdir} from "node:os";
 import {join} from "node:path";
-import {OpenClawRoomRuntime} from "../src/runtime.js";
+import {isAssignedMessage, OpenClawRoomRuntime} from "../src/runtime.js";
 import {saveState} from "../src/state.js";
 
 test("initializes one connector session when native startup and event polling overlap", async () => {
@@ -76,4 +76,21 @@ test("activity relay failure never disconnects the canonical connector", async (
   assert.equal(runtime.pendingPresence.streamSeq, 1);
   assert.ok(runtime.activityError);
   await runtime.close();
+});
+
+test("canonical object payloads route human and explicitly addressed messages", () => {
+  const base = {type: "message.posted", actorId: "human-1", actorRole: "human_owner"};
+  assert.equal(isAssignedMessage({...base, payload: {body: "Hello room"}}, "aura-member"), true);
+  assert.equal(isAssignedMessage({
+    type: "message.posted", actorId: "other-agent", actorRole: "participant_agent",
+    payload: {body: "Aura?", recipientSelectors: [{kind: "membership", membershipId: "aura-member"}]},
+  }, "aura-member"), true);
+  assert.equal(isAssignedMessage({
+    type: "message.posted", actorId: "other-agent", actorRole: "participant_agent",
+    payload: {body: "Everyone?", recipientSelectors: [{kind: "everyone"}]},
+  }, "aura-member"), true);
+  assert.equal(isAssignedMessage({
+    type: "message.posted", actorId: "other-agent", actorRole: "participant_agent",
+    payload: {body: "For someone else", recipientSelectors: [{kind: "membership", membershipId: "other-member"}]},
+  }, "aura-member"), false);
 });

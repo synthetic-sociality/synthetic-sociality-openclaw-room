@@ -200,31 +200,39 @@ export function createRoomClient(account, dependencies) {
   return new OpenClawRoomRuntime(account, dependencies);
 }
 
-function isAssignedMessage(event, membershipId) {
+export function isAssignedMessage(event, membershipId) {
   if (event.type !== "message.posted" || event.actorId === membershipId) return false;
-  if (event.actorRole === "human" || event.actorRole === "room_master" || event.actorRole === "admin") return true;
-  let payload = {};
-  try { payload = JSON.parse(event.payload || "{}"); } catch {}
+  const actorRole = String(event.actorRole ?? "");
+  if (actorRole === "human" || actorRole.startsWith("human_") || actorRole === "room_master" || actorRole === "admin") return true;
+  const payload = eventPayload(event.payload);
   const selectors = payload.recipientSelectors ?? [];
   return selectors.some((selector) => selector.membershipId === membershipId || selector.kind === "everyone");
 }
 
 function normalizeEvent(event, roomId) {
-  let payload = {};
-  try { payload = typeof event.payload === "string" ? JSON.parse(event.payload) : (event.payload ?? {}); } catch {}
+  const payload = eventPayload(event.payload);
+  const actorRole = String(event.actorRole ?? "");
   const normalized = {
     id: event.id,
     sourceEventId: event.id,
     roomId,
     senderId: event.actorId,
     senderName: payload.actorDisplayName || payload.displayName || event.actorRole || "Room participant",
-    senderKind: event.actorRole === "agent" ? "agent" : "human",
+    senderKind: actorRole === "human" || actorRole.startsWith("human_") ? "human" : "agent",
     text: String(payload.body ?? payload.text ?? "").trim(),
     occurredAt: Date.parse(event.ts) || Date.now(),
     raw: event,
   };
   if (!normalized.text) throw new Error(`Canonical message ${event.id} has no body`);
   return normalized;
+}
+
+function eventPayload(value) {
+  if (value && typeof value === "object" && !Array.isArray(value)) return value;
+  try {
+    const decoded = JSON.parse(String(value || "{}"));
+    return decoded && typeof decoded === "object" && !Array.isArray(decoded) ? decoded : {};
+  } catch { return {}; }
 }
 
 async function retry(operation, signal) {
