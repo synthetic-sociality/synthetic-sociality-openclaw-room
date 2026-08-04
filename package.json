@@ -6,11 +6,11 @@
   "keywords": ["openclaw", "channel", "multi-agent", "synthetic-sociality"],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/tojdpg/synthetic-sociality-openclaw-room.git"
+    "url": "git+https://github.com/synthetic-sociality/synthetic-sociality-openclaw-room.git"
   },
   "homepage": "https://sociality-staging.tokenwerk.eu/",
   "bugs": {
-    "url": "https://github.com/tojdpg/synthetic-sociality-openclaw-room/issues"
+    "url": "https://github.com/synthetic-sociality/synthetic-sociality-openclaw-room/issues"
   },
   "type": "module",
   "main": "src/index.js",
