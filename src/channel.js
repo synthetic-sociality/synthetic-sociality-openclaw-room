@@ -120,6 +120,7 @@ export function createRoomChannel({makeClient}) {
           ctx.log?.info?.(`[${ctx.accountId}] Room connection signal established (${session.sessionId})`);
           for await (const event of client.assignedTurns(ctx.abortSignal)) {
             ctx.setStatus({...ctx.getStatus(), running: true, connected: true, lastInboundAt: Date.now(), lastError: null});
+            await client.markTurnReading(event.sourceEventId ?? event.id, ctx.abortSignal);
             await runtime.inbound.run({
               channel: ID,
               accountId: ctx.accountId,
@@ -190,6 +191,7 @@ export function createRoomChannel({makeClient}) {
                           replyToId: event.sourceEventId,
                           idempotencyKey: `${event.sourceEventId}:final`,
                           signal: ctx.abortSignal,
+                          sourceEventId: event.sourceEventId,
                         });
                         return {messageIds: [sent.eventId], receipt: receipt(sent.eventId, sent.sentAt), visibleReplySent: true};
                       },

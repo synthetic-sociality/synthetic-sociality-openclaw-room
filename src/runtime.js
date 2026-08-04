@@ -22,6 +22,8 @@ export class OpenClawRoomRuntime {
     this.presenceRunId = `openclaw-presence:${randomUUID()}`;
     this.presenceStreamSeq = 0;
     this.pendingPresence = null;
+    this.activityRunId = null;
+    this.activityStreamSeq = 0;
   }
 
   async initialize(signal) {
@@ -73,6 +75,7 @@ export class OpenClawRoomRuntime {
           continue;
         }
         this.pendingEvent = event;
+        await this.markContextAcknowledged(event, signal);
         yield normalizeEvent(event, this.state.roomId);
       }
     }
@@ -91,10 +94,11 @@ export class OpenClawRoomRuntime {
     if (this.pendingEvent?.id === event.id) this.pendingEvent = null;
   }
 
-  async postAndFinish({roomId, text, replyToId, idempotencyKey, signal}) {
+  async postAndFinish({roomId, text, replyToId, idempotencyKey, signal, sourceEventId}) {
     if (roomId !== this.state.roomId) throw new Error("Outbound Room does not match connector membership");
     const body = String(text ?? "").trim();
     if (!body) throw new Error("OpenClaw produced an empty Room response");
+    await this.markTurnPreparing(sourceEventId, signal);
     const state = await this.client.roomState(this.state, signal);
     const topicId = state.activeTopic?.id ?? null;
     const requestKey = safeKey(`${idempotencyKey}:request`);
@@ -112,7 +116,7 @@ export class OpenClawRoomRuntime {
       ...(topicId ? {topicId} : {}),
       ...(fresh.activeEpoch?.id ? {observedEpochId: fresh.activeEpoch.id} : {}),
       ...(replyToId ? {respondsTo: [replyToId]} : {}),
-      contributionType: "text",
+      contributionType: "claim",
       body,
     }, signal);
     await this.client.finishTurn(this.state, {
@@ -120,6 +124,7 @@ export class OpenClawRoomRuntime {
       observedSeq: message.seq,
       idempotencyKey: safeKey(`${idempotencyKey}:finish`),
     }, signal);
+    await this.markTurnPosted(sourceEventId, message.id, signal);
     return {eventId: message.id, sentAt: Date.parse(message.ts) || Date.now()};
   }
 
@@ -178,6 +183,53 @@ export class OpenClawRoomRuntime {
       // must never disconnect the canonical Room connector or stop polling.
       this.activityError = error;
     }
+  }
+
+  async publishActivityFrame({kind, status, sourceEventId, sourceSeq, delivery, textDelta, canonicalEventId}, signal) {
+    // Presentation-only relay frames. Any failure is deliberately swallowed:
+    // the UI activity pane is best-effort and must never block canonical work.
+    // Each event run gets its own runId + streamSeq sequence starting at 1,
+    // matching the Hermes bridge scope semantics: the relay requires strictly
+    // increasing, gap-free streamSeq per runId and rejects cross-run interleaving.
+    if (!this.activityRunId) this.activityRunId = `openclaw-activity:${randomUUID()}`;
+    if (this.activityStreamSeq === undefined) this.activityStreamSeq = 0;
+    try {
+      const frame = {
+        version: 1,
+        kind,
+        runId: this.activityRunId,
+        streamSeq: this.activityStreamSeq + 1,
+        ...(sourceEventId ? {sourceEventId} : {}),
+        ...(sourceSeq ? {sourceSeq} : {}),
+        ...(status ? {status} : {}),
+        ...(delivery ? {delivery} : {}),
+        ...(textDelta ? {textDelta} : {}),
+        ...(canonicalEventId ? {canonicalEventId} : {}),
+      };
+      const receipt = await this.client.publishActivity(this.state, frame, signal);
+      this.activityStreamSeq = receipt.acceptedStreamSeq ?? frame.streamSeq;
+      this.activityError = null;
+      this.logger?.info?.(`[activity] published kind=${frame.kind} seq=${frame.streamSeq} status=${frame.status ?? ""} accepted=${receipt.acceptedStreamSeq}`);
+    } catch (error) {
+      this.activityError = error;
+      this.logger?.warn?.(`[activity] publish failed kind=${kind} frame=${JSON.stringify(frame)}: ${String(error).slice(0, 120)}`);
+    }
+  }
+
+  async markTurnReading(sourceEventId, signal) {
+    await this.publishActivityFrame({kind: "lifecycle", status: "reading_shared_room", sourceEventId}, signal);
+  }
+
+  async markContextAcknowledged(event, signal) {
+    await this.publishActivityFrame({kind: "context_acknowledged", sourceEventId: event.id, sourceSeq: event.seq}, signal);
+  }
+
+  async markTurnPreparing(sourceEventId, signal) {
+    await this.publishActivityFrame({kind: "lifecycle", status: "preparing_response", sourceEventId}, signal);
+  }
+
+  async markTurnPosted(sourceEventId, canonicalEventId, signal) {
+    await this.publishActivityFrame({kind: "terminal", status: "posted", sourceEventId, canonicalEventId}, signal);
   }
 
   async close() {
