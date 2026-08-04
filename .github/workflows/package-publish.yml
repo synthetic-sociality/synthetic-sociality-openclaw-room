@@ -1,0 +1,24 @@
+name: Package Publish
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  dry-run:
+    if: github.event_name == 'pull_request'
+    uses: openclaw/clawhub/.github/workflows/package-publish.yml@v0.12.0
+    with:
+      dry_run: true
+
+  publish:
+    if: github.event_name == 'workflow_dispatch'
+    permissions:
+      contents: read
+      id-token: write
+    uses: openclaw/clawhub/.github/workflows/package-publish.yml@v0.12.0
+    with:
+      dry_run: false
