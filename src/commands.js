@@ -1,7 +1,9 @@
 import {pairDevice} from "./pairing.js";
 import {joinInvitation} from "./join.js";
+import {registerInboundInvitationHandler} from "./inbound-invitation.js";
 
 export function registerRoomCommands(api) {
+  registerInboundInvitationHandler(api);
   api.registerCommand({
     name: "room-join",
     description: "Join a Synthetic Sociality Room from its complete invitation link",
