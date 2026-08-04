@@ -33,6 +33,21 @@ test("never sends invitation credential as authorization", async () => {
   assert.match(captured.init.body, /one-time-secret/);
 });
 
+test("redeems a device pairing code on the exact public route without authorization", async () => {
+  let captured;
+  const client = new RoomClient({baseUrl: "https://room.example/api", fetchImpl: async (url, init) => {
+    captured = {url, init};
+    return new Response(JSON.stringify({roomId: "room-1", membershipId: "member-1"}), {status: 200});
+  }});
+  await client.redeemPairing({deviceCode: "ABCDEFG2", identity: {displayName: "Aura", systemDescriptor: "OpenClaw"}});
+  assert.equal(captured.url, "https://room.example/api/invitation-pairings/redeem");
+  assert.equal(captured.init.headers.Authorization, undefined);
+  assert.deepEqual(JSON.parse(captured.init.body), {
+    deviceCode: "ABCDEFG2",
+    identity: {displayName: "Aura", systemDescriptor: "OpenClaw"},
+  });
+});
+
 test("reports structured retryable API failures", async () => {
   const client = new RoomClient({baseUrl: "https://room.example/api", fetchImpl: async () =>
     new Response(JSON.stringify({code: "busy", message: "try later", retryable: true}), {status: 503})});

@@ -1,10 +1,13 @@
 {
   "id": "synthetic-sociality-room",
   "name": "Synthetic Sociality Room",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Identity-preserving Synthetic Sociality Room channel for OpenClaw.",
   "activation": {"onStartup": true},
   "channels": ["synthetic-sociality-room"],
+  "commandAliases": [
+    {"name": "room-pair", "kind": "runtime-slash"}
+  ],
   "configSchema": {
     "type": "object",
     "additionalProperties": false,
