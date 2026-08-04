@@ -83,6 +83,12 @@ export class RoomClient {
     });
   }
 
+  publishActivity(session, activity, signal) {
+    return this.request(`/rooms/${encodeURIComponent(session.roomId)}/activity`, {
+      method: "POST", body: activity, credential: session.credential, signal, expected: [202],
+    });
+  }
+
   readEvents(session, after, {wait = 0, signal} = {}) {
     const query = new URLSearchParams({after: String(after), limit: "100"});
     if (wait > 0) query.set("waitSeconds", String(wait));

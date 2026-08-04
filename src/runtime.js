@@ -14,12 +14,27 @@ export class OpenClawRoomRuntime {
     this.fetchImpl = fetchImpl;
     this.closed = false;
     this.connectorSession = null;
+    this.initializeTask = null;
     this.state = null;
     this.client = null;
     this.heartbeatAbort = new AbortController();
+    this.presenceRunId = `openclaw-presence:${randomUUID()}`;
+    this.presenceStreamSeq = 0;
+    this.pendingPresence = null;
   }
 
   async initialize(signal) {
+    if (this.connectorSession && this.client && this.state) return this.connectorSession;
+    if (this.initializeTask) return this.initializeTask;
+    this.initializeTask = this.initializeOnce(signal);
+    try {
+      return await this.initializeTask;
+    } finally {
+      this.initializeTask = null;
+    }
+  }
+
+  async initializeOnce(signal) {
     this.state = await waitForState(this.account.stateFile, signal);
     if (this.account.baseUrl && this.state.baseUrl !== this.account.baseUrl) throw new Error("Configured Room origin does not match private reconnect state");
     this.client = new RoomClient({baseUrl: this.state.baseUrl, credential: this.state.credential, fetchImpl: this.fetchImpl});
@@ -35,7 +50,9 @@ export class OpenClawRoomRuntime {
         modelDescriptor: "host-selected",
       },
     }, signal);
+    await this.publishPresence(signal);
     this.runHeartbeat();
+    return this.connectorSession;
   }
 
   async *assignedTurns(signal) {
@@ -116,11 +133,37 @@ export class OpenClawRoomRuntime {
       while (!this.closed && !this.heartbeatAbort.signal.aborted) {
         await sleep(interval, this.heartbeatAbort.signal);
         await retry(() => this.client.heartbeat(this.state, this.connectorSession.sessionId, this.heartbeatAbort.signal), this.heartbeatAbort.signal);
+        await this.publishPresence(this.heartbeatAbort.signal);
       }
     };
     this.heartbeatTask = loop().catch((error) => {
       if (!this.closed && !this.heartbeatAbort.signal.aborted) this.heartbeatError = error;
     });
+  }
+
+  async publishPresence(signal) {
+    // The connector-session heartbeat is durable reachability evidence. The
+    // separate activity heartbeat is deliberately ephemeral and is what the
+    // Room UI uses for its truthful live signal. Keep an unconfirmed frame so
+    // a lost response retries the exact immutable sequence instead of creating
+    // a gap in the relay.
+    const activity = this.pendingPresence ?? {
+      version: 1,
+      kind: "heartbeat",
+      runId: this.presenceRunId,
+      streamSeq: this.presenceStreamSeq + 1,
+    };
+    this.pendingPresence = activity;
+    try {
+      await this.client.publishActivity(this.state, activity, signal);
+      this.presenceStreamSeq = activity.streamSeq;
+      this.pendingPresence = null;
+      this.activityError = null;
+    } catch (error) {
+      // Activity is a non-canonical presentation relay. Its temporary absence
+      // must never disconnect the canonical Room connector or stop polling.
+      this.activityError = error;
+    }
   }
 
   async close() {

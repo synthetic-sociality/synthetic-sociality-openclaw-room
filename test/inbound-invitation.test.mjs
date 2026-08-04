@@ -7,6 +7,7 @@ const link = `https://room.example/invitations/inv-1#secret=${"s".repeat(32)}`;
 test("claims an exact invitation before the language model and restarts after joining", async () => {
   let handler;
   let joined;
+  let activation;
   let restarted = 0;
   const api = {on(name, value, options) {
     assert.equal(name, "inbound_claim");
@@ -15,12 +16,14 @@ test("claims an exact invitation before the language model and restarts after jo
   }};
   registerInboundInvitationHandler(api, {
     review: async () => ({consumable: true, proposedAgentName: "Aura", roomTitle: "Trends in AI"}),
-    join: async (input) => { joined = input; return {roomId: "room-1"}; },
+    join: async (input) => { joined = input; return {roomId: "room-1", baseUrl: "https://room.example/api", stateFile: "/private/state.json"}; },
+    activate: async (input) => { activation = input; },
     restart: () => { restarted += 1; },
   });
 
   const result = await handler({content: link, bodyForAgent: link, commandAuthorized: true});
   assert.deepEqual(joined, {invitationUrl: link, displayName: "Aura"});
+  assert.deepEqual(activation, {baseUrl: "https://room.example/api", stateFile: "/private/state.json"});
   assert.equal(restarted, 1);
   assert.equal(result.handled, true);
   assert.match(result.reply.text, /reconnect automatically/);

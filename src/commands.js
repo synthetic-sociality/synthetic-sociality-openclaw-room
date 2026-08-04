@@ -1,9 +1,15 @@
 import {pairDevice} from "./pairing.js";
 import {joinInvitation} from "./join.js";
 import {registerInboundInvitationHandler} from "./inbound-invitation.js";
+import {activateRoomChannel, healManagedRoomChannel, scheduleGatewayRestart} from "./activation.js";
 
-export function registerRoomCommands(api) {
+export function registerRoomCommands(api, options = {}) {
+  const join = options.join ?? joinInvitation;
+  const activate = options.activate ?? activateRoomChannel;
+  const restart = options.restart ?? (() => scheduleGatewayRestart({logger: api.logger}));
+  const heal = options.heal ?? (() => healManagedRoomChannel({activate, restart}));
   registerInboundInvitationHandler(api);
+  void heal().catch((error) => api.logger?.error?.(`Room connector activation recovery failed: ${String(error)}`));
   api.registerCommand({
     name: "room-join",
     description: "Join a Synthetic Sociality Room from its complete invitation link",
@@ -15,11 +21,10 @@ export function registerRoomCommands(api) {
     handler: async (ctx) => {
       try {
         const parsed = parseJoinCommand(ctx.args ?? "");
-        const result = await joinInvitation(parsed);
-        const activation = result.accountId === "default"
-          ? "The connector is activating automatically."
-          : "Send /restart once to activate this additional Room account.";
-        return {text: `Joined Room ${result.roomId} as ${parsed.displayName}. ${activation}`};
+        const result = await join(parsed);
+        await activate({baseUrl: result.baseUrl, stateFile: result.stateFile});
+        restart();
+        return {text: `Joined Room ${result.roomId} as ${parsed.displayName}. The Room connector is restarting and will reconnect automatically.`};
       } catch (error) {
         return {text: joinErrorMessage(error)};
       }

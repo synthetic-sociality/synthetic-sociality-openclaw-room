@@ -1,6 +1,6 @@
 {
   "name": "@synthetic-sociality/openclaw-room",
-  "version": "0.2.4",
+  "version": "0.2.10",
   "license": "UNLICENSED",
   "description": "Identity-preserving OpenClaw channel for Synthetic Sociality Rooms.",
   "keywords": ["openclaw", "channel", "multi-agent", "synthetic-sociality"],
@@ -8,7 +8,7 @@
     "type": "git",
     "url": "git+https://github.com/synthetic-sociality/synthetic-sociality-openclaw-room.git"
   },
-  "homepage": "https://sociality-staging.tokenwerk.eu/",
+  "homepage": "https://github.com/synthetic-sociality/synthetic-sociality-openclaw-room",
   "bugs": {
     "url": "https://github.com/synthetic-sociality/synthetic-sociality-openclaw-room/issues"
   },

@@ -1,13 +1,12 @@
-import {spawn} from "node:child_process";
 import {parseInvitationURL} from "./invitation.js";
 import {joinInvitation} from "./join.js";
 import {RoomClient} from "./room-client.js";
-
-const RESTART_DELAY_MS = 1_500;
+import {activateRoomChannel, scheduleGatewayRestart} from "./activation.js";
 
 export function registerInboundInvitationHandler(api, options = {}) {
   const join = options.join ?? joinInvitation;
   const review = options.review ?? reviewInvitation;
+  const activate = options.activate ?? activateRoomChannel;
   const restart = options.restart ?? (() => scheduleGatewayRestart({logger: api.logger}));
 
   api.on("inbound_claim", async (event) => {
@@ -31,6 +30,7 @@ export function registerInboundInvitationHandler(api, options = {}) {
       if (!displayName) throw new Error("Invitation does not specify the agent identity");
 
       const result = await join({invitationUrl, displayName});
+      await activate({baseUrl: result.baseUrl, stateFile: result.stateFile});
       restart();
       return {
         handled: true,
@@ -62,19 +62,6 @@ export async function reviewInvitation(invitationUrl, {fetchImpl = globalThis.fe
   const review = await client.reviewUniversalInvitation({invitationId: invitation.invitationId, signal});
   if (review.consumable !== true) throw new Error("Invitation is no longer available");
   return review;
-}
-
-export function scheduleGatewayRestart({command = process.env.OPENCLAW_BIN || "openclaw", delayMs = RESTART_DELAY_MS, logger} = {}) {
-  const timer = setTimeout(() => {
-    const child = spawn(command, ["gateway", "restart"], {
-      detached: true,
-      stdio: "ignore",
-      env: process.env,
-    });
-    child.on("error", (error) => logger?.error?.(`Room connector restart failed: ${String(error)}`));
-    child.unref();
-  }, delayMs);
-  timer.unref?.();
 }
 
 function invitationErrorMessage(error) {
