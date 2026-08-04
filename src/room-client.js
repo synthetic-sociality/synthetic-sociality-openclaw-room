@@ -53,6 +53,24 @@ export class RoomClient {
     });
   }
 
+  reviewUniversalInvitation({invitationId, signal}) {
+    return this.request(`/invitations/${encodeURIComponent(invitationId)}/review`, {
+      credential: "", signal, expected: [200],
+    });
+  }
+
+  startPairing({invitationId, invitationSecret, signal}) {
+    return this.request(`/invitations/${encodeURIComponent(invitationId)}/pairings`, {
+      method: "POST", body: {invitationSecret}, credential: "", signal, expected: [201],
+    });
+  }
+
+  redeemPairing({deviceCode, identity, signal}) {
+    return this.request("/invitation-pairings/redeem", {
+      method: "POST", body: {deviceCode, identity}, credential: "", signal, expected: [200],
+    });
+  }
+
   register(session, registration, signal) {
     return this.request(`/rooms/${encodeURIComponent(session.roomId)}/connector/sessions`, {
       method: "POST", body: registration, credential: session.credential, signal, expected: [200],

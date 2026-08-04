@@ -1,6 +1,10 @@
 import {defineChannelPluginEntry} from "openclaw/plugin-sdk/channel-core";
 import {defineChannelMessageAdapter} from "openclaw/plugin-sdk/channel-message";
 import {buildChannelInboundEventContext} from "openclaw/plugin-sdk/channel-inbound";
+import {existsSync, readFileSync, readdirSync, lstatSync} from "node:fs";
+import {join} from "node:path";
+import {defaultStateDirectory, validateState} from "./state.js";
+import {registerRoomCommands} from "./commands.js";
 
 const ID = "synthetic-sociality-room";
 
@@ -13,15 +17,37 @@ const receipt = (eventId, sentAt) => ({
 
 function channelConfig(cfg) { return cfg?.channels?.[ID] ?? {}; }
 
+function managedAccounts() {
+  const directory = defaultStateDirectory();
+  try {
+    return readdirSync(directory, {withFileTypes: true})
+      .filter((entry) => entry.isFile() && !entry.isSymbolicLink() && entry.name.endsWith(".json"))
+      .map((entry) => entry.name.slice(0, -5));
+  } catch { return []; }
+}
+
+function managedAccount(accountId) {
+  const stateFile = join(defaultStateDirectory(), `${accountId}.json`);
+  if (!existsSync(stateFile)) return null;
+  try {
+    const stat = lstatSync(stateFile);
+    if (!stat.isFile() || stat.isSymbolicLink() || (stat.mode & 0o077) !== 0) return null;
+    const state = JSON.parse(readFileSync(stateFile, "utf8"));
+    validateState(state);
+    return {baseUrl: state.baseUrl, stateFile};
+  } catch { return null; }
+}
+
 function resolveAccount(cfg, accountId = "default") {
   const section = channelConfig(cfg);
   const raw = section.accounts?.[accountId] ?? section;
+  const managed = managedAccount(accountId);
   return {
     accountId,
     enabled: raw.enabled !== false,
-    configured: typeof raw.baseUrl === "string" && typeof raw.stateFile === "string",
-    baseUrl: String(raw.baseUrl ?? ""),
-    stateFile: String(raw.stateFile ?? ""),
+    configured: accountId === "default" || managed !== null || (typeof raw.baseUrl === "string" && typeof raw.stateFile === "string"),
+    baseUrl: managed?.baseUrl ?? String(raw.baseUrl ?? ""),
+    stateFile: managed?.stateFile ?? String(raw.stateFile ?? (accountId === "default" ? join(defaultStateDirectory(), "default.json") : "")),
     agentId: String(raw.agentId ?? "main"),
   };
 }
@@ -60,7 +86,7 @@ export function createRoomChannel({makeClient}) {
     },
     capabilities: {chatTypes: ["group"], reply: true, media: false, reactions: false, blockStreaming: true},
     config: {
-      listAccountIds: (cfg) => Object.keys(channelConfig(cfg).accounts ?? {default: true}),
+      listAccountIds: (cfg) => [...new Set(["default", ...Object.keys(channelConfig(cfg).accounts ?? {}), ...managedAccounts()])],
       resolveAccount: (cfg, accountId) => resolveAccount(cfg, accountId ?? "default"),
       isEnabled: (account) => account.enabled,
       isConfigured: (account) => account.configured,
@@ -181,5 +207,6 @@ export function createRoomChannel({makeClient}) {
     name: "Synthetic Sociality Room",
     description: "Native OpenClaw channel for Synthetic Sociality Rooms",
     plugin,
+    registerFull: registerRoomCommands,
   });
 }

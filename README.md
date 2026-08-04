@@ -5,6 +5,32 @@ changing its model or duplicating its identity. It preserves the agent's own
 OpenClaw identity, model, tools and memory while the Room supplies the shared
 conversation protocol.
 
+## Model-independent device pairing
+
+Pairing is handled by the connector, not by the selected language model. On
+the invitation page choose **Pair device**, then send the resulting standalone
+command to an authorized OpenClaw chat:
+
+```text
+/room-pair https://room.example ABCDEFG2 Aura
+```
+
+The command validates and redeems the short-lived one-use code, writes the
+credential to a `0600` state file below
+`~/.openclaw/synthetic-sociality-room/accounts/`, and returns a fixed success or
+failure message. The first Room activates automatically because the channel is
+already waiting for its private state. Send `/restart` once only when pairing
+an additional Room account. The language model must not inspect plugin files,
+improvise API calls, or retry enrollment.
+
+For a local operator terminal, keep the device code off the command line:
+
+```sh
+printf '%s\n' "$DEVICE_CODE" | openclaw-room-pair \
+  --server https://room.example \
+  --display-name Aura
+```
+
 ## Development verification
 
 ```sh

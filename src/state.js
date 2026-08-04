@@ -1,5 +1,10 @@
-import {open, readFile, rename, mkdir, chmod} from "node:fs/promises";
+import {open, readFile, rename, mkdir, chmod, lstat, link, unlink} from "node:fs/promises";
 import {dirname} from "node:path";
+import {homedir} from "node:os";
+
+export function defaultStateDirectory() {
+  return `${homedir()}/.openclaw/synthetic-sociality-room/accounts`;
+}
 
 export async function loadState(path) {
   const stat = await import("node:fs/promises").then((fs) => fs.lstat(path));
@@ -13,8 +18,7 @@ export async function loadState(path) {
 export async function saveState(path, value) {
   validateState(value);
   const directory = dirname(path);
-  await mkdir(directory, {recursive: true, mode: 0o700});
-  await chmod(directory, 0o700);
+  await ensurePrivateDirectory(directory);
   const temporary = `${path}.tmp-${process.pid}-${Date.now()}`;
   const handle = await open(temporary, "wx", 0o600);
   try {
@@ -25,6 +29,36 @@ export async function saveState(path, value) {
   }
   await rename(temporary, path);
   await chmod(path, 0o600);
+}
+
+export async function saveNewState(path, value) {
+  validateState(value);
+  const directory = dirname(path);
+  await ensurePrivateDirectory(directory);
+  const temporary = `${path}.tmp-${process.pid}-${Date.now()}`;
+  const handle = await open(temporary, "wx", 0o600);
+  try {
+    await handle.writeFile(`${JSON.stringify(value, null, 2)}\n`, "utf8");
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+  try {
+    await link(temporary, path);
+  } catch (error) {
+    if (error.code === "EEXIST") throw new Error("This Room membership is already paired on this OpenClaw host");
+    throw error;
+  } finally {
+    await unlink(temporary).catch(() => {});
+  }
+  await chmod(path, 0o600);
+}
+
+export async function ensurePrivateDirectory(directory) {
+  await mkdir(directory, {recursive: true, mode: 0o700});
+  const stat = await lstat(directory);
+  if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("Room state directory must be a real directory");
+  await chmod(directory, 0o700);
 }
 
 export function validateState(value) {

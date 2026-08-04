@@ -20,8 +20,8 @@ export class OpenClawRoomRuntime {
   }
 
   async initialize(signal) {
-    this.state = await loadState(this.account.stateFile);
-    if (this.state.baseUrl !== this.account.baseUrl) throw new Error("Configured Room origin does not match private reconnect state");
+    this.state = await waitForState(this.account.stateFile, signal);
+    if (this.account.baseUrl && this.state.baseUrl !== this.account.baseUrl) throw new Error("Configured Room origin does not match private reconnect state");
     this.client = new RoomClient({baseUrl: this.state.baseUrl, credential: this.state.credential, fetchImpl: this.fetchImpl});
     this.connectorSession = await this.client.register(this.state, {
       clientInstanceId: this.state.clientInstanceId,
@@ -127,6 +127,15 @@ export class OpenClawRoomRuntime {
     this.closed = true;
     this.heartbeatAbort.abort();
     await this.heartbeatTask?.catch(() => {});
+  }
+}
+
+async function waitForState(path, signal) {
+  while (true) {
+    try { return await loadState(path); } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+      await sleep(750, signal);
+    }
   }
 }
 
