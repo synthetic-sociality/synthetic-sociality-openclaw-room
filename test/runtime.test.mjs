@@ -19,12 +19,17 @@ test("initializes one connector session when native startup and event polling ov
     cursor: 0,
   });
   let registrations = 0;
+  let connectorHeartbeats = 0;
   const activities = [];
   const runtime = new OpenClawRoomRuntime({accountId: "default", stateFile, baseUrl: "https://room.example/api"}, {
     fetchImpl: async (url, init) => {
       if (url.endsWith("/connector/sessions")) {
         registrations += 1;
         return new Response(JSON.stringify({sessionId: "session-1", heartbeatIntervalSeconds: 60}), {status: 200});
+      }
+      if (url.endsWith("/heartbeat")) {
+        connectorHeartbeats += 1;
+        return new Response(JSON.stringify({sessionId: "session-1"}), {status: 200});
       }
       if (url.endsWith("/activity")) {
         activities.push(JSON.parse(init.body));
@@ -45,6 +50,10 @@ test("initializes one connector session when native startup and event polling ov
     runId: runtime.presenceRunId,
     streamSeq: 1,
   });
+  await runtime.maintainPresence();
+  assert.equal(connectorHeartbeats, 1);
+  assert.equal(activities.length, 2);
+  assert.equal(activities[1].streamSeq, 2);
   await runtime.close();
 });
 

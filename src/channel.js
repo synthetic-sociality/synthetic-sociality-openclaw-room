@@ -104,7 +104,7 @@ export function createRoomChannel({makeClient}) {
       startAccount: async (ctx) => {
         const runtime = ctx.channelRuntime;
         if (!runtime) throw new Error("OpenClaw channelRuntime is unavailable");
-        const client = makeClient(ctx.account);
+        const client = makeClient(ctx.account, {logger: ctx.log});
         let registered = false;
         ctx.setStatus({...ctx.getStatus(), running: true, connected: false, lastError: null});
         try {

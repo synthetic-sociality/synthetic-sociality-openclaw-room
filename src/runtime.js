@@ -9,9 +9,10 @@ const sleep = (milliseconds, signal) => new Promise((resolve, reject) => {
 });
 
 export class OpenClawRoomRuntime {
-  constructor(account, {fetchImpl = globalThis.fetch} = {}) {
+  constructor(account, {fetchImpl = globalThis.fetch, logger = null} = {}) {
     this.account = account;
     this.fetchImpl = fetchImpl;
+    this.logger = logger;
     this.closed = false;
     this.connectorSession = null;
     this.initializeTask = null;
@@ -51,6 +52,8 @@ export class OpenClawRoomRuntime {
       },
     }, signal);
     await this.publishPresence(signal);
+    if (this.activityError) this.logger?.warn?.(`Room activity signal unavailable: ${String(this.activityError)}`);
+    else this.logger?.info?.("Room activity signal established");
     this.runHeartbeat();
     return this.connectorSession;
   }
@@ -59,6 +62,10 @@ export class OpenClawRoomRuntime {
     await this.initialize(signal);
     while (!signal.aborted && !this.closed) {
       const page = await retry(() => this.client.readEvents(this.state, this.state.cursor, {wait: 20, signal}), signal);
+      // Long-poll completion is an independent liveness clock. Maintaining
+      // presence here prevents a failed timer task from leaving a locally
+      // green but remotely expired connector.
+      await retry(() => this.maintainPresence(signal), signal);
       for (const event of page.events ?? []) {
         if (event.seq <= this.state.cursor) continue;
         if (!isAssignedMessage(event, this.state.membershipId)) {
@@ -132,13 +139,20 @@ export class OpenClawRoomRuntime {
     const loop = async () => {
       while (!this.closed && !this.heartbeatAbort.signal.aborted) {
         await sleep(interval, this.heartbeatAbort.signal);
-        await retry(() => this.client.heartbeat(this.state, this.connectorSession.sessionId, this.heartbeatAbort.signal), this.heartbeatAbort.signal);
-        await this.publishPresence(this.heartbeatAbort.signal);
+        await retry(() => this.maintainPresence(this.heartbeatAbort.signal), this.heartbeatAbort.signal);
       }
     };
     this.heartbeatTask = loop().catch((error) => {
-      if (!this.closed && !this.heartbeatAbort.signal.aborted) this.heartbeatError = error;
+      if (!this.closed && !this.heartbeatAbort.signal.aborted) {
+        this.heartbeatError = error;
+        this.logger?.error?.(`Room heartbeat loop stopped: ${String(error)}`);
+      }
     });
+  }
+
+  async maintainPresence(signal) {
+    await this.client.heartbeat(this.state, this.connectorSession.sessionId, signal);
+    await this.publishPresence(signal);
   }
 
   async publishPresence(signal) {
