@@ -7,6 +7,7 @@ import {defaultStateDirectory, validateState} from "./state.js";
 import {registerRoomCommands} from "./commands.js";
 import {markChannelActive, markChannelInactive, registerPresenceFallback} from "./presence-fallback.js";
 import {resolveAccountSelection} from "./account.js";
+import {ROOM_SOURCE_REPLY_DELIVERY_MODE} from "./reply-policy.js";
 
 const ID = "synthetic-sociality-room";
 
@@ -152,7 +153,7 @@ export function createRoomChannel({makeClient}) {
                       replyTarget: event.roomId,
                       deliveryTarget: event.roomId,
                       replyToId: event.sourceEventId,
-                      sourceReplyDeliveryMode: "channel",
+                      sourceReplyDeliveryMode: ROOM_SOURCE_REPLY_DELIVERY_MODE,
                     },
                     message: {
                       rawBody: input.rawText,
