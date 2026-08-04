@@ -7,7 +7,9 @@ import {defaultStateDirectory, validateState} from "./state.js";
 import {registerRoomCommands} from "./commands.js";
 import {markChannelActive, markChannelInactive, registerPresenceFallback} from "./presence-fallback.js";
 import {resolveAccountSelection} from "./account.js";
-import {ROOM_SOURCE_REPLY_DELIVERY_MODE} from "./reply-policy.js";
+import {
+  roomReplyDeliveryPolicy,
+} from "./reply-policy.js";
 
 const ID = "synthetic-sociality-room";
 
@@ -105,6 +107,7 @@ export function createRoomChannel({makeClient}) {
       startAccount: async (ctx) => {
         const runtime = ctx.channelRuntime;
         if (!runtime) throw new Error("OpenClaw channelRuntime is unavailable");
+        const replyPolicy = roomReplyDeliveryPolicy();
         const client = makeClient(ctx.account, {logger: ctx.log});
         let registered = false;
         ctx.setStatus({...ctx.getStatus(), running: true, connected: false, lastError: null});
@@ -153,7 +156,7 @@ export function createRoomChannel({makeClient}) {
                       replyTarget: event.roomId,
                       deliveryTarget: event.roomId,
                       replyToId: event.sourceEventId,
-                      sourceReplyDeliveryMode: ROOM_SOURCE_REPLY_DELIVERY_MODE,
+                      ...replyPolicy.replyPlan,
                     },
                     message: {
                       rawBody: input.rawText,
@@ -175,6 +178,7 @@ export function createRoomChannel({makeClient}) {
                     ctxPayload,
                     recordInboundSession: runtime.session.recordInboundSession,
                     dispatchReplyWithBufferedBlockDispatcher: runtime.reply.dispatchReplyWithBufferedBlockDispatcher,
+                    replyOptions: replyPolicy.replyOptions,
                     delivery: {
                       durable: {to: event.roomId, replyToId: event.sourceEventId},
                       deliver: async (payload) => {
