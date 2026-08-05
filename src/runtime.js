@@ -193,8 +193,7 @@ export class OpenClawRoomRuntime {
     // increasing, gap-free streamSeq per runId and rejects cross-run interleaving.
     if (!this.activityRunId) this.activityRunId = `openclaw-activity:${randomUUID()}`;
     if (this.activityStreamSeq === undefined) this.activityStreamSeq = 0;
-    try {
-      const frame = {
+    const frame = {
         version: 1,
         kind,
         runId: this.activityRunId,
@@ -205,7 +204,8 @@ export class OpenClawRoomRuntime {
         ...(delivery ? {delivery} : {}),
         ...(textDelta ? {textDelta} : {}),
         ...(canonicalEventId ? {canonicalEventId} : {}),
-      };
+    };
+    try {
       const receipt = await this.client.publishActivity(this.state, frame, signal);
       this.activityStreamSeq = receipt.acceptedStreamSeq ?? frame.streamSeq;
       this.activityError = null;

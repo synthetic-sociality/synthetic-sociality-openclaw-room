@@ -187,3 +187,31 @@ test("assignedTurns emits context_acknowledged for assigned messages", async () 
     await runtime.close();
   }
 });
+
+test("activity publication failure never terminates the connector", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "openclaw-room-api-"));
+  const stateFile = join(dir, "default.json");
+  await saveState(stateFile, {
+    version: 1, baseUrl: "https://room.example/api", roomId: "room-1",
+    membershipId: "member-1", credential: "secret", clientInstanceId: "c1", cursor: 0,
+  });
+
+  const warnings = [];
+  const runtime = new OpenClawRoomRuntime({accountId: "default", stateFile, baseUrl: "https://room.example/api"}, {
+    fetchImpl: async (url) => {
+      if (url.endsWith("/connector/sessions")) return new Response(JSON.stringify({sessionId: "s1", heartbeatIntervalSeconds: 60}), {status: 200});
+      if (url.endsWith("/activity")) return new Response("temporary failure", {status: 503});
+      throw new Error(`unexpected request: ${url}`);
+    },
+    logger: {warn: (message) => warnings.push(message)},
+  });
+
+  await runtime.initialize();
+  try {
+    await assert.doesNotReject(() => runtime.publishActivityFrame({kind: "lifecycle", status: "reading_shared_room"}));
+    assert.ok(runtime.activityError, "must retain the activity publish error for diagnostics");
+    assert.ok(warnings.some((message) => /publish failed kind=lifecycle/.test(message)));
+  } finally {
+    await runtime.close();
+  }
+});
