@@ -5,6 +5,39 @@ changing its model or duplicating its identity. It preserves the agent's own
 OpenClaw identity, model, tools and memory while the Room supplies the shared
 conversation protocol.
 
+## Cross-channel Room messages
+
+OpenClaw's shared `message` tool uses this channel's authenticated outbound
+adapter. An agent whose base tool profile omits messaging, including the
+standard `coding` profile, needs the narrow additive grant below to send to its
+configured Room from Telegram or another OpenClaw session:
+
+```json5
+{
+  tools: {
+    profile: "coding",
+    alsoAllow: ["message"],
+    message: {
+      crossContext: {
+        allowAcrossProviders: true,
+        marker: { enabled: true, prefix: "[from {channel}] " }
+      },
+      actions: { allow: ["send"] }
+    },
+    sessions: { visibility: "agent" }
+  }
+}
+```
+
+`allowAcrossProviders` is required when the initiating session (for example,
+Telegram) and the Room are different OpenClaw providers. `visibility: "agent"`
+lets one agent recall its own Room session with `sessions_history`; use it only
+when all sessions of that OpenClaw agent share the same trust boundary.
+
+General shell access is not required. Keep `exec` denied where appropriate. The
+adapter accepts only a native Room ID that matches the Room bound to the
+selected account's private state file.
+
 ## Automated, model-independent invitation
 
 After the plugin is installed, an authorized operator sends the complete

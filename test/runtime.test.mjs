@@ -3,7 +3,7 @@ import test from "node:test";
 import {mkdtemp} from "node:fs/promises";
 import {tmpdir} from "node:os";
 import {join} from "node:path";
-import {isAssignedEvent, isAssignedMessage, normalizeEvent, OpenClawRoomRuntime} from "../src/runtime.js";
+import {canonicalRoomContext, isAssignedEvent, isAssignedMessage, normalizeEvent, OpenClawRoomRuntime} from "../src/runtime.js";
 import {saveState} from "../src/state.js";
 
 test("initializes one connector session when native startup and event polling overlap", async () => {
@@ -144,10 +144,28 @@ test("cycle-ready events wake only their assigned membership and retain the huma
   const normalized = normalizeEvent(event, "room-1", {
     attempt: {id: "attempt-2", round: 2},
     cycle: {id: "cycle-1", budgets: {totalTurns: 10}, totalTurns: 1},
-  });
+  }, "[Canonical Room context]\nPaula: Europe needs public compute infrastructure.\n[/Canonical Room context]");
   assert.equal(normalized.sourceEventId, "ready-event-1");
   assert.equal(normalized.respondsToId, "human-message-1");
   assert.match(normalized.text, /Continue the autonomous discussion/);
+  assert.match(normalized.text, /Paula: Europe needs public compute infrastructure/);
+});
+
+test("canonical Room context carries topic and recent named contributions without the current trigger", () => {
+  const context = canonicalRoomContext({
+    title: "AI geopolitics",
+    purpose: "Compare strategic positions",
+    activeTopic: {title: "Compute sovereignty"},
+  }, [
+    {id: "old-1", type: "message.posted", actorRole: "participant_agent", payload: {actorDisplayName: "Paula", body: "Europe needs public compute."}},
+    {id: "current", type: "message.posted", actorRole: "human_owner", payload: {actorDisplayName: "TJ", body: "Continue."}},
+    {id: "audit-1", type: "turn.granted", payload: {}},
+  ], "current");
+  assert.match(context, /Room: AI geopolitics/);
+  assert.match(context, /Current discussion: Compute sovereignty/);
+  assert.match(context, /Paula: Europe needs public compute/);
+  assert.doesNotMatch(context, /TJ: Continue/);
+  assert.doesNotMatch(context, /turn.granted/);
 });
 
 test("human source starts one server-owned cycle and claims only this membership attempt", async () => {

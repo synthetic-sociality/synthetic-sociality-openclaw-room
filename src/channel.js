@@ -3,10 +3,12 @@ import {defineChannelMessageAdapter} from "openclaw/plugin-sdk/channel-message";
 import {buildChannelInboundEventContext} from "openclaw/plugin-sdk/channel-inbound";
 import {existsSync, readFileSync, readdirSync, lstatSync} from "node:fs";
 import {join} from "node:path";
-import {defaultStateDirectory, validateState} from "./state.js";
+import {defaultStateDirectory, loadState, validateState} from "./state.js";
 import {registerRoomCommands} from "./commands.js";
 import {markChannelActive, markChannelInactive, registerPresenceFallback} from "./presence-fallback.js";
 import {resolveAccountSelection} from "./account.js";
+import {looksLikeRoomId, normalizeRoomTarget, resolveConfiguredRoomTarget} from "./target.js";
+import {outboundIdempotencyKey} from "./outbound.js";
 import {
   roomReplyDeliveryPolicy,
 } from "./reply-policy.js";
@@ -75,7 +77,7 @@ export function createRoomChannel({makeClient}) {
           roomId: ctx.to,
           text: ctx.text,
           replyToId: ctx.replyToId,
-          idempotencyKey: ctx.deliveryQueueId ?? `${ctx.replyToId ?? "outbound"}:text`,
+          idempotencyKey: outboundIdempotencyKey(ctx.deliveryQueueId),
           signal: ctx.signal,
         });
         return {messageId: sent.eventId, receipt: receipt(sent.eventId, sent.sentAt)};
@@ -95,6 +97,20 @@ export function createRoomChannel({makeClient}) {
       showInSetup: true,
     },
     capabilities: {chatTypes: ["group"], reply: true, media: false, reactions: false, blockStreaming: true},
+    messaging: {
+      targetPrefixes: [ID, "room"],
+      normalizeTarget: normalizeRoomTarget,
+      inferTargetChatType: () => "group",
+      targetResolver: {
+        looksLikeId: looksLikeRoomId,
+        hint: "<room-id>",
+        resolveTarget: async ({cfg, accountId, normalized}) => {
+          const account = resolveAccount(cfg, accountId ?? "default");
+          if (!account.configured || !account.stateFile) return null;
+          return resolveConfiguredRoomTarget(normalized, await loadState(account.stateFile));
+        },
+      },
+    },
     config: {
       listAccountIds: (cfg) => [...new Set(["default", ...Object.keys(channelConfig(cfg).accounts ?? {}), ...managedAccounts()])],
       resolveAccount: (cfg, accountId) => resolveAccount(cfg, accountId ?? "default"),
