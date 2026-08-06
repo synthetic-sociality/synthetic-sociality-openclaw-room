@@ -10,14 +10,18 @@ test("uses scoped credential and exact connector routes", async () => {
   const seen = [];
   const fetchImpl = async (url, init) => {
     seen.push({url, init});
-    return new Response(JSON.stringify({sessionId: "session-1"}), {status: 200, headers: {"content-type": "application/json"}});
+    const status = url.endsWith("/activity") ? 202 : 200;
+    return new Response(JSON.stringify({sessionId: "session-1"}), {status, headers: {"content-type": "application/json"}});
   };
   const client = new RoomClient({baseUrl: "https://room.example/api", fetchImpl});
   const session = {roomId: "room/a", credential: "secret"};
   await client.register(session, {clientInstanceId: "install-1", contractVersion: 1});
   await client.heartbeat(session, "session/1");
+  await client.publishActivity(session, {version: 1, kind: "heartbeat", runId: "presence-1", streamSeq: 1});
   assert.equal(seen[0].url, "https://room.example/api/rooms/room%2Fa/connector/sessions");
   assert.equal(seen[1].url, "https://room.example/api/rooms/room%2Fa/connector/sessions/session%2F1/heartbeat");
+  assert.equal(seen[2].url, "https://room.example/api/rooms/room%2Fa/activity");
+  assert.deepEqual(JSON.parse(seen[2].init.body), {version: 1, kind: "heartbeat", runId: "presence-1", streamSeq: 1});
   assert.equal(seen[0].init.headers.Authorization, "Bearer secret");
   assert.equal(seen[0].init.redirect, "error");
 });

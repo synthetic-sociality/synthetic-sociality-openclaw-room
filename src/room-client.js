@@ -83,6 +83,12 @@ export class RoomClient {
     });
   }
 
+  publishActivity(session, activity, signal) {
+    return this.request(`/rooms/${encodeURIComponent(session.roomId)}/activity`, {
+      method: "POST", body: activity, credential: session.credential, signal, expected: [202],
+    });
+  }
+
   readEvents(session, after, {wait = 0, signal} = {}) {
     const query = new URLSearchParams({after: String(after), limit: "100"});
     if (wait > 0) query.set("waitSeconds", String(wait));
@@ -100,6 +106,36 @@ export class RoomClient {
   roomState(session, signal) {
     return this.request(`/rooms/${encodeURIComponent(session.roomId)}/state`, {
       credential: session.credential, signal, expected: [200],
+    });
+  }
+
+  roomPolicy(session, signal) {
+    return this.request(`/rooms/${encodeURIComponent(session.roomId)}/policy`, {
+      credential: session.credential, signal, expected: [200],
+    });
+  }
+
+  startDiscussionCycle(session, request, signal) {
+    return this.request(`/rooms/${encodeURIComponent(session.roomId)}/cycles`, {
+      method: "POST", body: request, credential: session.credential, signal, expected: [201],
+    });
+  }
+
+  getDiscussionCycle(session, cycleId, signal) {
+    return this.request(`/rooms/${encodeURIComponent(session.roomId)}/cycles/${encodeURIComponent(cycleId)}`, {
+      credential: session.credential, signal, expected: [200],
+    });
+  }
+
+  claimDiscussionAttempt(session, cycleId, signal) {
+    return this.request(`/rooms/${encodeURIComponent(session.roomId)}/cycles/${encodeURIComponent(cycleId)}/claim`, {
+      method: "POST", credential: session.credential, signal, expected: [200],
+    });
+  }
+
+  completeDiscussionAttempt(session, cycleId, attemptId, request, signal) {
+    return this.request(`/rooms/${encodeURIComponent(session.roomId)}/cycles/${encodeURIComponent(cycleId)}/attempts/${encodeURIComponent(attemptId)}/complete`, {
+      method: "POST", body: request, credential: session.credential, signal, expected: [200],
     });
   }
 

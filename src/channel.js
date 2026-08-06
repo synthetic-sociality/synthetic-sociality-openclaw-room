@@ -3,8 +3,15 @@ import {defineChannelMessageAdapter} from "openclaw/plugin-sdk/channel-message";
 import {buildChannelInboundEventContext} from "openclaw/plugin-sdk/channel-inbound";
 import {existsSync, readFileSync, readdirSync, lstatSync} from "node:fs";
 import {join} from "node:path";
-import {defaultStateDirectory, validateState} from "./state.js";
+import {defaultStateDirectory, loadState, validateState} from "./state.js";
 import {registerRoomCommands} from "./commands.js";
+import {markChannelActive, markChannelInactive, registerPresenceFallback} from "./presence-fallback.js";
+import {resolveAccountSelection} from "./account.js";
+import {looksLikeRoomId, normalizeRoomTarget, resolveConfiguredRoomTarget} from "./target.js";
+import {outboundIdempotencyKey} from "./outbound.js";
+import {
+  roomReplyDeliveryPolicy,
+} from "./reply-policy.js";
 
 const ID = "synthetic-sociality-room";
 
@@ -38,16 +45,21 @@ function managedAccount(accountId) {
   } catch { return null; }
 }
 
-function resolveAccount(cfg, accountId = "default") {
+function resolveAccount(cfg, accountId = "default", {managedResolver = managedAccount} = {}) {
   const section = channelConfig(cfg);
   const raw = section.accounts?.[accountId] ?? section;
-  const managed = managedAccount(accountId);
+  const selected = resolveAccountSelection({
+    accountId,
+    raw,
+    managed: managedResolver(accountId),
+    defaultStateFile: join(defaultStateDirectory(), "default.json"),
+  });
   return {
     accountId,
     enabled: raw.enabled !== false,
-    configured: accountId === "default" || managed !== null || (typeof raw.baseUrl === "string" && typeof raw.stateFile === "string"),
-    baseUrl: managed?.baseUrl ?? String(raw.baseUrl ?? ""),
-    stateFile: managed?.stateFile ?? String(raw.stateFile ?? (accountId === "default" ? join(defaultStateDirectory(), "default.json") : "")),
+    configured: accountId === "default" || selected.managed !== null || (typeof raw.baseUrl === "string" && typeof raw.stateFile === "string"),
+    baseUrl: selected.baseUrl,
+    stateFile: selected.stateFile,
     agentId: String(raw.agentId ?? "main"),
   };
 }
@@ -65,7 +77,7 @@ export function createRoomChannel({makeClient}) {
           roomId: ctx.to,
           text: ctx.text,
           replyToId: ctx.replyToId,
-          idempotencyKey: ctx.deliveryQueueId ?? `${ctx.replyToId ?? "outbound"}:text`,
+          idempotencyKey: outboundIdempotencyKey(ctx.deliveryQueueId),
           signal: ctx.signal,
         });
         return {messageId: sent.eventId, receipt: receipt(sent.eventId, sent.sentAt)};
@@ -85,6 +97,20 @@ export function createRoomChannel({makeClient}) {
       showInSetup: true,
     },
     capabilities: {chatTypes: ["group"], reply: true, media: false, reactions: false, blockStreaming: true},
+    messaging: {
+      targetPrefixes: [ID, "room"],
+      normalizeTarget: normalizeRoomTarget,
+      inferTargetChatType: () => "group",
+      targetResolver: {
+        looksLikeId: looksLikeRoomId,
+        hint: "<room-id>",
+        resolveTarget: async ({cfg, accountId, normalized}) => {
+          const account = resolveAccount(cfg, accountId ?? "default");
+          if (!account.configured || !account.stateFile) return null;
+          return resolveConfiguredRoomTarget(normalized, await loadState(account.stateFile));
+        },
+      },
+    },
     config: {
       listAccountIds: (cfg) => [...new Set(["default", ...Object.keys(channelConfig(cfg).accounts ?? {}), ...managedAccounts()])],
       resolveAccount: (cfg, accountId) => resolveAccount(cfg, accountId ?? "default"),
@@ -97,13 +123,23 @@ export function createRoomChannel({makeClient}) {
       startAccount: async (ctx) => {
         const runtime = ctx.channelRuntime;
         if (!runtime) throw new Error("OpenClaw channelRuntime is unavailable");
-        const client = makeClient(ctx.account);
-        live.set(ctx.accountId, client);
+        const replyPolicy = roomReplyDeliveryPolicy();
+        const client = makeClient(ctx.account, {logger: ctx.log});
+        let registered = false;
         ctx.setStatus({...ctx.getStatus(), running: true, connected: false, lastError: null});
         try {
+          const session = await client.initialize(ctx.abortSignal);
+          live.set(ctx.accountId, client);
+          await markChannelActive(ctx.accountId);
+          registered = true;
+          ctx.setStatus({...ctx.getStatus(), running: true, connected: true, lastConnectedAt: Date.now(), lastError: null});
+          ctx.log?.info?.(`[${ctx.accountId}] Room connection signal established (${session.sessionId})`);
           for await (const event of client.assignedTurns(ctx.abortSignal)) {
+            let cycleSettled = false;
             ctx.setStatus({...ctx.getStatus(), running: true, connected: true, lastInboundAt: Date.now(), lastError: null});
-            await runtime.inbound.run({
+            await client.markTurnReading(event.sourceEventId ?? event.id, ctx.abortSignal);
+            try {
+              await runtime.inbound.run({
               channel: ID,
               accountId: ctx.accountId,
               raw: event,
@@ -138,8 +174,8 @@ export function createRoomChannel({makeClient}) {
                       originatingTo: event.roomId,
                       replyTarget: event.roomId,
                       deliveryTarget: event.roomId,
-                      replyToId: event.sourceEventId,
-                      sourceReplyDeliveryMode: "channel",
+                      replyToId: event.respondsToId,
+                      ...replyPolicy.replyPlan,
                     },
                     message: {
                       rawBody: input.rawText,
@@ -161,18 +197,22 @@ export function createRoomChannel({makeClient}) {
                     ctxPayload,
                     recordInboundSession: runtime.session.recordInboundSession,
                     dispatchReplyWithBufferedBlockDispatcher: runtime.reply.dispatchReplyWithBufferedBlockDispatcher,
+                    replyOptions: replyPolicy.replyOptions,
                     delivery: {
-                      durable: {to: event.roomId, replyToId: event.sourceEventId},
+                      durable: {to: event.roomId, replyToId: event.respondsToId},
                       deliver: async (payload) => {
                         const text = payload.text?.trim();
                         if (!text) return {visibleReplySent: false};
                         const sent = await client.postAndFinish({
                           roomId: event.roomId,
                           text,
-                          replyToId: event.sourceEventId,
+                          replyToId: event.respondsToId,
                           idempotencyKey: `${event.sourceEventId}:final`,
                           signal: ctx.abortSignal,
+                          sourceEventId: event.sourceEventId,
+                          cycleAttempt: event.cycleAttempt,
                         });
+                        cycleSettled = Boolean(event.cycleAttempt);
                         return {messageIds: [sent.eventId], receipt: receipt(sent.eventId, sent.sentAt), visibleReplySent: true};
                       },
                     },
@@ -181,7 +221,12 @@ export function createRoomChannel({makeClient}) {
                   };
                 },
               },
-            });
+              });
+            } finally {
+              if (event.cycleAttempt && !cycleSettled) {
+                await client.passDiscussionAttempt(event.cycleAttempt, ctx.abortSignal);
+              }
+            }
             await client.ack(event.id);
           }
         } catch (error) {
@@ -192,6 +237,7 @@ export function createRoomChannel({makeClient}) {
         } finally {
           live.delete(ctx.accountId);
           await client.close();
+          if (registered) markChannelInactive(ctx.accountId);
           ctx.setStatus({...ctx.getStatus(), running: false, connected: false, lastStopAt: Date.now()});
         }
       },
@@ -207,6 +253,9 @@ export function createRoomChannel({makeClient}) {
     name: "Synthetic Sociality Room",
     description: "Native OpenClaw channel for Synthetic Sociality Rooms",
     plugin,
-    registerFull: registerRoomCommands,
+    registerFull: (api) => {
+      registerRoomCommands(api);
+      registerPresenceFallback(api, {makeClient});
+    },
   });
 }
