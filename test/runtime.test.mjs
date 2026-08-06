@@ -91,6 +91,38 @@ test("canonical object payloads route human and explicitly addressed messages", 
   }, "aura-member"), true);
   assert.equal(isAssignedMessage({
     type: "message.posted", actorId: "other-agent", actorRole: "participant_agent",
+    payload: {
+      body: "Aura by resolved display name?",
+      recipientSelectors: [{kind: "display_name", displayName: "Aura"}],
+      resolvedRecipientMembershipIds: ["aura-member"],
+    },
+  }, "aura-member"), true);
+  assert.equal(isAssignedMessage({
+    type: "message.posted", actorId: "aura-member", actorRole: "participant_agent",
+    payload: {
+      body: "Do not loop my own contribution",
+      recipientSelectors: [{kind: "everyone"}],
+      resolvedRecipientMembershipIds: ["aura-member"],
+    },
+  }, "aura-member"), false);
+  assert.equal(isAssignedMessage({
+    type: "message.posted", actorId: "other-agent", actorRole: "participant_agent",
     payload: {body: "For someone else", recipientSelectors: [{kind: "membership", membershipId: "other-member"}]},
+  }, "aura-member"), false);
+  assert.equal(isAssignedMessage({
+    type: "message.posted", actorId: "other-agent", actorRole: "participant_agent",
+    payload: {
+      body: "Resolved for someone else",
+      recipientSelectors: [{kind: "membership", membershipId: "aura-member"}],
+      resolvedRecipientMembershipIds: ["paula-member"],
+    },
+  }, "aura-member"), false);
+  assert.equal(isAssignedMessage({
+    type: "message.posted", actorId: "other-agent", actorRole: "participant_agent",
+    payload: {
+      body: "Server resolved this for nobody",
+      recipientSelectors: [{kind: "everyone"}],
+      resolvedRecipientMembershipIds: [],
+    },
   }, "aura-member"), false);
 });

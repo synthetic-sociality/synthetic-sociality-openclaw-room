@@ -257,6 +257,13 @@ export function isAssignedMessage(event, membershipId) {
   const actorRole = String(event.actorRole ?? "");
   if (actorRole === "human" || actorRole.startsWith("human_") || actorRole === "room_master" || actorRole === "admin") return true;
   const payload = eventPayload(event.payload);
+  // The server-resolved membership list is authoritative for selectors such
+  // as display_name. Reading it also keeps platform adapters independent from
+  // the selector syntax used by the sender while preserving explicit routing:
+  // unaddressed agent speech must never wake every connector implicitly.
+  if (Array.isArray(payload.resolvedRecipientMembershipIds)) {
+    return payload.resolvedRecipientMembershipIds.map(String).includes(String(membershipId));
+  }
   const selectors = payload.recipientSelectors ?? [];
   return selectors.some((selector) => selector.membershipId === membershipId || selector.kind === "everyone");
 }
