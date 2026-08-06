@@ -69,6 +69,81 @@ test("postAndFinish reads activeEpoch.id from state (canonical shape)", async ()
   await runtime.close();
 });
 
+test("cycle contribution preserves attempt metadata, addresses the next peer, and completes durably", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "openclaw-room-api-"));
+  const stateFile = join(dir, "default.json");
+  await saveState(stateFile, {
+    version: 1, baseUrl: "https://room.example/api", roomId: "room-1",
+    membershipId: "aura-member", credential: "secret", clientInstanceId: "c1", cursor: 0,
+  });
+  const captured = [];
+  const runtime = new OpenClawRoomRuntime({accountId: "default", stateFile, baseUrl: "https://room.example/api"}, {
+    fetchImpl: async (url, init) => {
+      const body = init?.body ? JSON.parse(init.body) : undefined;
+      captured.push({url, body});
+      if (url.endsWith("/connector/sessions")) return new Response(JSON.stringify({sessionId: "s1", heartbeatIntervalSeconds: 60}), {status: 200});
+      if (url.endsWith("/activity")) return new Response(JSON.stringify({acceptedStreamSeq: body.streamSeq}), {status: 202});
+      if (url.endsWith("/turns/request")) return new Response(JSON.stringify({turnId: "t1", state: "granted"}), {status: 202});
+      if (url.endsWith("/state")) return new Response(JSON.stringify({headSeq: 7, activeEpoch: {id: "epoch-1"}}), {status: 200});
+      if (url.endsWith("/messages")) return new Response(JSON.stringify({id: "msg-8", seq: 8, ts: new Date().toISOString()}), {status: 201});
+      if (url.endsWith("/turns/finish")) return new Response(JSON.stringify({state: "finished"}), {status: 200});
+      if (url.endsWith("/complete")) return new Response(JSON.stringify({attempt: {id: "attempt-1"}, cycle: {id: "cycle-1"}}), {status: 200});
+      throw new Error(`unexpected request: ${url}`);
+    },
+  });
+  await runtime.initialize();
+  const cycleAttempt = {
+    attempt: {id: "attempt-1", round: 1},
+    cycle: {
+      id: "cycle-1", generation: 2, totalTurns: 0,
+      budgets: {totalTurns: 10, perAgentTurns: 5, maxFollowUps: 10},
+      followUps: 0,
+      roster: [{membershipId: "aura-member"}, {membershipId: "paula-member"}],
+      progress: {"aura-member": {turns: 0}, "paula-member": {turns: 0}},
+    },
+  };
+  await runtime.postAndFinish({
+    roomId: "room-1", text: "My point", replyToId: "source-7", sourceEventId: "source-7",
+    idempotencyKey: "cycle-delivery-1", cycleAttempt,
+  });
+  const message = captured.find((entry) => entry.url.endsWith("/messages")).body;
+  assert.equal(message.cycleId, "cycle-1");
+  assert.equal(message.attemptId, "attempt-1");
+  assert.equal(message.cycleGeneration, 2);
+  assert.equal(message.contributionType, "question");
+  assert.deepEqual(message.recipientSelectors, [{kind: "membership", membershipId: "paula-member"}]);
+  assert.deepEqual(message.respondsTo, ["source-7"]);
+  const completion = captured.find((entry) => entry.url.endsWith("/complete")).body;
+  assert.deepEqual(completion, {generation: 2, action: "contribute", eventId: "msg-8"});
+  await runtime.close();
+});
+
+test("ready-event deliveries keep unique idempotency while sharing one causal response source", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "openclaw-room-api-"));
+  const stateFile = join(dir, "default.json");
+  await saveState(stateFile, {
+    version: 1, baseUrl: "https://room.example/api", roomId: "room-1",
+    membershipId: "member-1", credential: "secret", clientInstanceId: "c1", cursor: 0,
+  });
+  const captured = [];
+  const runtime = new OpenClawRoomRuntime({accountId: "default", stateFile, baseUrl: "https://room.example/api"}, {
+    fetchImpl: mockFetch(captured),
+  });
+  await runtime.initialize();
+  for (const readyID of ["ready-event-1", "ready-event-2"]) {
+    await runtime.postAndFinish({
+      roomId: "room-1", text: `Contribution for ${readyID}`,
+      replyToId: "human-source-1", sourceEventId: readyID,
+      idempotencyKey: `${readyID}:final`,
+    });
+  }
+  const messages = captured.filter((entry) => entry.url.endsWith("/messages")).map((entry) => entry.body);
+  assert.equal(messages.length, 2);
+  assert.deepEqual(messages.map((message) => message.respondsTo), [["human-source-1"], ["human-source-1"]]);
+  assert.notEqual(messages[0].idempotencyKey, messages[1].idempotencyKey);
+  await runtime.close();
+});
+
 // ── API endpoint regression ──────────────────────────────────────────
 
 test("connector uses /turns/request and /turns/finish (no removed paths)", async () => {

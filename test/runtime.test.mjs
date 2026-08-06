@@ -3,7 +3,7 @@ import test from "node:test";
 import {mkdtemp} from "node:fs/promises";
 import {tmpdir} from "node:os";
 import {join} from "node:path";
-import {isAssignedMessage, OpenClawRoomRuntime} from "../src/runtime.js";
+import {isAssignedEvent, isAssignedMessage, normalizeEvent, OpenClawRoomRuntime} from "../src/runtime.js";
 import {saveState} from "../src/state.js";
 
 test("initializes one connector session when native startup and event polling overlap", async () => {
@@ -125,4 +125,58 @@ test("canonical object payloads route human and explicitly addressed messages", 
       resolvedRecipientMembershipIds: [],
     },
   }, "aura-member"), false);
+});
+
+test("cycle-ready events wake only their assigned membership and retain the human response source", () => {
+  const event = {
+    id: "ready-event-1",
+    type: "discussion.cycle_attempt_ready",
+    actorRole: "system",
+    ts: "2026-08-06T08:00:00Z",
+    payload: {
+      membershipId: "aura-member",
+      sourceEventId: "human-message-1",
+      cycleId: "cycle-1",
+    },
+  };
+  assert.equal(isAssignedEvent(event, "aura-member"), true);
+  assert.equal(isAssignedEvent(event, "paula-member"), false);
+  const normalized = normalizeEvent(event, "room-1", {
+    attempt: {id: "attempt-2", round: 2},
+    cycle: {id: "cycle-1", budgets: {totalTurns: 10}, totalTurns: 1},
+  });
+  assert.equal(normalized.sourceEventId, "ready-event-1");
+  assert.equal(normalized.respondsToId, "human-message-1");
+  assert.match(normalized.text, /Continue the autonomous discussion/);
+});
+
+test("human source starts one server-owned cycle and claims only this membership attempt", async () => {
+  const runtime = new OpenClawRoomRuntime({accountId: "default", stateFile: "/unused", baseUrl: "https://room.example/api"});
+  runtime.state = {roomId: "room-1", membershipId: "aura-member"};
+  const starts = [];
+  runtime.client = {
+    roomState: async () => ({
+      activeEpoch: {id: "epoch-1"},
+      roster: [
+        {membershipId: "human-1", displayName: "TJ", role: "human_owner", status: "active"},
+        {membershipId: "paula-member", displayName: "Paula", role: "participant_agent", status: "active"},
+        {membershipId: "aura-member", displayName: "Aura", role: "participant_agent", status: "active"},
+        {membershipId: "gone", displayName: "Gone", role: "participant_agent", status: "removed"},
+      ],
+    }),
+    startDiscussionCycle: async (_state, request) => {
+      starts.push(request);
+      return {id: "cycle-1"};
+    },
+    claimDiscussionAttempt: async () => ({attempt: {id: "attempt-1", round: 1}, cycle: {id: "cycle-1"}}),
+  };
+  const result = await runtime.prepareCycleAttempt({
+    id: "human-event", type: "message.posted", actorId: "human-1", actorRole: "human_owner", payload: {body: "Debate this"},
+  });
+  assert.equal(result.attempt.id, "attempt-1");
+  assert.deepEqual(starts[0].roster, [
+    {membershipId: "paula-member", displayName: "Paula"},
+    {membershipId: "aura-member", displayName: "Aura"},
+  ]);
+  assert.equal(starts[0].sourceEventId, "human-event");
 });

@@ -119,9 +119,11 @@ export function createRoomChannel({makeClient}) {
           ctx.setStatus({...ctx.getStatus(), running: true, connected: true, lastConnectedAt: Date.now(), lastError: null});
           ctx.log?.info?.(`[${ctx.accountId}] Room connection signal established (${session.sessionId})`);
           for await (const event of client.assignedTurns(ctx.abortSignal)) {
+            let cycleSettled = false;
             ctx.setStatus({...ctx.getStatus(), running: true, connected: true, lastInboundAt: Date.now(), lastError: null});
             await client.markTurnReading(event.sourceEventId ?? event.id, ctx.abortSignal);
-            await runtime.inbound.run({
+            try {
+              await runtime.inbound.run({
               channel: ID,
               accountId: ctx.accountId,
               raw: event,
@@ -156,7 +158,7 @@ export function createRoomChannel({makeClient}) {
                       originatingTo: event.roomId,
                       replyTarget: event.roomId,
                       deliveryTarget: event.roomId,
-                      replyToId: event.sourceEventId,
+                      replyToId: event.respondsToId,
                       ...replyPolicy.replyPlan,
                     },
                     message: {
@@ -181,18 +183,20 @@ export function createRoomChannel({makeClient}) {
                     dispatchReplyWithBufferedBlockDispatcher: runtime.reply.dispatchReplyWithBufferedBlockDispatcher,
                     replyOptions: replyPolicy.replyOptions,
                     delivery: {
-                      durable: {to: event.roomId, replyToId: event.sourceEventId},
+                      durable: {to: event.roomId, replyToId: event.respondsToId},
                       deliver: async (payload) => {
                         const text = payload.text?.trim();
                         if (!text) return {visibleReplySent: false};
                         const sent = await client.postAndFinish({
                           roomId: event.roomId,
                           text,
-                          replyToId: event.sourceEventId,
+                          replyToId: event.respondsToId,
                           idempotencyKey: `${event.sourceEventId}:final`,
                           signal: ctx.abortSignal,
                           sourceEventId: event.sourceEventId,
+                          cycleAttempt: event.cycleAttempt,
                         });
+                        cycleSettled = Boolean(event.cycleAttempt);
                         return {messageIds: [sent.eventId], receipt: receipt(sent.eventId, sent.sentAt), visibleReplySent: true};
                       },
                     },
@@ -201,7 +205,12 @@ export function createRoomChannel({makeClient}) {
                   };
                 },
               },
-            });
+              });
+            } finally {
+              if (event.cycleAttempt && !cycleSettled) {
+                await client.passDiscussionAttempt(event.cycleAttempt, ctx.abortSignal);
+              }
+            }
             await client.ack(event.id);
           }
         } catch (error) {

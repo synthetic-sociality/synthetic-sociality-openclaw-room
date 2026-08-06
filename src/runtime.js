@@ -70,14 +70,66 @@ export class OpenClawRoomRuntime {
       await retry(() => this.maintainPresence(signal), signal);
       for (const event of page.events ?? []) {
         if (event.seq <= this.state.cursor) continue;
-        if (!isAssignedMessage(event, this.state.membershipId)) {
+        if (!isAssignedEvent(event, this.state.membershipId)) {
+          await this.ackEvent(event);
+          continue;
+        }
+        const cycleAttempt = await this.prepareCycleAttempt(event, signal);
+        if (cycleAttempt === false) {
           await this.ackEvent(event);
           continue;
         }
         this.pendingEvent = event;
         await this.markContextAcknowledged(event, signal);
-        yield normalizeEvent(event, this.state.roomId);
+        yield normalizeEvent(event, this.state.roomId, cycleAttempt || null);
       }
+    }
+  }
+
+  async prepareCycleAttempt(event, signal) {
+    const payload = eventPayload(event.payload);
+    if (isHumanCycleSource(event)) {
+      const cycle = await this.ensureDiscussionCycle(event, signal);
+      if (!cycle) return false;
+      return this.claimAssignedAttempt(cycle.id, signal);
+    }
+    if (!payload.cycleId) return null;
+    return this.claimAssignedAttempt(String(payload.cycleId), signal);
+  }
+
+  async ensureDiscussionCycle(event, signal) {
+    const state = await this.client.roomState(this.state, signal);
+    if (!state.activeEpoch?.id) return null;
+    let roster = (state.roster ?? []).filter((member) => member.status === "active" && ["participant_agent", "room_master"].includes(member.role));
+    const payload = eventPayload(event.payload);
+    const resolved = Array.isArray(payload.resolvedRecipientMembershipIds)
+      ? new Set(payload.resolvedRecipientMembershipIds.map(String))
+      : null;
+    if (resolved) roster = roster.filter((member) => resolved.has(String(member.membershipId)));
+    if (event.type === "human.command") {
+      const policy = await this.client.roomPolicy(this.state, signal);
+      const coordinator = String(policy.summaryCoordinatorMembershipId ?? "");
+      roster = roster.filter((member, index) => String(member.membershipId) === coordinator || (!coordinator && index === 0));
+    }
+    if (!roster.some((member) => String(member.membershipId) === this.state.membershipId)) return null;
+    const agents = roster.map((member) => ({membershipId: String(member.membershipId), displayName: String(member.displayName || "Agent")}));
+    return this.client.startDiscussionCycle(this.state, {
+      epochId: state.activeEpoch.id,
+      sourceEventId: event.id,
+      policyDigest: "0".repeat(64),
+      researchDigest: "0".repeat(64),
+      roster: agents,
+      budgets: {totalTurns: 1, perAgentTurns: 1, maxContributionBytes: 1, maxCycleBytes: 1, maxDuration: 1, maxFollowUps: 0},
+      idempotencyKey: safeKey(`openclaw-cycle:${event.id}`),
+    }, signal);
+  }
+
+  async claimAssignedAttempt(cycleId, signal) {
+    try {
+      return await this.client.claimDiscussionAttempt(this.state, cycleId, signal);
+    } catch (error) {
+      if (error instanceof RoomAPIError && ["cycle_no_attempt", "cycle_superseded"].includes(error.code)) return false;
+      throw error;
     }
   }
 
@@ -94,7 +146,7 @@ export class OpenClawRoomRuntime {
     if (this.pendingEvent?.id === event.id) this.pendingEvent = null;
   }
 
-  async postAndFinish({roomId, text, replyToId, idempotencyKey, signal, sourceEventId}) {
+  async postAndFinish({roomId, text, replyToId, idempotencyKey, signal, sourceEventId, cycleAttempt = null}) {
     if (roomId !== this.state.roomId) throw new Error("Outbound Room does not match connector membership");
     const body = String(text ?? "").trim();
     if (!body) throw new Error("OpenClaw produced an empty Room response");
@@ -109,6 +161,7 @@ export class OpenClawRoomRuntime {
     }, signal);
     const granted = await this.waitForGrant(turn, signal);
     const fresh = await this.client.roomState(this.state, signal);
+    const nextRecipient = cycleAttempt ? nextCycleRecipient(cycleAttempt.cycle, this.state.membershipId) : "";
     const message = await this.client.postMessage(this.state, {
       turnId: granted.turnId,
       observedSeq: fresh.headSeq,
@@ -116,9 +169,23 @@ export class OpenClawRoomRuntime {
       ...(topicId ? {topicId} : {}),
       ...(fresh.activeEpoch?.id ? {observedEpochId: fresh.activeEpoch.id} : {}),
       ...(replyToId ? {respondsTo: [replyToId]} : {}),
-      contributionType: "claim",
+      ...(nextRecipient ? {recipientSelectors: [{kind: "membership", membershipId: nextRecipient}]} : {}),
+      ...(cycleAttempt ? {
+        cycleId: cycleAttempt.cycle.id,
+        attemptId: cycleAttempt.attempt.id,
+        cycleGeneration: cycleAttempt.cycle.generation,
+      } : {}),
+      contributionType: nextRecipient ? "question" : "claim",
       body,
     }, signal);
+    if (cycleAttempt) {
+      await this.client.completeDiscussionAttempt(this.state, cycleAttempt.cycle.id, cycleAttempt.attempt.id, {
+        generation: cycleAttempt.cycle.generation,
+        action: "contribute",
+        eventId: message.id,
+      }, signal);
+      cycleAttempt.settled = true;
+    }
     await this.client.finishTurn(this.state, {
       turnId: granted.turnId,
       observedSeq: message.seq,
@@ -126,6 +193,24 @@ export class OpenClawRoomRuntime {
     }, signal);
     await this.markTurnPosted(sourceEventId, message.id, signal);
     return {eventId: message.id, sentAt: Date.parse(message.ts) || Date.now()};
+  }
+
+  async passDiscussionAttempt(cycleAttempt, signal) {
+    if (!cycleAttempt || cycleAttempt.settled) return null;
+    try {
+      const result = await this.client.completeDiscussionAttempt(
+        this.state,
+        cycleAttempt.cycle.id,
+        cycleAttempt.attempt.id,
+        {generation: cycleAttempt.cycle.generation, action: "pass"},
+        signal,
+      );
+      cycleAttempt.settled = true;
+      return result;
+    } catch (error) {
+      if (error instanceof RoomAPIError && error.code === "cycle_superseded") return null;
+      throw error;
+    }
   }
 
   async waitForGrant(initial, signal) {
@@ -268,22 +353,74 @@ export function isAssignedMessage(event, membershipId) {
   return selectors.some((selector) => selector.membershipId === membershipId || selector.kind === "everyone");
 }
 
-function normalizeEvent(event, roomId) {
+export function isAssignedEvent(event, membershipId) {
+  if (event?.type === "discussion.cycle_attempt_ready") {
+    return String(eventPayload(event.payload).membershipId ?? "") === String(membershipId);
+  }
+  return isHumanCycleSource(event) || isAssignedMessage(event, membershipId);
+}
+
+function isHumanCycleSource(event) {
+  const role = String(event?.actorRole ?? "");
+  if (!(role === "human" || role.startsWith("human_"))) return false;
+  if (event?.type === "message.posted") return true;
+  const command = eventPayload(event?.payload).command;
+  return event?.type === "human.command" && command?.command === "summarize";
+}
+
+function nextCycleRecipient(cycle, membershipId) {
+  const roster = Array.isArray(cycle?.roster) ? cycle.roster : [];
+  if (roster.length < 2) return "";
+  if (Number(cycle?.followUps ?? 0) >= Number(cycle?.budgets?.maxFollowUps ?? 0)) return "";
+  const start = roster.findIndex((agent) => String(agent.membershipId) === String(membershipId));
+  for (let offset = 1; offset < roster.length; offset += 1) {
+    const candidate = roster[(Math.max(start, 0) + offset) % roster.length];
+    const progress = cycle?.progress?.[candidate.membershipId] ?? {};
+    if (!progress.finished && Number(progress.turns ?? 0) < Number(cycle?.budgets?.perAgentTurns ?? 0)) return String(candidate.membershipId);
+  }
+  return "";
+}
+
+export function normalizeEvent(event, roomId, cycleAttempt = null) {
   const payload = eventPayload(event.payload);
   const actorRole = String(event.actorRole ?? "");
   const normalized = {
     id: event.id,
+    // Delivery/idempotency identity must remain the unique canonical event.
+    // A ready event separately retains the earlier causal source for respondsTo.
     sourceEventId: event.id,
+    respondsToId: event.type === "discussion.cycle_attempt_ready"
+      ? String(payload.sourceEventId || event.id)
+      : event.id,
     roomId,
     senderId: event.actorId,
     senderName: payload.actorDisplayName || payload.displayName || event.actorRole || "Room participant",
     senderKind: actorRole === "human" || actorRole.startsWith("human_") ? "human" : "agent",
-    text: String(payload.body ?? payload.text ?? "").trim(),
+    text: cyclePrompt(event, payload, cycleAttempt),
     occurredAt: Date.parse(event.ts) || Date.now(),
     raw: event,
+    cycleAttempt,
   };
   if (!normalized.text) throw new Error(`Canonical message ${event.id} has no body`);
   return normalized;
+}
+
+function cyclePrompt(event, payload, cycleAttempt) {
+  if (event.type === "discussion.cycle_attempt_ready") {
+    return "Continue the autonomous discussion from the shared canonical Room context. Add a meaningful new point; do not repeat prior contributions.";
+  }
+  if (event.type === "human.command") return "Wrap up this discussion now. Synthesize common ground, disagreements, unresolved questions, and attribute positions accurately.";
+  const text = String(payload.body ?? payload.text ?? "").trim();
+  if (!cycleAttempt) return text;
+  const {attempt, cycle} = cycleAttempt;
+  const finalTurn = Number(cycle.totalTurns ?? 0) + 1 >= Number(cycle.budgets?.totalTurns ?? Infinity);
+  return [
+    `[Autonomous Room discussion: round ${attempt.round}, turn ${Number(cycle.totalTurns ?? 0) + 1}/${cycle.budgets?.totalTurns}]`,
+    text,
+    finalTurn
+      ? "This is the final budgeted turn. Briefly synthesize common ground, differences, and unresolved questions before concluding."
+      : "Respond to the substance as yourself, advance the discussion, and directly engage the other participants when useful.",
+  ].join("\n\n");
 }
 
 function eventPayload(value) {
