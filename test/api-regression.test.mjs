@@ -290,3 +290,27 @@ test("activity publication failure never terminates the connector", async () => 
     await runtime.close();
   }
 });
+
+test("activity runs are immutable per source event and restart their sequence at one", async () => {
+  const frames = [];
+  const runtime = new OpenClawRoomRuntime({accountId: "default", stateFile: "/unused", baseUrl: "https://room.example/api"});
+  runtime.state = {roomId: "room-1", membershipId: "member-1", credential: "secret"};
+  runtime.client = {
+    publishActivity: async (_state, frame) => {
+      frames.push(frame);
+      return {acceptedStreamSeq: frame.streamSeq};
+    },
+  };
+
+  await runtime.markContextAcknowledged({id: "source-1", seq: 10});
+  await runtime.markTurnPreparing("source-1");
+  await runtime.markTurnPosted("source-1", "answer-1");
+  await runtime.markContextAcknowledged({id: "source-2", seq: 12});
+  await runtime.markTurnPreparing("source-2");
+
+  assert.deepEqual(frames.map(({sourceEventId, streamSeq}) => [sourceEventId, streamSeq]), [
+    ["source-1", 1], ["source-1", 2], ["source-1", 3], ["source-2", 1], ["source-2", 2],
+  ]);
+  assert.equal(frames[0].runId, frames[2].runId);
+  assert.notEqual(frames[2].runId, frames[3].runId);
+});

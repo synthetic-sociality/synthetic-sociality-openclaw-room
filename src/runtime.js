@@ -24,6 +24,7 @@ export class OpenClawRoomRuntime {
     this.pendingPresence = null;
     this.activityRunId = null;
     this.activityStreamSeq = 0;
+    this.activitySourceEventId = "";
   }
 
   async initialize(signal) {
@@ -288,10 +289,15 @@ export class OpenClawRoomRuntime {
   async publishActivityFrame({kind, status, sourceEventId, sourceSeq, delivery, textDelta, canonicalEventId}, signal) {
     // Presentation-only relay frames. Any failure is deliberately swallowed:
     // the UI activity pane is best-effort and must never block canonical work.
-    // Each event run gets its own runId + streamSeq sequence starting at 1,
-    // matching the Hermes bridge scope semantics: the relay requires strictly
-    // increasing, gap-free streamSeq per runId and rejects cross-run interleaving.
-    if (!this.activityRunId) this.activityRunId = `openclaw-activity:${randomUUID()}`;
+    // Each source event owns one immutable runId + gap-free stream sequence.
+    // Reusing a process-wide run across different sourceEventIds violates the
+    // relay scope contract and makes every later acknowledgement fail with 400.
+    const source = String(sourceEventId ?? "");
+    if (!this.activityRunId || source !== this.activitySourceEventId) {
+      this.activityRunId = `openclaw-activity:${randomUUID()}`;
+      this.activityStreamSeq = 0;
+      this.activitySourceEventId = source;
+    }
     if (this.activityStreamSeq === undefined) this.activityStreamSeq = 0;
     const frame = {
         version: 1,
