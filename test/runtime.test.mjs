@@ -213,6 +213,15 @@ test("canonical Room context carries topic and recent named contributions withou
   assert.match(context, /Topic drift policy: soft/);
   assert.doesNotMatch(context, /TJ: Continue/);
   assert.doesNotMatch(context, /turn.granted/);
+  const direct = normalizeEvent({
+    id: "direct-question", seq: 8, type: "message.posted", actorRole: "human_owner",
+    payload: {body: "What is your direct answer to this question?"},
+  }, "room-1", {
+    attempt: {id: "attempt-1", round: 1},
+    cycle: {id: "cycle-1", totalTurns: 0, budgets: {totalTurns: 4, perAgentTurns: 2}},
+  }, context);
+  assert.match(direct.text, /Current discussion: Compute sovereignty/);
+  assert.match(direct.text, /What is your direct answer to this question/);
 });
 
 test("human source starts one server-owned cycle and claims only this membership attempt", async () => {
