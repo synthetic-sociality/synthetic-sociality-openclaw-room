@@ -314,3 +314,28 @@ test("activity runs are immutable per source event and restart their sequence at
   assert.equal(frames[0].runId, frames[2].runId);
   assert.notEqual(frames[2].runId, frames[3].runId);
 });
+
+test("a failed receipt acknowledgement is retried unchanged before lifecycle activity", async () => {
+  const attempted = [];
+  let failures = 1;
+  const runtime = new OpenClawRoomRuntime({accountId: "default", stateFile: "/unused", baseUrl: "https://room.example/api"});
+  runtime.state = {roomId: "room-1", membershipId: "member-1", credential: "secret"};
+  runtime.client = {
+    publishActivity: async (_state, frame) => {
+      attempted.push({...frame});
+      if (failures-- > 0) throw new Error("temporary relay failure");
+      return {acceptedStreamSeq: frame.streamSeq};
+    },
+  };
+
+  await runtime.markContextAcknowledged({id: "source-1", seq: 10});
+  await runtime.markTurnPreparing("source-1");
+
+  assert.deepEqual(attempted.map(({kind, streamSeq}) => [kind, streamSeq]), [
+    ["context_acknowledged", 1],
+    ["context_acknowledged", 1],
+    ["lifecycle", 2],
+  ]);
+  assert.deepEqual(attempted[1], attempted[0], "ambiguous activity delivery must retry the exact immutable frame");
+  assert.equal(runtime.pendingActivityFrame, null);
+});

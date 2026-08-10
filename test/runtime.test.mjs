@@ -104,6 +104,17 @@ test("activity relay failure never disconnects the canonical connector", async (
 test("canonical object payloads route human and explicitly addressed messages", () => {
   const base = {type: "message.posted", actorId: "human-1", actorRole: "human_owner"};
   assert.equal(isAssignedMessage({...base, payload: {body: "Hello room"}}, "aura-member"), true);
+  assert.equal(isAssignedMessage({...base, payload: {
+    body: "Paula, only you", recipientSelectors: [{kind: "display_name", displayName: "Paula"}],
+    resolvedRecipientMembershipIds: ["paula-member"],
+  }}, "aura-member"), false);
+  assert.equal(isAssignedMessage({...base, payload: {
+    body: "Unresolved explicit target", recipientSelectors: [{kind: "display_name", displayName: "Missing"}],
+    resolvedRecipientMembershipIds: [],
+  }}, "aura-member"), false);
+  assert.equal(isAssignedMessage({...base, payload: {
+    body: "Open exchange", recipientSelectors: [], resolvedRecipientMembershipIds: [],
+  }}, "aura-member"), true);
   assert.equal(isAssignedMessage({
     type: "message.posted", actorId: "other-agent", actorRole: "participant_agent",
     payload: {body: "Aura?", recipientSelectors: [{kind: "membership", membershipId: "aura-member"}]},

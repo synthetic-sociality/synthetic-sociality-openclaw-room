@@ -25,6 +25,7 @@ export class OpenClawRoomRuntime {
     this.activityRunId = null;
     this.activityStreamSeq = 0;
     this.activitySourceEventId = "";
+    this.pendingActivityFrame = null;
   }
 
   async initialize(signal) {
@@ -123,7 +124,7 @@ export class OpenClawRoomRuntime {
     const resolved = Array.isArray(payload.resolvedRecipientMembershipIds)
       ? new Set(payload.resolvedRecipientMembershipIds.map(String))
       : null;
-    if (resolved) roster = roster.filter((member) => resolved.has(String(member.membershipId)));
+    if (resolved?.size) roster = roster.filter((member) => resolved.has(String(member.membershipId)));
     if (event.type === "human.command") {
       const policy = await this.client.roomPolicy(this.state, signal);
       const coordinator = String(policy.summaryCoordinatorMembershipId ?? "");
@@ -299,8 +300,21 @@ export class OpenClawRoomRuntime {
       this.activityRunId = `openclaw-activity:${randomUUID()}`;
       this.activityStreamSeq = 0;
       this.activitySourceEventId = source;
+      this.pendingActivityFrame = null;
     }
     if (this.activityStreamSeq === undefined) this.activityStreamSeq = 0;
+    if (this.pendingActivityFrame) {
+      try {
+        const receipt = await this.client.publishActivity(this.state, this.pendingActivityFrame, signal);
+        this.activityStreamSeq = receipt.acceptedStreamSeq ?? this.pendingActivityFrame.streamSeq;
+        this.pendingActivityFrame = null;
+        this.activityError = null;
+      } catch (error) {
+        this.activityError = error;
+        this.logger?.warn?.(`[activity] retry failed kind=${this.pendingActivityFrame.kind} frame=${JSON.stringify(this.pendingActivityFrame)}: ${String(error).slice(0, 120)}`);
+        return;
+      }
+    }
     const frame = {
         version: 1,
         kind,
@@ -313,9 +327,11 @@ export class OpenClawRoomRuntime {
         ...(textDelta ? {textDelta} : {}),
         ...(canonicalEventId ? {canonicalEventId} : {}),
     };
+    this.pendingActivityFrame = frame;
     try {
       const receipt = await this.client.publishActivity(this.state, frame, signal);
       this.activityStreamSeq = receipt.acceptedStreamSeq ?? frame.streamSeq;
+      this.pendingActivityFrame = null;
       this.activityError = null;
       this.logger?.info?.(`[activity] published kind=${frame.kind} seq=${frame.streamSeq} status=${frame.status ?? ""} accepted=${receipt.acceptedStreamSeq}`);
     } catch (error) {
@@ -363,8 +379,11 @@ export function createRoomClient(account, dependencies) {
 export function isAssignedMessage(event, membershipId) {
   if (event.type !== "message.posted" || event.actorId === membershipId) return false;
   const actorRole = String(event.actorRole ?? "");
-  if (actorRole === "human" || actorRole.startsWith("human_") || actorRole === "room_master" || actorRole === "admin") return true;
   const payload = eventPayload(event.payload);
+  if (actorRole === "human" || actorRole.startsWith("human_") || actorRole === "agent_owner") {
+    return humanMessageAddressesOrOpens(payload, membershipId);
+  }
+  if (actorRole === "room_master" || actorRole === "admin") return true;
   // The server-resolved membership list is authoritative for selectors such
   // as display_name. Reading it also keeps platform adapters independent from
   // the selector syntax used by the sender while preserving explicit routing:
@@ -380,12 +399,26 @@ export function isAssignedEvent(event, membershipId) {
   if (event?.type === "discussion.cycle_attempt_ready") {
     return String(eventPayload(event.payload).membershipId ?? "") === String(membershipId);
   }
-  return isHumanCycleSource(event) || isAssignedMessage(event, membershipId);
+  if (event?.type === "human.command") return isHumanCycleSource(event);
+  return isAssignedMessage(event, membershipId);
+}
+
+function humanMessageAddressesOrOpens(payload, membershipId) {
+  const selectors = Array.isArray(payload.recipientSelectors) ? payload.recipientSelectors : [];
+  if (Array.isArray(payload.resolvedRecipientMembershipIds)) {
+    const addressed = new Set(payload.resolvedRecipientMembershipIds.map(String));
+    if (addressed.size) return addressed.has(String(membershipId));
+    return selectors.length === 0;
+  }
+  if (selectors.length) {
+    return selectors.some((selector) => selector.kind === "everyone" || String(selector.membershipId ?? "") === String(membershipId));
+  }
+  return true;
 }
 
 function isHumanCycleSource(event) {
   const role = String(event?.actorRole ?? "");
-  if (!(role === "human" || role.startsWith("human_"))) return false;
+  if (!(role === "human" || role.startsWith("human_") || role === "agent_owner")) return false;
   if (event?.type === "message.posted") return true;
   const command = eventPayload(event?.payload).command;
   return event?.type === "human.command" && command?.command === "summarize";
