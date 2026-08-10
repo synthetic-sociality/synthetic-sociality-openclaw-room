@@ -6,17 +6,19 @@ import {join} from "node:path";
 import {canonicalRoomContext, commandInstruction, cyclePhaseInstruction, isAssignedEvent, isAssignedMessage, normalizeEvent, OpenClawRoomRuntime} from "../src/runtime.js";
 import {saveState} from "../src/state.js";
 
-test("maps durable rounds to debate phases", () => {
+test("keeps durable rounds generic and bounded instead of imposing a room topic", () => {
   const cycle = {budgets: {perAgentTurns: 7}};
-  assert.equal(cyclePhaseInstruction({round: 1}, cycle).phase, "reception_mandate");
-  assert.equal(cyclePhaseInstruction({round: 2}, cycle).phase, "evidence_pitch");
-  assert.equal(cyclePhaseInstruction({round: 4}, cycle).phase, "cross_sdg_debate");
-  assert.equal(cyclePhaseInstruction({round: 7}, cycle).phase, "government_synthesis");
+  assert.equal(cyclePhaseInstruction({round: 1}, cycle).phase, "opening");
+  assert.equal(cyclePhaseInstruction({round: 2}, cycle).phase, "follow_up");
+  assert.equal(cyclePhaseInstruction({round: 7}, cycle).phase, "follow_up");
   assert.equal(cyclePhaseInstruction(
     {round: 1},
     {budgets: {perAgentTurns: 1}},
     {command: {command: "summarize"}},
-  ).phase, "government_synthesis");
+  ).phase, "summary");
+  const all = [cyclePhaseInstruction({round: 1}, cycle), cyclePhaseInstruction({round: 2}, cycle)]
+    .map(({instruction}) => instruction.toLowerCase()).join(" ");
+  for (const forbidden of ["sdg", "government", "national evidence", "evidence pitch"]) assert.doesNotMatch(all, new RegExp(forbidden));
 });
 
 test("initial greeting keeps the exact ask instruction and a bounded greeting phase", () => {
@@ -190,14 +192,22 @@ test("canonical Room context carries topic and recent named contributions withou
     title: "AI geopolitics",
     purpose: "Compare strategic positions",
     activeTopic: {title: "Compute sovereignty"},
+    rules: [
+      {text: "Read the other agents before replying.", enforcement: "guidance"},
+      {text: "Owner reviews disputes.", enforcement: "human_moderation"},
+    ],
   }, [
     {id: "old-1", type: "message.posted", actorRole: "participant_agent", payload: {actorDisplayName: "Paula", body: "Europe needs public compute."}},
     {id: "current", type: "message.posted", actorRole: "human_owner", payload: {actorDisplayName: "TJ", body: "Continue."}},
     {id: "audit-1", type: "turn.granted", payload: {}},
-  ], "current");
+  ], "current", {researchGroundingMode: "time-sensitive", researchMaxSources: 3});
   assert.match(context, /Room: AI geopolitics/);
   assert.match(context, /Current discussion: Compute sovereignty/);
   assert.match(context, /Paula: Europe needs public compute/);
+  assert.match(context, /Read the other agents before replying/);
+  assert.doesNotMatch(context, /Owner reviews disputes/);
+  assert.match(context, /Research grounding policy: time-sensitive/);
+  assert.match(context, /at most 3 sources/);
   assert.doesNotMatch(context, /TJ: Continue/);
   assert.doesNotMatch(context, /turn.granted/);
 });

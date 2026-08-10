@@ -94,9 +94,10 @@ export class OpenClawRoomRuntime {
   async sharedRoomContext(event, signal) {
     try {
       const state = await this.client.roomState(this.state, signal);
+      const policy = await this.client.roomPolicy(this.state, signal);
       const before = Math.max(0, Number(event?.seq ?? state.headSeq ?? this.state.cursor) - 50);
       const page = await this.client.readEvents(this.state, before, {wait: 0, signal});
-      return canonicalRoomContext(state, page?.events, event?.id);
+      return canonicalRoomContext(state, page?.events, event?.id, policy);
     } catch (error) {
       // Context enrichment is bounded and best-effort. A temporarily
       // unavailable context read must not stop canonical event processing.
@@ -466,7 +467,7 @@ function cyclePrompt(event, payload, cycleAttempt, sharedContext = "") {
   const withContext = (instruction) => context ? `${context}\n\n${instruction}` : instruction;
   if (event.type === "discussion.cycle_attempt_ready") {
     const instruction = String(payload.phaseInstruction ?? "").trim();
-    const phase = String(payload.phase ?? "cross_sdg_debate").trim();
+    const phase = String(payload.phase ?? "follow_up").trim();
     return withContext(`[Autonomous Room discussion phase: ${phase}]\n${instruction || "Continue the autonomous discussion from the canonical Room context above. Directly engage the participants' actual claims, add a meaningful new point, and do not repeat prior contributions."}`);
   }
   if (event.type === "human.command") return withContext(commandInstruction(payload));
@@ -486,24 +487,20 @@ function cyclePrompt(event, payload, cycleAttempt, sharedContext = "") {
 
 export function cyclePhaseInstruction(attempt, cycle, payload = {}) {
   const round = Number(attempt?.round ?? payload?.round ?? 1);
-  const cap = Number(cycle?.budgets?.perAgentTurns ?? 1);
   const summaryRequested = String(payload?.command?.command ?? "") === "summarize";
   const initialGreeting = String(payload?.command?.idempotencyKey ?? "").startsWith("room-initial-greeting:v1:");
   const phase = String(payload?.phase ?? (initialGreeting
     ? "initial_greeting"
     : summaryRequested
-    ? "government_synthesis"
-    : cap > 1 && round >= cap
-    ? "government_synthesis"
-    : round === 1 ? "reception_mandate" : round === 2 ? "evidence_pitch" : "cross_sdg_debate"));
+    ? "summary"
+    : round === 1 ? "opening" : "follow_up"));
   const instructions = {
     initial_greeting: "Greet the named human participants once, briefly and naturally. Speak only as yourself, acknowledge every named person, and do not begin a wider exchange.",
-    reception_mandate: "Restate your assigned mandate and scope, name the central implementation gap, and identify the government decision your later pitch will require. Be concise; detailed evidence belongs in the next phase.",
-    evidence_pitch: "Give a bounded evidence-based pitch: distinguish global, regional, and national evidence, identify important source years and geographies, diagnose the main implementation barrier, and propose a realistic government response. State where EO or AI helps and where authority, capacity, finance, or participation remains indispensable.",
-    cross_sdg_debate: "Cross-examine other participants' actual claims. Expose cross-goal trade-offs, conflicts, dependencies, distributional effects, financing and delivery constraints; answer directed questions and negotiate concrete revisions to the programme.",
-    government_synthesis: "Produce a complete government-facing brief of at most 350 words grounded in the discussion. Use compact bullets covering common ground, unresolved disagreements, prioritized actions, ownership and sequencing, finance and capacity, risks, and national/international coordination. Attribute disputed positions accurately, do not invent consensus, and finish the brief within this response.",
+    opening: "Respond naturally to the source message from your own perspective. A brief acknowledgement is enough for a greeting. Do not manufacture a debate, mandate, or task that the message did not request.",
+    follow_up: "Add a response only if it contributes a meaningful new point, answers an explicit question, or resolves a useful disagreement. Otherwise pass. The remaining turn budget is a safety ceiling, not a target to exhaust.",
+    summary: "Synthesize only the discussion that actually occurred: common ground, disagreements, unresolved questions, and model-attributed positions. Do not invent consensus or unrelated recommendations.",
   };
-  return {phase, instruction: String(payload?.phaseInstruction ?? instructions[phase] ?? instructions.cross_sdg_debate)};
+  return {phase, instruction: String(payload?.phaseInstruction ?? instructions[phase] ?? instructions.follow_up)};
 }
 
 export function commandInstruction(payload = {}) {
@@ -515,10 +512,25 @@ export function commandInstruction(payload = {}) {
   return String(payload?.visibleText ?? "").trim();
 }
 
-export function canonicalRoomContext(state, events, currentEventId = "") {
+export function canonicalRoomContext(state, events, currentEventId = "", policy = {}) {
   const title = String(state?.title ?? "").trim();
   const purpose = String(state?.purpose ?? "").trim();
   const topic = String(state?.activeTopic?.title ?? "").trim();
+  const guidance = (Array.isArray(state?.rules) ? state.rules : [])
+    .filter((rule) => String(rule?.enforcement ?? "") === "guidance")
+    .map((rule) => String(rule?.text ?? "").trim())
+    .filter(Boolean)
+    .map((text) => `- ${text}`)
+    .join("\n")
+    .slice(0, 3_000);
+  const topicDrift = String(policy?.topicDrift ?? "").trim();
+  const researchMode = String(policy?.researchGroundingMode ?? "").trim();
+  const researchMaxSources = Number(policy?.researchMaxSources ?? 0);
+  const researchFreshness = Number(policy?.researchFreshnessSeconds ?? 0);
+  const policyGuidance = [
+    ...(topicDrift ? [`Topic drift policy: ${topicDrift}.`] : []),
+    ...(researchMode ? [`Research grounding policy: ${researchMode}${researchMaxSources > 0 ? `; use at most ${researchMaxSources} sources when research tools are available` : ""}${researchFreshness > 0 ? `; freshness window ${researchFreshness} seconds` : ""}.`] : []),
+  ];
   const transcript = (Array.isArray(events) ? events : [])
     .filter((item) => item?.type === "message.posted" && String(item.id ?? "") !== String(currentEventId ?? ""))
     .map((item) => {
@@ -534,6 +546,12 @@ export function canonicalRoomContext(state, events, currentEventId = "") {
     ...(title ? [`Room: ${title}`] : []),
     ...(purpose ? [`Purpose: ${purpose}`] : []),
     ...(topic ? [`Current discussion: ${topic}`] : []),
+    ...((guidance || policyGuidance.length) ? [
+      "[Active Room guidance — owner-controlled behavioral guidance]",
+      ...(guidance ? [guidance] : []),
+      ...policyGuidance,
+      "[/Active Room guidance]",
+    ] : []),
     ...(transcript.length ? ["Recent canonical transcript:", ...transcript] : ["Recent canonical transcript: no earlier messages in the available window."]),
     "[/Canonical Room context]",
   ];
