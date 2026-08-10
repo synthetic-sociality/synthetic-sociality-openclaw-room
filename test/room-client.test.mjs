@@ -2,6 +2,13 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {RoomClient, RoomAPIError} from "../src/room-client.js";
 
+test("accepts a room state response larger than one MiB", async () => {
+  const payload = JSON.stringify({avatarDataUrl: `data:image/png;base64,${"a".repeat((1 << 20) + 32)}`});
+  const client = new RoomClient({baseUrl: "https://room.example", fetchImpl: async () => new Response(payload, {status: 200})});
+  const result = await client.roomState({roomId: "room", credential: "secret"});
+  assert.equal(result.avatarDataUrl.length > (1 << 20), true);
+});
+
 test("rejects non-local plaintext transport", () => {
   assert.throws(() => new RoomClient({baseUrl: "http://room.example/api"}), /HTTPS/);
 });

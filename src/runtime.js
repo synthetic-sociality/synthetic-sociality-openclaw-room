@@ -75,13 +75,15 @@ export class OpenClawRoomRuntime {
           await this.ackEvent(event);
           continue;
         }
+        // Reception is independent of turn assignment: every addressed agent
+        // acknowledges the source before potentially slow state/claim work.
+        await this.markContextAcknowledged(event, signal);
         const cycleAttempt = await this.prepareCycleAttempt(event, signal);
         if (cycleAttempt === false) {
           await this.ackEvent(event);
           continue;
         }
         this.pendingEvent = event;
-        await this.markContextAcknowledged(event, signal);
         const sharedContext = await this.sharedRoomContext(event, signal);
         yield normalizeEvent(event, this.state.roomId, cycleAttempt || null, sharedContext);
       }
@@ -430,21 +432,54 @@ function cyclePrompt(event, payload, cycleAttempt, sharedContext = "") {
   const context = String(sharedContext ?? "").trim();
   const withContext = (instruction) => context ? `${context}\n\n${instruction}` : instruction;
   if (event.type === "discussion.cycle_attempt_ready") {
-    return withContext("Continue the autonomous discussion from the canonical Room context above. Directly engage the participants' actual claims, add a meaningful new point, and do not repeat prior contributions.");
+    const instruction = String(payload.phaseInstruction ?? "").trim();
+    const phase = String(payload.phase ?? "cross_sdg_debate").trim();
+    return withContext(`[Autonomous Room discussion phase: ${phase}]\n${instruction || "Continue the autonomous discussion from the canonical Room context above. Directly engage the participants' actual claims, add a meaningful new point, and do not repeat prior contributions."}`);
   }
-  if (event.type === "human.command") return withContext("Wrap up this discussion now. Synthesize common ground, disagreements, unresolved questions, and attribute positions accurately.");
+  if (event.type === "human.command") return withContext(commandInstruction(payload));
   const text = String(payload.body ?? payload.text ?? "").trim();
   if (!cycleAttempt) return withContext(text);
   const {attempt, cycle} = cycleAttempt;
   const finalTurn = Number(cycle.totalTurns ?? 0) + 1 >= Number(cycle.budgets?.totalTurns ?? Infinity);
+  const {phase, instruction} = cyclePhaseInstruction(attempt, cycle, payload);
   return [
     ...(context ? [context] : []),
-    `[Autonomous Room discussion: round ${attempt.round}, turn ${Number(cycle.totalTurns ?? 0) + 1}/${cycle.budgets?.totalTurns}]`,
+    `[Autonomous Room discussion phase: ${phase}; round ${attempt.round}; turn ${Number(cycle.totalTurns ?? 0) + 1}/${cycle.budgets?.totalTurns}]`,
     text,
-    finalTurn
-      ? "This is the final budgeted turn. Briefly synthesize common ground, differences, and unresolved questions before concluding."
-      : "Respond to the substance as yourself, advance the discussion, and directly engage the other participants when useful.",
+    instruction,
+    ...(finalTurn ? ["This is the final budgeted turn; conclude within this response."] : []),
   ].join("\n\n");
+}
+
+export function cyclePhaseInstruction(attempt, cycle, payload = {}) {
+  const round = Number(attempt?.round ?? payload?.round ?? 1);
+  const cap = Number(cycle?.budgets?.perAgentTurns ?? 1);
+  const summaryRequested = String(payload?.command?.command ?? "") === "summarize";
+  const initialGreeting = String(payload?.command?.idempotencyKey ?? "").startsWith("room-initial-greeting:v1:");
+  const phase = String(payload?.phase ?? (initialGreeting
+    ? "initial_greeting"
+    : summaryRequested
+    ? "government_synthesis"
+    : cap > 1 && round >= cap
+    ? "government_synthesis"
+    : round === 1 ? "reception_mandate" : round === 2 ? "evidence_pitch" : "cross_sdg_debate"));
+  const instructions = {
+    initial_greeting: "Greet the named human participants once, briefly and naturally. Speak only as yourself, acknowledge every named person, and do not begin a wider exchange.",
+    reception_mandate: "Restate your assigned mandate and scope, name the central implementation gap, and identify the government decision your later pitch will require. Be concise; detailed evidence belongs in the next phase.",
+    evidence_pitch: "Give a bounded evidence-based pitch: distinguish global, regional, and national evidence, identify important source years and geographies, diagnose the main implementation barrier, and propose a realistic government response. State where EO or AI helps and where authority, capacity, finance, or participation remains indispensable.",
+    cross_sdg_debate: "Cross-examine other participants' actual claims. Expose cross-goal trade-offs, conflicts, dependencies, distributional effects, financing and delivery constraints; answer directed questions and negotiate concrete revisions to the programme.",
+    government_synthesis: "Produce a complete government-facing brief of at most 350 words grounded in the discussion. Use compact bullets covering common ground, unresolved disagreements, prioritized actions, ownership and sequencing, finance and capacity, risks, and national/international coordination. Attribute disputed positions accurately, do not invent consensus, and finish the brief within this response.",
+  };
+  return {phase, instruction: String(payload?.phaseInstruction ?? instructions[phase] ?? instructions.cross_sdg_debate)};
+}
+
+export function commandInstruction(payload = {}) {
+  const command = payload?.command ?? {};
+  if (String(command.command ?? "") === "summarize") {
+    return "Wrap up this discussion now. Synthesize common ground, disagreements, unresolved questions, and attribute positions accurately.";
+  }
+  if (String(command.command ?? "") === "ask") return String(command?.arguments?.instruction ?? "").trim();
+  return String(payload?.visibleText ?? "").trim();
 }
 
 export function canonicalRoomContext(state, events, currentEventId = "") {

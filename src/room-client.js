@@ -1,4 +1,6 @@
-const MAX_RESPONSE_BYTES = 1 << 20;
+// Room state may legitimately include several base64-encoded profile avatars.
+// Keep a finite guard while allowing the protocol's complete room snapshot.
+const MAX_RESPONSE_BYTES = 16 << 20;
 
 export class RoomAPIError extends Error {
   constructor(status, body) {

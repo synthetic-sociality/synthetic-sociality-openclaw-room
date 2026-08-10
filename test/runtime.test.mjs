@@ -3,8 +3,31 @@ import test from "node:test";
 import {mkdtemp} from "node:fs/promises";
 import {tmpdir} from "node:os";
 import {join} from "node:path";
-import {canonicalRoomContext, isAssignedEvent, isAssignedMessage, normalizeEvent, OpenClawRoomRuntime} from "../src/runtime.js";
+import {canonicalRoomContext, commandInstruction, cyclePhaseInstruction, isAssignedEvent, isAssignedMessage, normalizeEvent, OpenClawRoomRuntime} from "../src/runtime.js";
 import {saveState} from "../src/state.js";
+
+test("maps durable rounds to debate phases", () => {
+  const cycle = {budgets: {perAgentTurns: 7}};
+  assert.equal(cyclePhaseInstruction({round: 1}, cycle).phase, "reception_mandate");
+  assert.equal(cyclePhaseInstruction({round: 2}, cycle).phase, "evidence_pitch");
+  assert.equal(cyclePhaseInstruction({round: 4}, cycle).phase, "cross_sdg_debate");
+  assert.equal(cyclePhaseInstruction({round: 7}, cycle).phase, "government_synthesis");
+  assert.equal(cyclePhaseInstruction(
+    {round: 1},
+    {budgets: {perAgentTurns: 1}},
+    {command: {command: "summarize"}},
+  ).phase, "government_synthesis");
+});
+
+test("initial greeting keeps the exact ask instruction and a bounded greeting phase", () => {
+  const payload = {command: {
+    command: "ask",
+    idempotencyKey: "room-initial-greeting:v1:room:agent",
+    arguments: {instruction: "Greet Alex and Sam."},
+  }};
+  assert.equal(commandInstruction(payload), "Greet Alex and Sam.");
+  assert.equal(cyclePhaseInstruction({round: 1}, {budgets: {perAgentTurns: 1}}, payload).phase, "initial_greeting");
+});
 
 test("initializes one connector session when native startup and event polling overlap", async () => {
   const directory = await mkdtemp(join(tmpdir(), "openclaw-room-runtime-"));
