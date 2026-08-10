@@ -513,6 +513,7 @@ export function commandInstruction(payload = {}) {
 }
 
 export function canonicalRoomContext(state, events, currentEventId = "", policy = {}) {
+  const policyView = policy?.policy && typeof policy.policy === "object" ? policy.policy : policy;
   const title = String(state?.title ?? "").trim();
   const purpose = String(state?.purpose ?? "").trim();
   const topic = String(state?.activeTopic?.title ?? "").trim();
@@ -523,10 +524,10 @@ export function canonicalRoomContext(state, events, currentEventId = "", policy 
     .map((text) => `- ${text}`)
     .join("\n")
     .slice(0, 3_000);
-  const topicDrift = String(policy?.topicDrift ?? "").trim();
-  const researchMode = String(policy?.researchGroundingMode ?? "").trim();
-  const researchMaxSources = Number(policy?.researchMaxSources ?? 0);
-  const researchFreshness = Number(policy?.researchFreshnessSeconds ?? 0);
+  const topicDrift = String(policyView?.topicDrift ?? "").trim();
+  const researchMode = String(policyView?.researchGroundingMode ?? "").trim();
+  const researchMaxSources = Number(policyView?.researchMaxSources ?? 0);
+  const researchFreshness = Number(policyView?.researchFreshnessSeconds ?? 0);
   const policyGuidance = [
     ...(topicDrift ? [`Topic drift policy: ${topicDrift}.`] : []),
     ...(researchMode ? [`Research grounding policy: ${researchMode}${researchMaxSources > 0 ? `; use at most ${researchMaxSources} sources when research tools are available` : ""}${researchFreshness > 0 ? `; freshness window ${researchFreshness} seconds` : ""}.`] : []),

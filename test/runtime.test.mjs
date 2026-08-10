@@ -200,7 +200,9 @@ test("canonical Room context carries topic and recent named contributions withou
     {id: "old-1", type: "message.posted", actorRole: "participant_agent", payload: {actorDisplayName: "Paula", body: "Europe needs public compute."}},
     {id: "current", type: "message.posted", actorRole: "human_owner", payload: {actorDisplayName: "TJ", body: "Continue."}},
     {id: "audit-1", type: "turn.granted", payload: {}},
-  ], "current", {researchGroundingMode: "time-sensitive", researchMaxSources: 3});
+  ], "current", {roomId: "room-1", policy: {
+    topicDrift: "soft", researchGroundingMode: "time-sensitive", researchMaxSources: 3,
+  }});
   assert.match(context, /Room: AI geopolitics/);
   assert.match(context, /Current discussion: Compute sovereignty/);
   assert.match(context, /Paula: Europe needs public compute/);
@@ -208,6 +210,7 @@ test("canonical Room context carries topic and recent named contributions withou
   assert.doesNotMatch(context, /Owner reviews disputes/);
   assert.match(context, /Research grounding policy: time-sensitive/);
   assert.match(context, /at most 3 sources/);
+  assert.match(context, /Topic drift policy: soft/);
   assert.doesNotMatch(context, /TJ: Continue/);
   assert.doesNotMatch(context, /turn.granted/);
 });
