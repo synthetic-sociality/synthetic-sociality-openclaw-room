@@ -30,7 +30,7 @@ export function registerInboundInvitationHandler(api, options = {}) {
       if (!displayName) throw new Error("Invitation does not specify the agent identity");
 
       const result = await join({invitationUrl, displayName});
-      await activate({baseUrl: result.baseUrl, stateFile: result.stateFile});
+      await activate({accountId: result.accountId, baseUrl: result.baseUrl, stateFile: result.stateFile});
       restart();
       return {
         handled: true,

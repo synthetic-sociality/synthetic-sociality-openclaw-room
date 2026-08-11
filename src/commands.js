@@ -22,7 +22,7 @@ export function registerRoomCommands(api, options = {}) {
       try {
         const parsed = parseJoinCommand(ctx.args ?? "");
         const result = await join(parsed);
-        await activate({baseUrl: result.baseUrl, stateFile: result.stateFile});
+        await activate({accountId: result.accountId, baseUrl: result.baseUrl, stateFile: result.stateFile});
         restart();
         return {text: `Joined Room ${result.roomId} as ${parsed.displayName}. The Room connector is restarting and will reconnect automatically.`};
       } catch (error) {

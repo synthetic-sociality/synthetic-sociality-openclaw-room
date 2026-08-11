@@ -6,7 +6,7 @@ import {join} from "node:path";
 import {defaultStateDirectory, loadState, validateState} from "./state.js";
 import {registerRoomCommands} from "./commands.js";
 import {markChannelActive, markChannelInactive, registerPresenceFallback} from "./presence-fallback.js";
-import {resolveAccountSelection} from "./account.js";
+import {resolveAccountConfig, resolveAccountSelection} from "./account.js";
 import {looksLikeRoomId, normalizeRoomTarget, resolveConfiguredRoomTarget} from "./target.js";
 import {outboundIdempotencyKey} from "./outbound.js";
 import {
@@ -47,7 +47,7 @@ function managedAccount(accountId) {
 
 function resolveAccount(cfg, accountId = "default", {managedResolver = managedAccount} = {}) {
   const section = channelConfig(cfg);
-  const raw = section.accounts?.[accountId] ?? section;
+  const raw = resolveAccountConfig(section, accountId);
   const selected = resolveAccountSelection({
     accountId,
     raw,
