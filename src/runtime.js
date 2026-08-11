@@ -120,9 +120,13 @@ export class OpenClawRoomRuntime {
     if (isHumanCycleSource(event) || agentSeed) {
       const cycle = await this.ensureDiscussionCycle(event, signal);
       if (!cycle) return false;
-      return this.claimAssignedAttempt(cycle.id, signal);
+      // Starting a cycle publishes the authoritative attempt-ready event.
+      // The source message is context only; claiming it here would let the
+      // source and ready events launch the same model attempt twice.
+      return false;
     }
     if (!payload.cycleId) return null;
+    if (event.type !== "discussion.cycle_attempt_ready") return false;
     return this.claimAssignedAttempt(String(payload.cycleId), signal);
   }
 
@@ -185,17 +189,21 @@ export class OpenClawRoomRuntime {
     await this.markTurnPreparing(sourceEventId, signal);
     const state = await this.client.roomState(this.state, signal);
     const topicId = state.activeTopic?.id ?? null;
-    const requestKey = safeKey(`${idempotencyKey}:request`);
-    const turn = await this.client.requestTurn(this.state, {
-      observedSeq: state.headSeq,
-      idempotencyKey: requestKey,
-      ...(topicId ? {topicId} : {}),
-    }, signal);
-    const granted = await this.waitForGrant(turn, signal);
-    const fresh = await this.client.roomState(this.state, signal);
+    let granted = null;
+    let fresh = state;
+    if (!cycleAttempt) {
+      const requestKey = safeKey(`${idempotencyKey}:request`);
+      const turn = await this.client.requestTurn(this.state, {
+        observedSeq: state.headSeq,
+        idempotencyKey: requestKey,
+        ...(topicId ? {topicId} : {}),
+      }, signal);
+      granted = await this.waitForGrant(turn, signal);
+      fresh = await this.client.roomState(this.state, signal);
+    }
     const nextRecipient = cycleAttempt ? nextCycleRecipient(cycleAttempt.cycle, this.state.membershipId) : "";
     const message = await this.client.postMessage(this.state, {
-      turnId: granted.turnId,
+      ...(granted ? {turnId: granted.turnId} : {}),
       observedSeq: fresh.headSeq,
       idempotencyKey: safeKey(`${idempotencyKey}:message`),
       ...(topicId ? {topicId} : {}),
@@ -218,11 +226,13 @@ export class OpenClawRoomRuntime {
       }, signal);
       cycleAttempt.settled = true;
     }
-    await this.client.finishTurn(this.state, {
-      turnId: granted.turnId,
-      observedSeq: message.seq,
-      idempotencyKey: safeKey(`${idempotencyKey}:finish`),
-    }, signal);
+    if (granted) {
+      await this.client.finishTurn(this.state, {
+        turnId: granted.turnId,
+        observedSeq: message.seq,
+        idempotencyKey: safeKey(`${idempotencyKey}:finish`),
+      }, signal);
+    }
     await this.markTurnPosted(sourceEventId, message.id, signal);
     return {eventId: message.id, sentAt: Date.parse(message.ts) || Date.now()};
   }

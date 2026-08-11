@@ -69,7 +69,7 @@ test("postAndFinish reads activeEpoch.id from state (canonical shape)", async ()
   await runtime.close();
 });
 
-test("cycle contribution preserves attempt metadata, addresses the next peer, and completes durably", async () => {
+test("cycle contribution survives an interleaved peer acknowledgement without a normal turn lease", async () => {
   const dir = await mkdtemp(join(tmpdir(), "openclaw-room-api-"));
   const stateFile = join(dir, "default.json");
   await saveState(stateFile, {
@@ -83,10 +83,11 @@ test("cycle contribution preserves attempt metadata, addresses the next peer, an
       captured.push({url, body});
       if (url.endsWith("/connector/sessions")) return new Response(JSON.stringify({sessionId: "s1", heartbeatIntervalSeconds: 60}), {status: 200});
       if (url.endsWith("/activity")) return new Response(JSON.stringify({acceptedStreamSeq: body.streamSeq}), {status: 202});
-      if (url.endsWith("/turns/request")) return new Response(JSON.stringify({turnId: "t1", state: "granted"}), {status: 202});
       if (url.endsWith("/state")) return new Response(JSON.stringify({headSeq: 7, activeEpoch: {id: "epoch-1"}}), {status: 200});
+      // The response sequence deliberately trails the canonical head after a
+      // peer acknowledgement. A normal finishTurn(observedSeq=8) would now
+      // be stale and leave its granted lease behind.
       if (url.endsWith("/messages")) return new Response(JSON.stringify({id: "msg-8", seq: 8, ts: new Date().toISOString()}), {status: 201});
-      if (url.endsWith("/turns/finish")) return new Response(JSON.stringify({state: "finished"}), {status: 200});
       if (url.endsWith("/complete")) return new Response(JSON.stringify({attempt: {id: "attempt-1"}, cycle: {id: "cycle-1"}}), {status: 200});
       throw new Error(`unexpected request: ${url}`);
     },
@@ -115,6 +116,9 @@ test("cycle contribution preserves attempt metadata, addresses the next peer, an
   assert.deepEqual(message.respondsTo, ["source-7"]);
   const completion = captured.find((entry) => entry.url.endsWith("/complete")).body;
   assert.deepEqual(completion, {generation: 2, action: "contribute", eventId: "msg-8"});
+  assert.equal(captured.some((entry) => entry.url.endsWith("/turns/request")), false);
+  assert.equal(captured.some((entry) => entry.url.endsWith("/turns/finish")), false);
+  assert.equal("turnId" in message, false);
   await runtime.close();
 });
 

@@ -224,7 +224,7 @@ test("canonical Room context carries topic and recent named contributions withou
   assert.match(direct.text, /What is your direct answer to this question/);
 });
 
-test("human source starts one server-owned cycle and claims only this membership attempt", async () => {
+test("human source starts one server-owned cycle but only its ready event claims the attempt", async () => {
   const runtime = new OpenClawRoomRuntime({accountId: "default", stateFile: "/unused", baseUrl: "https://room.example/api"});
   runtime.state = {roomId: "room-1", membershipId: "aura-member"};
   const starts = [];
@@ -247,7 +247,7 @@ test("human source starts one server-owned cycle and claims only this membership
   const result = await runtime.prepareCycleAttempt({
     id: "human-event", type: "message.posted", actorId: "human-1", actorRole: "human_owner", payload: {body: "Debate this"},
   });
-  assert.equal(result.attempt.id, "attempt-1");
+  assert.equal(result, false);
   assert.deepEqual(starts[0].roster, [
     {membershipId: "paula-member", displayName: "Paula"},
     {membershipId: "aura-member", displayName: "Aura"},
@@ -280,15 +280,20 @@ test("eligible agent contribution seeds once while a cycle-bound contribution co
     id: "agent-source", type: "message.posted", actorId: "author-member", actorRole: "participant_agent",
     payload: {body: "A new peer claim", resolvedRecipientMembershipIds: ["reader-member"]},
   });
-  assert.equal(seeded.cycle.id, "cycle-agent-1");
+  assert.equal(seeded, false);
   assert.deepEqual(starts[0].roster.map(({membershipId}) => membershipId), ["author-member", "reader-member"]);
   const continued = await runtime.prepareCycleAttempt({
     id: "agent-cycle-contribution", type: "message.posted", actorId: "author-member", actorRole: "participant_agent",
     payload: {body: "A bounded follow-up", cycleId: "cycle-existing", resolvedRecipientMembershipIds: ["reader-member"]},
   });
-  assert.equal(continued.cycle.id, "cycle-existing");
+  assert.equal(continued, false);
+  const ready = await runtime.prepareCycleAttempt({
+    id: "ready-existing", type: "discussion.cycle_attempt_ready", actorId: "room_coordinator", actorRole: "system",
+    payload: {cycleId: "cycle-existing", membershipId: "reader-member", sourceEventId: "agent-cycle-contribution"},
+  });
+  assert.equal(ready.cycle.id, "cycle-existing");
   assert.equal(starts.length, 1);
-  assert.deepEqual(claims, ["cycle-agent-1", "cycle-existing"]);
+  assert.deepEqual(claims, ["cycle-existing"]);
 });
 
 test("agent contribution cannot seed outside the open follow-up policy", async () => {
