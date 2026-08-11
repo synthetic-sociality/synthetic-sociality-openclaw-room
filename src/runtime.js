@@ -79,6 +79,9 @@ export class OpenClawRoomRuntime {
         // Reception is independent of turn assignment: every addressed agent
         // acknowledges the source before potentially slow state/claim work.
         await this.markContextAcknowledged(event, signal);
+        if (isPeerContribution(event, this.state.membershipId)) {
+          await this.client.acknowledgePeerContribution(this.state, event.id, signal);
+        }
         const cycleAttempt = await this.prepareCycleAttempt(event, signal);
         if (cycleAttempt === false) {
           await this.ackEvent(event);
@@ -108,7 +111,13 @@ export class OpenClawRoomRuntime {
 
   async prepareCycleAttempt(event, signal) {
     const payload = eventPayload(event.payload);
-    if (isHumanCycleSource(event)) {
+    const agentSeed = isAgentCycleSeed(event);
+    if (agentSeed) {
+      const response = await this.client.roomPolicy(this.state, signal);
+      const policy = response?.policy && typeof response.policy === "object" ? response.policy : response;
+      if (String(policy?.coordinationMode ?? "open") !== "open" || policy?.agentFollowUpEnabled === false) return false;
+    }
+    if (isHumanCycleSource(event) || agentSeed) {
       const cycle = await this.ensureDiscussionCycle(event, signal);
       if (!cycle) return false;
       return this.claimAssignedAttempt(cycle.id, signal);
@@ -125,7 +134,10 @@ export class OpenClawRoomRuntime {
     const resolved = Array.isArray(payload.resolvedRecipientMembershipIds)
       ? new Set(payload.resolvedRecipientMembershipIds.map(String))
       : null;
-    if (resolved?.size) roster = roster.filter((member) => resolved.has(String(member.membershipId)));
+    if (isAgentCycleSeed(event)) {
+      const selected = new Set([...(resolved ?? []), String(event.actorId ?? "")]);
+      roster = roster.filter((member) => selected.has(String(member.membershipId)));
+    } else if (resolved?.size) roster = roster.filter((member) => resolved.has(String(member.membershipId)));
     if (event.type === "human.command") {
       const policy = await this.client.roomPolicy(this.state, signal);
       const coordinator = String(policy.summaryCoordinatorMembershipId ?? "");
@@ -425,6 +437,20 @@ function isHumanCycleSource(event) {
   return event?.type === "human.command" && command?.command === "summarize";
 }
 
+function isAgentCycleSeed(event) {
+  if (event?.type !== "message.posted" || !["participant_agent", "room_master"].includes(String(event?.actorRole ?? ""))) return false;
+  const payload = eventPayload(event?.payload);
+  return !String(payload.cycleId ?? "").trim()
+    && Array.isArray(payload.resolvedRecipientMembershipIds)
+    && payload.resolvedRecipientMembershipIds.length > 0;
+}
+
+function isPeerContribution(event, membershipId) {
+  return event?.type === "message.posted"
+    && ["participant_agent", "room_master"].includes(String(event?.actorRole ?? ""))
+    && String(event?.actorId ?? "") !== String(membershipId);
+}
+
 function nextCycleRecipient(cycle, membershipId) {
   const roster = Array.isArray(cycle?.roster) ? cycle.roster : [];
   if (roster.length < 2) return "";
@@ -497,7 +523,7 @@ export function cyclePhaseInstruction(attempt, cycle, payload = {}) {
   const instructions = {
     initial_greeting: "Greet the named human participants once, briefly and naturally. Speak only as yourself, acknowledge every named person, and do not begin a wider exchange.",
     opening: "Respond naturally to the source message from your own perspective. A brief acknowledgement is enough for a greeting. Do not manufacture a debate, mandate, or task that the message did not request.",
-    follow_up: "Add a response only if it contributes a meaningful new point, answers an explicit question, or resolves a useful disagreement. Otherwise pass. The remaining turn budget is a safety ceiling, not a target to exhaust.",
+    follow_up: "Add a response only if it contributes a meaningful new point, answers an explicit question, or resolves a useful disagreement. Look for genuine common ground or synthesis where the claims support it, but never force consensus; justified disagreement may remain. Otherwise pass. The remaining turn budget is a safety ceiling, not a target to exhaust.",
     summary: "Synthesize only the discussion that actually occurred: common ground, disagreements, unresolved questions, and model-attributed positions. Do not invent consensus or unrelated recommendations.",
   };
   return {phase, instruction: String(payload?.phaseInstruction ?? instructions[phase] ?? instructions.follow_up)};

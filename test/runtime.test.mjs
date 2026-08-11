@@ -254,3 +254,62 @@ test("human source starts one server-owned cycle and claims only this membership
   ]);
   assert.equal(starts[0].sourceEventId, "human-event");
 });
+
+test("eligible agent contribution seeds once while a cycle-bound contribution continues its cycle", async () => {
+  const runtime = new OpenClawRoomRuntime({accountId: "default", stateFile: "/unused", baseUrl: "https://room.example/api"});
+  runtime.state = {roomId: "room-1", membershipId: "reader-member"};
+  const starts = [];
+  const claims = [];
+  runtime.client = {
+    roomPolicy: async () => ({policy: {coordinationMode: "open", agentFollowUpEnabled: true}}),
+    roomState: async () => ({
+      activeEpoch: {id: "epoch-1"},
+      roster: [
+        {membershipId: "author-member", displayName: "Author", role: "participant_agent", status: "active"},
+        {membershipId: "reader-member", displayName: "Reader", role: "participant_agent", status: "active"},
+        {membershipId: "other-member", displayName: "Other", role: "participant_agent", status: "active"},
+      ],
+    }),
+    startDiscussionCycle: async (_state, request) => { starts.push(request); return {id: "cycle-agent-1"}; },
+    claimDiscussionAttempt: async (_state, cycleId) => {
+      claims.push(cycleId);
+      return {attempt: {id: `attempt-${claims.length}`, round: claims.length}, cycle: {id: cycleId}};
+    },
+  };
+  const seeded = await runtime.prepareCycleAttempt({
+    id: "agent-source", type: "message.posted", actorId: "author-member", actorRole: "participant_agent",
+    payload: {body: "A new peer claim", resolvedRecipientMembershipIds: ["reader-member"]},
+  });
+  assert.equal(seeded.cycle.id, "cycle-agent-1");
+  assert.deepEqual(starts[0].roster.map(({membershipId}) => membershipId), ["author-member", "reader-member"]);
+  const continued = await runtime.prepareCycleAttempt({
+    id: "agent-cycle-contribution", type: "message.posted", actorId: "author-member", actorRole: "participant_agent",
+    payload: {body: "A bounded follow-up", cycleId: "cycle-existing", resolvedRecipientMembershipIds: ["reader-member"]},
+  });
+  assert.equal(continued.cycle.id, "cycle-existing");
+  assert.equal(starts.length, 1);
+  assert.deepEqual(claims, ["cycle-agent-1", "cycle-existing"]);
+});
+
+test("agent contribution cannot seed outside the open follow-up policy", async () => {
+  const runtime = new OpenClawRoomRuntime({accountId: "default", stateFile: "/unused", baseUrl: "https://room.example/api"});
+  runtime.state = {roomId: "room-1", membershipId: "reader-member"};
+  let stateReads = 0;
+  runtime.client = {
+    roomPolicy: async () => ({policy: {coordinationMode: "open", agentFollowUpEnabled: false}}),
+    roomState: async () => { stateReads += 1; return {}; },
+  };
+  const result = await runtime.prepareCycleAttempt({
+    id: "agent-source", type: "message.posted", actorId: "author-member", actorRole: "participant_agent",
+    payload: {body: "A peer claim", resolvedRecipientMembershipIds: ["reader-member"]},
+  });
+  assert.equal(result, false);
+  assert.equal(stateReads, 0);
+});
+
+test("follow-up guidance searches for synthesis without forcing consensus", () => {
+  const result = cyclePhaseInstruction({round: 2}, {budgets: {perAgentTurns: 3}}, {});
+  assert.match(result.instruction, /common ground or synthesis/);
+  assert.match(result.instruction, /never force consensus/);
+  assert.match(result.instruction, /justified disagreement may remain/);
+});

@@ -168,6 +168,18 @@ test("connector uses /turns/request and /turns/finish (no removed paths)", async
   assert.equal(result.state, "finished");
 });
 
+test("peer read evidence uses a dedicated idempotent endpoint rather than a turn path", async () => {
+  const captured = [];
+  const client = new RoomClient({baseUrl: "https://room.example/api", fetchImpl: async (url, init) => {
+    captured.push({url, body: JSON.parse(init.body)});
+    return new Response(JSON.stringify({event: {id: "peer-ack-1"}, replayed: false}), {status: 201});
+  }});
+  await client.acknowledgePeerContribution({roomId: "room-1", credential: "secret"}, "source-1");
+  assert.match(captured[0].url, /\/rooms\/room-1\/peer-acknowledgements$/);
+  assert.deepEqual(captured[0].body, {sourceEventId: "source-1"});
+  assert.doesNotMatch(captured[0].url, /turn|cycle/);
+});
+
 test("API errors do not silently swallow — non-retryable codes throw", async () => {
   const client = new RoomClient({baseUrl: "https://room.example/api", fetchImpl: async () =>
     new Response(JSON.stringify({code: "stale_context", message: "stale"}), {status: 400})});

@@ -105,6 +105,12 @@ export class RoomClient {
     });
   }
 
+  acknowledgePeerContribution(session, sourceEventId, signal) {
+    return this.request(`/rooms/${encodeURIComponent(session.roomId)}/peer-acknowledgements`, {
+      method: "POST", body: {sourceEventId}, credential: session.credential, signal, expected: [200, 201],
+    });
+  }
+
   roomState(session, signal) {
     return this.request(`/rooms/${encodeURIComponent(session.roomId)}/state`, {
       credential: session.credential, signal, expected: [200],
