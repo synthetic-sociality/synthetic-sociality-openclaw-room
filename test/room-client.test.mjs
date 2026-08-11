@@ -2,6 +2,13 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {RoomClient, RoomAPIError} from "../src/room-client.js";
 
+test("accepts a room state response larger than one MiB", async () => {
+  const payload = JSON.stringify({avatarDataUrl: `data:image/png;base64,${"a".repeat((1 << 20) + 32)}`});
+  const client = new RoomClient({baseUrl: "https://room.example", fetchImpl: async () => new Response(payload, {status: 200})});
+  const result = await client.roomState({roomId: "room", credential: "secret"});
+  assert.equal(result.avatarDataUrl.length > (1 << 20), true);
+});
+
 test("rejects non-local plaintext transport", () => {
   assert.throws(() => new RoomClient({baseUrl: "http://room.example/api"}), /HTTPS/);
 });
@@ -10,14 +17,18 @@ test("uses scoped credential and exact connector routes", async () => {
   const seen = [];
   const fetchImpl = async (url, init) => {
     seen.push({url, init});
-    return new Response(JSON.stringify({sessionId: "session-1"}), {status: 200, headers: {"content-type": "application/json"}});
+    const status = url.endsWith("/activity") ? 202 : 200;
+    return new Response(JSON.stringify({sessionId: "session-1"}), {status, headers: {"content-type": "application/json"}});
   };
   const client = new RoomClient({baseUrl: "https://room.example/api", fetchImpl});
   const session = {roomId: "room/a", credential: "secret"};
   await client.register(session, {clientInstanceId: "install-1", contractVersion: 1});
   await client.heartbeat(session, "session/1");
+  await client.publishActivity(session, {version: 1, kind: "heartbeat", runId: "presence-1", streamSeq: 1});
   assert.equal(seen[0].url, "https://room.example/api/rooms/room%2Fa/connector/sessions");
   assert.equal(seen[1].url, "https://room.example/api/rooms/room%2Fa/connector/sessions/session%2F1/heartbeat");
+  assert.equal(seen[2].url, "https://room.example/api/rooms/room%2Fa/activity");
+  assert.deepEqual(JSON.parse(seen[2].init.body), {version: 1, kind: "heartbeat", runId: "presence-1", streamSeq: 1});
   assert.equal(seen[0].init.headers.Authorization, "Bearer secret");
   assert.equal(seen[0].init.redirect, "error");
 });

@@ -39,7 +39,7 @@ export async function joinInvitation({invitationUrl, displayName, systemDescript
     cursor: session.headSeq ?? 0,
   };
   await saveNewState(stateFile, state);
-  return {joined: true, roomId: state.roomId, membershipId: state.membershipId, accountId, stateFile};
+  return {joined: true, roomId: state.roomId, membershipId: state.membershipId, accountId, stateFile, baseUrl: state.baseUrl};
 }
 
 function safeAccountId(value) {
