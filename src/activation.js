@@ -14,11 +14,12 @@ export function resolveOpenClawBinary({env = process.env, exists = existsSync} =
   return "openclaw";
 }
 
-export async function activateRoomChannel({baseUrl, stateFile, command = resolveOpenClawBinary(), exec = execFile} = {}) {
+export async function activateRoomChannel({accountId = "default", baseUrl, stateFile, command = resolveOpenClawBinary(), exec = execFile} = {}) {
   if (!String(baseUrl ?? "").trim() || !String(stateFile ?? "").trim()) {
     throw new Error("Room channel activation requires baseUrl and stateFile");
   }
-  const value = JSON.stringify({enabled: true, baseUrl, stateFile});
+  const account = {enabled: true, baseUrl, stateFile};
+  const value = JSON.stringify(accountId === "default" ? account : {accounts: {[accountId]: account}});
   try {
     await new Promise((resolve, reject) => {
     exec(command, ["config", "set", `channels.${CHANNEL_ID}`, value, "--strict-json", "--merge"], {
@@ -32,7 +33,8 @@ export async function activateRoomChannel({baseUrl, stateFile, command = resolve
     const configFile = `${homedir()}/.openclaw/openclaw.json`;
     try {
       const config = JSON.parse(await readFile(configFile, "utf8"));
-      const current = config?.channels?.[CHANNEL_ID] ?? {};
+      const channel = config?.channels?.[CHANNEL_ID] ?? {};
+      const current = accountId === "default" ? channel : channel.accounts?.[accountId] ?? {};
       if (current.enabled === true && current.baseUrl === baseUrl && current.stateFile === stateFile) return;
     } catch {}
     throw error;

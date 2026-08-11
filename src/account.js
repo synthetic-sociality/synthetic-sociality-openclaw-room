@@ -11,3 +11,14 @@ export function resolveAccountSelection({accountId, raw = {}, managed = null, de
     stateFile: explicitStateFile || selectedManaged?.stateFile || (accountId === "default" ? defaultStateFile : ""),
   };
 }
+
+export function resolveAccountConfig(section = {}, accountId = "default") {
+  const accounts = section?.accounts;
+  if (accounts && Object.prototype.hasOwnProperty.call(accounts, accountId)) {
+    return accounts[accountId] ?? {};
+  }
+  // Top-level channel fields configure only the default account. Falling back
+  // to them for a managed account aliases every discovered Room to the same
+  // state file and connector session.
+  return accountId === "default" ? section : {};
+}

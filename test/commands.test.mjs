@@ -11,7 +11,7 @@ test("room-join activates the channel and schedules a restart", async () => {
     registerCommand(command) { commands.set(command.name, command); },
   };
   registerRoomCommands(api, {
-    join: async () => ({roomId: "room-1", accountId: "default", baseUrl: "https://room.example/api", stateFile: "/private/state.json"}),
+    join: async () => ({roomId: "room-1", accountId: "member-2", baseUrl: "https://room.example/api", stateFile: "/private/state.json"}),
     activate: async (input) => { activation = input; },
     restart: () => { restarted += 1; },
     heal: async () => false,
@@ -19,7 +19,7 @@ test("room-join activates the channel and schedules a restart", async () => {
   const result = await commands.get("room-join").handler({
     args: `https://room.example/invitations/inv-1#secret=${"s".repeat(32)} Aura`,
   });
-  assert.deepEqual(activation, {baseUrl: "https://room.example/api", stateFile: "/private/state.json"});
+  assert.deepEqual(activation, {accountId: "member-2", baseUrl: "https://room.example/api", stateFile: "/private/state.json"});
   assert.equal(restarted, 1);
   assert.match(result.text, /restarting and will reconnect automatically/);
 });
