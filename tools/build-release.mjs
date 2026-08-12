@@ -41,8 +41,8 @@ const manifest = {
   sha256: createHash("sha256").update(bytes).digest("hex"),
   openclaw: packageJson.peerDependencies.openclaw,
   pluginId: "synthetic-sociality-room",
-	sourceCommit,
-	artifactIdentity,
+  sourceCommit,
+  artifactIdentity,
 };
 const manifestPath = resolve(options.output, `${created[0]}.manifest.json`);
 await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, {mode: 0o644});

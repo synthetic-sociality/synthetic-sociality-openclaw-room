@@ -14,7 +14,7 @@ export class OpenClawRoomRuntime {
     this.account = account;
     this.fetchImpl = fetchImpl;
     this.logger = logger;
-	this.releaseProvenance = releaseProvenance;
+  this.releaseProvenance = releaseProvenance;
     this.closed = false;
     this.connectorSession = null;
     this.initializeTask = null;
@@ -52,9 +52,9 @@ export class OpenClawRoomRuntime {
       metadata: {
         runtimeName: "OpenClaw",
         runtimeVersion: "2026.7.1-2",
-		roomConnectorVersion: this.releaseProvenance.version,
-		roomConnectorCommit: this.releaseProvenance.sourceCommit,
-		roomConnectorArtifact: this.releaseProvenance.artifactIdentity,
+    roomConnectorVersion: this.releaseProvenance.version,
+    roomConnectorCommit: this.releaseProvenance.sourceCommit,
+    roomConnectorArtifact: this.releaseProvenance.artifactIdentity,
         hostLabel: this.account.accountId,
         transport: "long_poll",
         modelDescriptor: "host-selected",
