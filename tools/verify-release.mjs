@@ -35,6 +35,8 @@ export async function verifyRelease(options) {
     if (packageJson.name !== manifest.package || packageJson.version !== manifest.version) throw new Error("Packaged identity does not match signed manifest");
     if (packageJson.peerDependencies?.openclaw !== manifest.openclaw) throw new Error("Packaged OpenClaw compatibility does not match signed manifest");
     if (pluginManifest.id !== manifest.pluginId) throw new Error("Packaged plugin id does not match signed manifest");
+	const provenance = await readFile(join(extractRoot, "package", "src", "release-provenance.js"), "utf8");
+	for (const expected of [manifest.version, manifest.sourceCommit, manifest.artifactIdentity]) if (!provenance.includes(JSON.stringify(expected))) throw new Error("Packaged runtime provenance does not match signed manifest");
   } finally {
     await rm(extractRoot, {recursive: true, force: true});
   }
@@ -42,12 +44,13 @@ export async function verifyRelease(options) {
 }
 
 export function validateManifest(value) {
-  if (!value || value.schemaVersion !== 1) throw new Error("Unsupported release manifest schema");
-  for (const field of ["package", "version", "archive", "sha256", "openclaw", "pluginId"]) {
+  if (!value || value.schemaVersion !== 2) throw new Error("Unsupported release manifest schema");
+  for (const field of ["package", "version", "archive", "sha256", "openclaw", "pluginId", "sourceCommit", "artifactIdentity"]) {
     if (typeof value[field] !== "string" || !value[field].trim()) throw new Error(`Release manifest is missing ${field}`);
   }
   if (!/^[a-f0-9]{64}$/.test(value.sha256)) throw new Error("Release manifest SHA-256 is invalid");
   if (value.archive.includes("/") || value.archive.includes("\\")) throw new Error("Release manifest archive name is unsafe");
+	if (!/^[a-f0-9]{40}$/.test(value.sourceCommit)) throw new Error("Release source commit is invalid");
 }
 
 export function parseArguments(values) {

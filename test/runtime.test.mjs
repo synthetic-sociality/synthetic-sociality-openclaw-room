@@ -44,12 +44,14 @@ test("initializes one connector session when native startup and event polling ov
     cursor: 0,
   });
   let registrations = 0;
+	let registrationBody;
   let connectorHeartbeats = 0;
   const activities = [];
   const runtime = new OpenClawRoomRuntime({accountId: "default", stateFile, baseUrl: "https://room.example/api"}, {
     fetchImpl: async (url, init) => {
       if (url.endsWith("/connector/sessions")) {
         registrations += 1;
+		registrationBody = JSON.parse(init.body);
         return new Response(JSON.stringify({sessionId: "session-1", heartbeatIntervalSeconds: 60}), {status: 200});
       }
       if (url.endsWith("/heartbeat")) {
@@ -68,6 +70,11 @@ test("initializes one connector session when native startup and event polling ov
   assert.equal(first.sessionId, "session-1");
   assert.equal(second.sessionId, "session-1");
   assert.equal(registrations, 1);
+	assert.deepEqual(registrationBody.metadata, {
+	  runtimeName: "OpenClaw", runtimeVersion: "2026.7.1-2",
+	  roomConnectorVersion: "0.2.26", roomConnectorCommit: "unknown", roomConnectorArtifact: "unknown",
+	  hostLabel: "default", transport: "long_poll", modelDescriptor: "host-selected",
+	});
   assert.equal(activities.length, 1);
   assert.deepEqual(activities[0], {
     version: 1,
@@ -80,6 +87,17 @@ test("initializes one connector session when native startup and event polling ov
   assert.equal(activities.length, 2);
   assert.equal(activities[1].streamSeq, 2);
   await runtime.close();
+});
+
+test("verified build provenance is sent independently of OpenClaw core version", async () => {
+	const directory=await mkdtemp(join(tmpdir(),"openclaw-room-provenance-")); const stateFile=join(directory,"default.json");
+	await saveState(stateFile,{version:1,baseUrl:"https://room.example/api",roomId:"room-1",membershipId:"member-1",credential:"secret",clientInstanceId:"client-1",cursor:0});
+	let metadata;
+	const runtime=new OpenClawRoomRuntime({accountId:"default",stateFile,baseUrl:"https://room.example/api"},{releaseProvenance:{version:"0.2.26",sourceCommit:"a".repeat(40),artifactIdentity:"sha256:"+"b".repeat(64)},fetchImpl:async(url,init)=>{
+	  if(url.endsWith("/connector/sessions")){metadata=JSON.parse(init.body).metadata;return new Response(JSON.stringify({sessionId:"s",heartbeatIntervalSeconds:60}),{status:200})}
+	  if(url.endsWith("/activity"))return new Response(JSON.stringify({acceptedStreamSeq:1}),{status:202}); throw new Error(url);
+	}});
+	await runtime.initialize(); assert.equal(metadata.runtimeVersion,"2026.7.1-2"); assert.equal(metadata.roomConnectorVersion,"0.2.26"); assert.equal(metadata.roomConnectorCommit,"a".repeat(40)); assert.equal(metadata.roomConnectorArtifact,"sha256:"+"b".repeat(64)); await runtime.close();
 });
 
 test("activity relay failure never disconnects the canonical connector", async () => {

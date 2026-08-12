@@ -8,19 +8,22 @@ import {fileURLToPath} from "node:url";
 const packageRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
 
 const valid = {
-  schemaVersion: 1,
+  schemaVersion: 2,
   package: "@synthetic-sociality/openclaw-room",
   version: "0.1.0",
   archive: "openclaw-room-0.1.0.tgz",
   sha256: "a".repeat(64),
   openclaw: "2026.7.1-2",
   pluginId: "synthetic-sociality-room",
+	sourceCommit: "c".repeat(40),
+	artifactIdentity: "npm:@synthetic-sociality/openclaw-room@0.1.0#git:"+"c".repeat(40),
 };
 
 test("accepts a pinned signed-release manifest shape", () => assert.doesNotThrow(() => validateManifest(valid)));
 test("rejects unsafe archive names and invalid hashes", () => {
   assert.throws(() => validateManifest({...valid, archive: "../plugin.tgz"}), /unsafe/);
   assert.throws(() => validateManifest({...valid, sha256: "abc"}), /SHA-256/);
+	assert.throws(() => validateManifest({...valid, sourceCommit: "unknown"}), /source commit/);
 });
 
 test("declares the compatibility and install metadata required by ClawHub", async () => {

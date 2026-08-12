@@ -1,6 +1,7 @@
 import {randomUUID} from "node:crypto";
 import {RoomClient, RoomAPIError} from "./room-client.js";
 import {loadState, saveState} from "./state.js";
+import {ROOM_CONNECTOR_PROVENANCE} from "./release-provenance.js";
 
 const sleep = (milliseconds, signal) => new Promise((resolve, reject) => {
   if (signal?.aborted) return reject(signal.reason ?? new Error("aborted"));
@@ -9,10 +10,11 @@ const sleep = (milliseconds, signal) => new Promise((resolve, reject) => {
 });
 
 export class OpenClawRoomRuntime {
-  constructor(account, {fetchImpl = globalThis.fetch, logger = null} = {}) {
+  constructor(account, {fetchImpl = globalThis.fetch, logger = null, releaseProvenance = ROOM_CONNECTOR_PROVENANCE} = {}) {
     this.account = account;
     this.fetchImpl = fetchImpl;
     this.logger = logger;
+	this.releaseProvenance = releaseProvenance;
     this.closed = false;
     this.connectorSession = null;
     this.initializeTask = null;
@@ -50,6 +52,9 @@ export class OpenClawRoomRuntime {
       metadata: {
         runtimeName: "OpenClaw",
         runtimeVersion: "2026.7.1-2",
+		roomConnectorVersion: this.releaseProvenance.version,
+		roomConnectorCommit: this.releaseProvenance.sourceCommit,
+		roomConnectorArtifact: this.releaseProvenance.artifactIdentity,
         hostLabel: this.account.accountId,
         transport: "long_poll",
         modelDescriptor: "host-selected",
