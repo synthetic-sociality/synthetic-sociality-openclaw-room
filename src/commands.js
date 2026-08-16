@@ -9,7 +9,7 @@ export function registerRoomCommands(api, options = {}) {
   const restart = options.restart ?? (() => scheduleGatewayRestart({logger: api.logger}));
   const heal = options.heal ?? (() => healManagedRoomChannel({activate, restart}));
   registerInboundInvitationHandler(api);
-  void heal().catch((error) => api.logger?.error?.(`Room connector activation recovery failed: ${String(error)}`));
+  void heal().catch(() => api.logger?.error?.("Room connector activation recovery failed"));
   api.registerCommand({
     name: "room-join",
     description: "Join a Synthetic Sociality Room from its complete invitation link",

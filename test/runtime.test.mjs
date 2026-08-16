@@ -49,6 +49,7 @@ test("initializes one connector session when native startup and event polling ov
   const activities = [];
   const runtime = new OpenClawRoomRuntime({accountId: "default", stateFile, baseUrl: "https://room.example/api"}, {
     fetchImpl: async (url, init) => {
+      if (url.endsWith("/status")) return new Response(JSON.stringify({protocolCapabilities: []}), {status: 200});
       if (url.endsWith("/connector/sessions")) {
         registrations += 1;
     registrationBody = JSON.parse(init.body);
@@ -72,7 +73,8 @@ test("initializes one connector session when native startup and event polling ov
   assert.equal(registrations, 1);
   assert.deepEqual(registrationBody.metadata, {
     runtimeName: "OpenClaw", runtimeVersion: "2026.7.1-2",
-    roomConnectorVersion: "0.2.26", roomConnectorCommit: "unknown", roomConnectorArtifact: "unknown",
+    roomConnectorVersion: "0.2.29", roomConnectorCommit: "unbuilt",
+    roomConnectorArtifact: "unbuilt",
     hostLabel: "default", transport: "long_poll", modelDescriptor: "host-selected",
   });
   assert.equal(activities.length, 1);
@@ -94,6 +96,7 @@ test("verified build provenance is sent independently of OpenClaw core version",
   await saveState(stateFile,{version:1,baseUrl:"https://room.example/api",roomId:"room-1",membershipId:"member-1",credential:"secret",clientInstanceId:"client-1",cursor:0});
   let metadata;
   const runtime=new OpenClawRoomRuntime({accountId:"default",stateFile,baseUrl:"https://room.example/api"},{releaseProvenance:{version:"0.2.26",sourceCommit:"a".repeat(40),artifactIdentity:"sha256:"+"b".repeat(64)},fetchImpl:async(url,init)=>{
+    if(url.endsWith("/status"))return new Response(JSON.stringify({protocolCapabilities:[]}),{status:200});
     if(url.endsWith("/connector/sessions")){metadata=JSON.parse(init.body).metadata;return new Response(JSON.stringify({sessionId:"s",heartbeatIntervalSeconds:60}),{status:200})}
     if(url.endsWith("/activity"))return new Response(JSON.stringify({acceptedStreamSeq:1}),{status:202}); throw new Error(url);
   }});
@@ -109,6 +112,7 @@ test("activity relay failure never disconnects the canonical connector", async (
   });
   const runtime = new OpenClawRoomRuntime({accountId: "default", stateFile, baseUrl: "https://room.example/api"}, {
     fetchImpl: async (url) => {
+      if (url.endsWith("/status")) return new Response(JSON.stringify({protocolCapabilities: []}), {status: 200});
       if (url.endsWith("/connector/sessions")) return new Response(JSON.stringify({sessionId: "session-1", heartbeatIntervalSeconds: 60}), {status: 200});
       if (url.endsWith("/activity")) return new Response(JSON.stringify({message: "relay unavailable"}), {status: 503});
       throw new Error(`Unexpected request: ${url}`);

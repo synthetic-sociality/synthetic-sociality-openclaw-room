@@ -6,9 +6,16 @@ import {join} from "node:path";
 import {defaultStateDirectory, loadState, validateState} from "./state.js";
 import {registerRoomCommands} from "./commands.js";
 import {markChannelActive, markChannelInactive, registerPresenceFallback} from "./presence-fallback.js";
-import {resolveAccountConfig, resolveAccountSelection} from "./account.js";
+import {
+  accountCandidates,
+  claimRuntimeOwnership,
+  resolveAccountConfig,
+  resolveAccountSelection,
+  selectUniqueAccountIds,
+} from "./account.js";
 import {looksLikeRoomId, normalizeRoomTarget, resolveConfiguredRoomTarget} from "./target.js";
 import {outboundIdempotencyKey} from "./outbound.js";
+import {roomErrorDiagnostic} from "./room-client.js";
 import {
   roomReplyDeliveryPolicy,
 } from "./reply-policy.js";
@@ -66,14 +73,15 @@ function resolveAccount(cfg, accountId = "default", {managedResolver = managedAc
 
 export function createRoomChannel({makeClient}) {
   const live = new Map();
+  const runtimeOwners = {accounts: new Map(), stateFiles: new Map()};
   const message = defineChannelMessageAdapter({
     receive: {defaultAckPolicy: "manual", supportedAckPolicies: ["manual"]},
     send: {
       text: async (ctx) => {
         const accountId = ctx.accountId ?? "default";
-        const client = live.get(accountId);
-        if (!client) throw new Error(`Room account ${accountId} is not running`);
-        const sent = await client.postAndFinish({
+        const entry = live.get(accountId);
+        if (!entry) throw new Error(`Room account ${accountId} is not running`);
+        const sent = await entry.client.postAndFinish({
           roomId: ctx.to,
           text: ctx.text,
           replyToId: ctx.replyToId,
@@ -112,7 +120,10 @@ export function createRoomChannel({makeClient}) {
       },
     },
     config: {
-      listAccountIds: (cfg) => [...new Set(["default", ...Object.keys(channelConfig(cfg).accounts ?? {}), ...managedAccounts()])],
+      listAccountIds: (cfg) => selectUniqueAccountIds(
+        accountCandidates(channelConfig(cfg), managedAccounts()),
+        (accountId) => resolveAccount(cfg, accountId),
+      ),
       resolveAccount: (cfg, accountId) => resolveAccount(cfg, accountId ?? "default"),
       isEnabled: (account) => account.enabled,
       isConfigured: (account) => account.configured,
@@ -123,15 +134,17 @@ export function createRoomChannel({makeClient}) {
       startAccount: async (ctx) => {
         const runtime = ctx.channelRuntime;
         if (!runtime) throw new Error("OpenClaw channelRuntime is unavailable");
-        const replyPolicy = roomReplyDeliveryPolicy();
-        const client = makeClient(ctx.account, {logger: ctx.log});
+        const ownership = claimRuntimeOwnership(runtimeOwners, ctx.account);
+        let client;
         let registered = false;
-        ctx.setStatus({...ctx.getStatus(), running: true, connected: false, lastError: null});
         try {
-          const session = await client.initialize(ctx.abortSignal);
-          live.set(ctx.accountId, client);
+          const replyPolicy = roomReplyDeliveryPolicy();
+          ctx.setStatus({...ctx.getStatus(), running: true, connected: false, lastError: null});
           await markChannelActive(ctx.accountId);
           registered = true;
+          client = makeClient(ctx.account, {logger: ctx.log});
+          const session = await client.initialize(ctx.abortSignal);
+          live.set(ctx.accountId, {token: ownership.token, client, abortSignal: ctx.abortSignal});
           ctx.setStatus({...ctx.getStatus(), running: true, connected: true, lastConnectedAt: Date.now(), lastError: null});
           ctx.log?.info?.(`[${ctx.accountId}] Room connection signal established (${session.sessionId})`);
           for await (const event of client.assignedTurns(ctx.abortSignal)) {
@@ -216,7 +229,7 @@ export function createRoomChannel({makeClient}) {
                         return {messageIds: [sent.eventId], receipt: receipt(sent.eventId, sent.sentAt), visibleReplySent: true};
                       },
                     },
-                    record: {createIfMissing: true, onRecordError: (error) => ctx.log?.error?.(`Room session record failed: ${String(error)}`)},
+                    record: {createIfMissing: true, onRecordError: () => ctx.log?.error?.("Room session record failed")},
                     messageId: event.sourceEventId,
                   };
                 },
@@ -231,19 +244,27 @@ export function createRoomChannel({makeClient}) {
           }
         } catch (error) {
           if (!ctx.abortSignal.aborted) {
-            ctx.setStatus({...ctx.getStatus(), connected: false, lastError: String(error)});
+            ctx.setStatus({...ctx.getStatus(), connected: false, lastError: `Room channel stopped unexpectedly${roomErrorDiagnostic(error)}`});
             throw error;
           }
         } finally {
-          live.delete(ctx.accountId);
-          await client.close();
-          if (registered) markChannelInactive(ctx.accountId);
-          ctx.setStatus({...ctx.getStatus(), running: false, connected: false, lastStopAt: Date.now()});
+          const liveEntry = live.get(ctx.accountId);
+          if (liveEntry?.token === ownership.token) live.delete(ctx.accountId);
+          try {
+            await client?.close();
+          } catch {
+            ctx.log?.warn?.(`[${ctx.accountId}] Room client close failed`);
+          }
+          if (registered && ownership.owns()) markChannelInactive(ctx.accountId);
+          if (ownership.owns()) {
+            ctx.setStatus({...ctx.getStatus(), running: false, connected: false, lastStopAt: Date.now()});
+          }
+          ownership.release();
         }
       },
       stopAccount: async (ctx) => {
-        await live.get(ctx.accountId)?.close();
-        live.delete(ctx.accountId);
+        const entry = live.get(ctx.accountId);
+        if (entry?.abortSignal === ctx.abortSignal) await entry.client.close();
       },
     },
   };

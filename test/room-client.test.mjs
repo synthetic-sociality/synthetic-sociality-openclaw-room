@@ -70,6 +70,48 @@ test("reports structured retryable API failures", async () => {
   });
 });
 
+test("validation diagnostics expose only status API code and field paths", async () => {
+  const secretToken = "token-super-secret";
+  const privateId = "membership-private-id";
+  const privateBody = "confidential contribution text";
+  const responseBody = {
+    code: "request_validation_failed",
+    message: `request validation failed for ${secretToken} ${privateId}`,
+    requestId: privateId,
+    body: {content: privateBody, token: secretToken},
+    errors: [
+      {path: ["body", "logicalContributionId"], message: privateId, value: privateId},
+      {fieldPath: "body.recipientSelectors[0].membershipId", rejected: privateId},
+      {path: ["body", secretToken], message: privateBody},
+    ],
+  };
+  const client = new RoomClient({baseUrl: "https://room.example/api", fetchImpl: async () =>
+    new Response(JSON.stringify(responseBody), {status: 422})});
+  await assert.rejects(() => client.roomState({roomId: "room-1", credential: secretToken}), (error) => {
+    assert.ok(error instanceof RoomAPIError);
+    assert.equal(error.status, 422);
+    assert.equal(error.code, "request_validation_failed");
+    assert.deepEqual(error.fieldPaths, ["body.logicalContributionId", "body.recipientSelectors[0].membershipId"]);
+    const diagnostic = JSON.stringify({message: error.message, status: error.status, code: error.code, fieldPaths: error.fieldPaths});
+    assert.match(diagnostic, /422/);
+    assert.match(diagnostic, /request_validation_failed/);
+    assert.doesNotMatch(diagnostic, new RegExp([secretToken, privateId, privateBody].join("|")));
+    assert.equal("body" in error, false);
+    return true;
+  });
+});
+
+test("unsafe API codes and field paths are omitted from diagnostics", () => {
+  const error = new RoomAPIError(400, {
+    code: "tokensecretvalue",
+    errors: [{fieldPath: "body.tokensecretvalue"}],
+    message: "secret content",
+  });
+  assert.equal(error.code, "");
+  assert.deepEqual(error.fieldPaths, []);
+  assert.equal(error.message, "Room API request failed (status=400)");
+});
+
 test("uses canonical state and long-poll query names", async () => {
   const urls = [];
   const client = new RoomClient({baseUrl: "https://room.example/api", fetchImpl: async (url) => {

@@ -69,7 +69,7 @@ export function scheduleGatewayRestart({command = resolveOpenClawBinary(), delay
       stdio: "ignore",
       env: process.env,
     });
-    child.on("error", (error) => logger?.error?.(`Room connector restart failed: ${String(error)}`));
+    child.on("error", () => logger?.error?.("Room connector restart failed"));
     child.unref();
   }, delayMs);
   timer.unref?.();

@@ -2,14 +2,64 @@
 // Keep a finite guard while allowing the protocol's complete room snapshot.
 const MAX_RESPONSE_BYTES = 16 << 20;
 
+const SAFE_API_CODES = new Set([
+  "busy",
+  "cycle_no_attempt",
+  "cycle_superseded",
+  "invitation_consumed",
+  "invitation_expired",
+  "invitation_invalid",
+  "request_validation_failed",
+  "stale_context",
+  "validation_error",
+]);
+const SAFE_FIELD_PATH = /^[A-Za-z_][A-Za-z0-9_]*(?:(?:\.[A-Za-z_][A-Za-z0-9_]*)|(?:\[\d+\]))*$/;
+const SAFE_FIELD_SEGMENTS = new Set([
+  "acknowledgedSeq", "agentId", "attemptId", "body", "clientInstanceId", "contributionType", "credential",
+  "cycleAttempt", "cycleId", "deviceCode", "displayName", "eventId", "holderMembershipId", "hostLabel", "idempotencyKey",
+  "identity", "invitationSecret", "invitationToken", "kind", "logicalContributionId", "membershipId", "message", "metadata",
+  "modelDescriptor", "observedSeq", "recipientSelectors", "replyToId", "respondsToId", "roomConnectorArtifact",
+  "roomConnectorCommit", "roomConnectorVersion", "roomId", "runId", "runtimeName", "runtimeVersion", "sourceEventId", "status",
+  "streamSeq", "text", "transport", "turnId",
+]);
+
+function normalizeFieldPath(value) {
+  const path = Array.isArray(value)
+    ? value.map((segment, index) => Number.isSafeInteger(segment) ? `[${segment}]` : `${index ? "." : ""}${String(segment)}`).join("")
+    : String(value ?? "");
+  const fieldSegments = path.match(/[A-Za-z_][A-Za-z0-9_]*/g) ?? [];
+  return path.length <= 256 && SAFE_FIELD_PATH.test(path) && fieldSegments.every((segment) => SAFE_FIELD_SEGMENTS.has(segment)) ? path : "";
+}
+
+function validationFieldPaths(body) {
+  const candidates = [];
+  for (const issue of [...(Array.isArray(body?.errors) ? body.errors : []), ...(Array.isArray(body?.issues) ? body.issues : [])]) {
+    candidates.push(issue?.fieldPath, issue?.field_path, issue?.path);
+  }
+  if (Array.isArray(body?.fieldPaths)) candidates.push(...body.fieldPaths);
+  return [...new Set(candidates.map(normalizeFieldPath).filter(Boolean))].slice(0, 32);
+}
+
 export class RoomAPIError extends Error {
   constructor(status, body) {
-    super(body?.message || `Room API request failed (${status})`);
+    const code = typeof body?.code === "string" && SAFE_API_CODES.has(body.code) ? body.code : "";
+    const fieldPaths = validationFieldPaths(body);
+    const diagnostics = [`status=${status}`, ...(code ? [`code=${code}`] : []), ...(fieldPaths.length ? [`fields=${fieldPaths.join(",")}`] : [])];
+    super(`Room API request failed (${diagnostics.join(", ")})`);
     this.name = "RoomAPIError";
     this.status = status;
-    this.code = body?.code || "";
+    this.code = code;
+    this.fieldPaths = fieldPaths;
     this.retryable = status === 429 || status >= 500 || body?.retryable === true;
   }
+}
+
+export function roomErrorDiagnostic(error) {
+  if (!(error instanceof RoomAPIError)) return "";
+  const status = Number.isSafeInteger(error.status) && error.status >= 100 && error.status <= 599 ? ` status=${error.status}` : "";
+  const code = error.code ? ` code=${error.code}` : "";
+  const fields = error.fieldPaths?.length ? ` fields=${error.fieldPaths.join(",")}` : "";
+  return `${status}${code}${fields}`;
 }
 
 export class RoomClient {

@@ -1,5 +1,5 @@
 import {createHash, randomUUID} from "node:crypto";
-import {RoomClient, RoomAPIError} from "./room-client.js";
+import {RoomClient, roomErrorDiagnostic} from "./room-client.js";
 import {loadState, saveState} from "./state.js";
 import {ROOM_CONNECTOR_PROVENANCE} from "./release-provenance.js";
 
@@ -23,6 +23,13 @@ If your work is delayed or parked, reconsider it against the current state of th
 Follow an explicit speaking order or special instruction when the human participant or Conversation Policy provides one. If an instruction cannot be followed safely or coherently, state that briefly rather than silently ignoring it.`;
 export const OPEN_EXCHANGE_PREAMBLE_SHA256 = createHash("sha256").update(OPEN_EXCHANGE_PREAMBLE).digest("hex");
 export const MESSAGE_LOGICAL_CONTRIBUTION_CAPABILITY = "messages.logical_contribution.v1";
+
+function acceptedActivitySequence(receipt, expected) {
+  if (!Number.isSafeInteger(receipt?.acceptedStreamSeq) || receipt.acceptedStreamSeq !== expected) {
+    throw new Error("Room activity receipt sequence is invalid");
+  }
+  return receipt.acceptedStreamSeq;
+}
 
 const sleep = (milliseconds, signal) => new Promise((resolve, reject) => {
   if (signal?.aborted) return reject(signal.reason ?? new Error("aborted"));
@@ -93,7 +100,7 @@ export class OpenClawRoomRuntime {
       },
     }, signal);
     await this.publishPresence(signal);
-    if (this.activityError) this.logger?.warn?.(`Room activity signal unavailable: ${String(this.activityError)}`);
+    if (this.activityError) this.logger?.warn?.(`Room activity signal unavailable${roomErrorDiagnostic(this.activityError)}`);
     else this.logger?.info?.("Room activity signal established");
     this.runHeartbeat();
     return this.connectorSession;
@@ -384,7 +391,7 @@ export class OpenClawRoomRuntime {
     this.heartbeatTask = loop().catch((error) => {
       if (!this.closed && !this.heartbeatAbort.signal.aborted) {
         this.heartbeatError = error;
-        this.logger?.error?.(`Room heartbeat loop stopped: ${String(error)}`);
+        this.logger?.error?.(`Room heartbeat loop stopped${roomErrorDiagnostic(error)}`);
       }
     });
   }
@@ -408,8 +415,8 @@ export class OpenClawRoomRuntime {
     };
     this.pendingPresence = activity;
     try {
-      await this.client.publishActivity(this.state, activity, signal);
-      this.presenceStreamSeq = activity.streamSeq;
+      const receipt = await this.client.publishActivity(this.state, activity, signal);
+      this.presenceStreamSeq = acceptedActivitySequence(receipt, activity.streamSeq);
       this.pendingPresence = null;
       this.activityError = null;
     } catch (error) {
@@ -436,12 +443,12 @@ export class OpenClawRoomRuntime {
     if (this.pendingActivityFrame) {
       try {
         const receipt = await this.client.publishActivity(this.state, this.pendingActivityFrame, signal);
-        this.activityStreamSeq = receipt.acceptedStreamSeq ?? this.pendingActivityFrame.streamSeq;
+        this.activityStreamSeq = acceptedActivitySequence(receipt, this.pendingActivityFrame.streamSeq);
         this.pendingActivityFrame = null;
         this.activityError = null;
       } catch (error) {
         this.activityError = error;
-        this.logger?.warn?.(`[activity] retry failed kind=${this.pendingActivityFrame.kind} frame=${JSON.stringify(this.pendingActivityFrame)}: ${String(error).slice(0, 120)}`);
+        this.logger?.warn?.(`[activity] retry failed kind=${this.pendingActivityFrame.kind}${roomErrorDiagnostic(error)}`);
         return;
       }
     }
@@ -460,13 +467,13 @@ export class OpenClawRoomRuntime {
     this.pendingActivityFrame = frame;
     try {
       const receipt = await this.client.publishActivity(this.state, frame, signal);
-      this.activityStreamSeq = receipt.acceptedStreamSeq ?? frame.streamSeq;
+      this.activityStreamSeq = acceptedActivitySequence(receipt, frame.streamSeq);
       this.pendingActivityFrame = null;
       this.activityError = null;
-      this.logger?.info?.(`[activity] published kind=${frame.kind} seq=${frame.streamSeq} status=${frame.status ?? ""} accepted=${receipt.acceptedStreamSeq}`);
+      this.logger?.info?.(`[activity] published kind=${frame.kind} seq=${frame.streamSeq} status=${frame.status ?? ""}`);
     } catch (error) {
       this.activityError = error;
-      this.logger?.warn?.(`[activity] publish failed kind=${kind} frame=${JSON.stringify(frame)}: ${String(error).slice(0, 120)}`);
+      this.logger?.warn?.(`[activity] publish failed kind=${kind}${roomErrorDiagnostic(error)}`);
     }
   }
 

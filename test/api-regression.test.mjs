@@ -10,12 +10,14 @@ import {saveState} from "../src/state.js";
 function mockFetch(captured, overrides = {}) {
   return async (url, init) => {
     captured.push({url, body: init?.body ? JSON.parse(init.body) : undefined});
+    if (url.endsWith("/status")) return new Response(JSON.stringify({protocolCapabilities: []}), {status: 200});
     if (url.endsWith("/connector/sessions")) return new Response(JSON.stringify({sessionId: "s1", heartbeatIntervalSeconds: 60}), {status: 200});
     if (url.endsWith("/heartbeat")) return new Response(JSON.stringify({}), {status: 200});
     if (url.endsWith("/activity")) return new Response(JSON.stringify({acceptedStreamSeq: 1}), {status: 202});
     if (url.endsWith("/turns/request")) return new Response(JSON.stringify({turnId: "t1", state: "granted", holderMembershipId: "member-1"}), {status: 202});
     if (url.endsWith("/messages")) return new Response(JSON.stringify({id: "msg-1", seq: 5, ts: new Date().toISOString()}), {status: 201});
     if (url.endsWith("/turns/finish")) return new Response(JSON.stringify({turnId: "t1", state: "finished"}), {status: 200});
+    if (url.endsWith("/policy")) return new Response(JSON.stringify({policy: {coordinationMode: "coordinated"}}), {status: 200});
     if (url.endsWith("/state")) return new Response(JSON.stringify({headSeq: 3, ...(overrides.state ?? {activeEpochId: "ep-1"})}), {status: 200});
     throw new Error(`unexpected request: ${url}`);
   };
@@ -81,9 +83,11 @@ test("cycle contribution survives an interleaved peer acknowledgement without a 
     fetchImpl: async (url, init) => {
       const body = init?.body ? JSON.parse(init.body) : undefined;
       captured.push({url, body});
-      if (url.endsWith("/connector/sessions")) return new Response(JSON.stringify({sessionId: "s1", heartbeatIntervalSeconds: 60}), {status: 200});
+      if (url.endsWith("/status")) return new Response(JSON.stringify({protocolCapabilities: []}), {status: 200});
+    if (url.endsWith("/connector/sessions")) return new Response(JSON.stringify({sessionId: "s1", heartbeatIntervalSeconds: 60}), {status: 200});
       if (url.endsWith("/activity")) return new Response(JSON.stringify({acceptedStreamSeq: body.streamSeq}), {status: 202});
-      if (url.endsWith("/state")) return new Response(JSON.stringify({headSeq: 7, activeEpoch: {id: "epoch-1"}}), {status: 200});
+      if (url.endsWith("/policy")) return new Response(JSON.stringify({policy: {coordinationMode: "coordinated"}}), {status: 200});
+    if (url.endsWith("/state")) return new Response(JSON.stringify({headSeq: 7, activeEpoch: {id: "epoch-1"}}), {status: 200});
       // The response sequence deliberately trails the canonical head after a
       // peer acknowledgement. A normal finishTurn(observedSeq=8) would now
       // be stale and leave its granted lease behind.
@@ -207,7 +211,8 @@ test("postAndFinish emits preparing_response and terminal posted activity frames
     fetchImpl: async (url, init) => {
       const body = init?.body ? JSON.parse(init.body) : undefined;
       captured.push({url, body});
-      if (url.endsWith("/connector/sessions")) return new Response(JSON.stringify({sessionId: "s1", heartbeatIntervalSeconds: 60}), {status: 200});
+      if (url.endsWith("/status")) return new Response(JSON.stringify({protocolCapabilities: []}), {status: 200});
+    if (url.endsWith("/connector/sessions")) return new Response(JSON.stringify({sessionId: "s1", heartbeatIntervalSeconds: 60}), {status: 200});
       if (url.endsWith("/heartbeat")) return new Response(JSON.stringify({}), {status: 200});
       if (url.endsWith("/activity")) {
         activityFrames.push(body);
@@ -216,7 +221,8 @@ test("postAndFinish emits preparing_response and terminal posted activity frames
       if (url.endsWith("/turns/request")) return new Response(JSON.stringify({turnId: "t1", state: "granted", holderMembershipId: "member-1"}), {status: 202});
       if (url.endsWith("/messages")) return new Response(JSON.stringify({id: "msg-1", seq: 5, ts: new Date().toISOString()}), {status: 201});
       if (url.endsWith("/turns/finish")) return new Response(JSON.stringify({turnId: "t1", state: "finished"}), {status: 200});
-      if (url.endsWith("/state")) return new Response(JSON.stringify({headSeq: 3, activeEpoch: {id: "ep-1"}}), {status: 200});
+      if (url.endsWith("/policy")) return new Response(JSON.stringify({policy: {coordinationMode: "coordinated"}}), {status: 200});
+    if (url.endsWith("/state")) return new Response(JSON.stringify({headSeq: 3, activeEpoch: {id: "ep-1"}}), {status: 200});
       throw new Error(`unexpected request: ${url}`);
     },
   });
@@ -251,14 +257,16 @@ test("assignedTurns emits context_acknowledged for assigned messages", async () 
   const runtime = new OpenClawRoomRuntime({accountId: "default", stateFile, baseUrl: "https://room.example/api"}, {
     fetchImpl: async (url, init) => {
       const body = init?.body ? JSON.parse(init.body) : undefined;
-      if (url.endsWith("/connector/sessions")) return new Response(JSON.stringify({sessionId: "s1", heartbeatIntervalSeconds: 60}), {status: 200});
+      if (url.endsWith("/status")) return new Response(JSON.stringify({protocolCapabilities: []}), {status: 200});
+    if (url.endsWith("/connector/sessions")) return new Response(JSON.stringify({sessionId: "s1", heartbeatIntervalSeconds: 60}), {status: 200});
       if (url.endsWith("/heartbeat")) return new Response(JSON.stringify({}), {status: 200});
       if (url.endsWith("/activity")) {
         activityFrames.push(body);
         return new Response(JSON.stringify({acceptedStreamSeq: body.streamSeq}), {status: 202});
       }
       if (url.endsWith("/events")) return new Response(JSON.stringify({events: [], headSeq: 5}), {status: 200});
-      if (url.endsWith("/state")) return new Response(JSON.stringify({headSeq: 3, activeEpoch: {id: "ep-1"}}), {status: 200});
+      if (url.endsWith("/policy")) return new Response(JSON.stringify({policy: {coordinationMode: "coordinated"}}), {status: 200});
+    if (url.endsWith("/state")) return new Response(JSON.stringify({headSeq: 3, activeEpoch: {id: "ep-1"}}), {status: 200});
       if (url.endsWith("/acknowledgements")) return new Response(JSON.stringify({acknowledgedSeq: 2}), {status: 200});
       throw new Error(`unexpected request: ${url}`);
     },
@@ -290,7 +298,8 @@ test("activity publication failure never terminates the connector", async () => 
   const warnings = [];
   const runtime = new OpenClawRoomRuntime({accountId: "default", stateFile, baseUrl: "https://room.example/api"}, {
     fetchImpl: async (url) => {
-      if (url.endsWith("/connector/sessions")) return new Response(JSON.stringify({sessionId: "s1", heartbeatIntervalSeconds: 60}), {status: 200});
+      if (url.endsWith("/status")) return new Response(JSON.stringify({protocolCapabilities: []}), {status: 200});
+    if (url.endsWith("/connector/sessions")) return new Response(JSON.stringify({sessionId: "s1", heartbeatIntervalSeconds: 60}), {status: 200});
       if (url.endsWith("/activity")) return new Response("temporary failure", {status: 503});
       throw new Error(`unexpected request: ${url}`);
     },
@@ -299,11 +308,52 @@ test("activity publication failure never terminates the connector", async () => 
 
   await runtime.initialize();
   try {
-    await assert.doesNotReject(() => runtime.publishActivityFrame({kind: "lifecycle", status: "reading_shared_room"}));
+    const secretId = "membershipprivate123";
+    const secretText = "confidential contribution text";
+    await assert.doesNotReject(() => runtime.publishActivityFrame({
+      kind: "lifecycle",
+      status: "reading_shared_room",
+      sourceEventId: secretId,
+      textDelta: secretText,
+    }));
     assert.ok(runtime.activityError, "must retain the activity publish error for diagnostics");
     assert.ok(warnings.some((message) => /publish failed kind=lifecycle/.test(message)));
+    assert.doesNotMatch(warnings.join("\n"), new RegExp(`${secretId}|${secretText}`));
   } finally {
     await runtime.close();
+  }
+});
+
+test("missing or mismatched activity receipt sequences never acknowledge pending frames", async () => {
+  const unsafeSequence = "credentialABC123";
+  for (const receipt of [{}, {acceptedStreamSeq: 999}, {acceptedStreamSeq: unsafeSequence}]) {
+    const messages = [];
+    const runtime = new OpenClawRoomRuntime({accountId: "default", stateFile: "/unused", baseUrl: "https://room.example/api"}, {
+      logger: {info: (message) => messages.push(message), warn: (message) => messages.push(message)},
+    });
+    runtime.state = {roomId: "room-1", membershipId: "member-1", credential: "secret"};
+    runtime.client = {publishActivity: async () => receipt};
+
+    await runtime.publishActivityFrame({kind: "lifecycle", status: "reading_shared_room"});
+
+    assert.ok(runtime.activityError);
+    assert.equal(runtime.activityStreamSeq, 0);
+    assert.ok(runtime.pendingActivityFrame);
+    assert.doesNotMatch(messages.join("\n"), new RegExp(unsafeSequence));
+  }
+});
+
+test("presence rejects missing or mismatched activity receipt sequences", async () => {
+  for (const receipt of [{}, {acceptedStreamSeq: 999}, {acceptedStreamSeq: "not-an-integer"}]) {
+    const runtime = new OpenClawRoomRuntime({accountId: "default", stateFile: "/unused", baseUrl: "https://room.example/api"});
+    runtime.state = {roomId: "room-1", membershipId: "member-1", credential: "secret"};
+    runtime.client = {publishActivity: async () => receipt};
+
+    await runtime.publishPresence();
+
+    assert.ok(runtime.activityError);
+    assert.equal(runtime.presenceStreamSeq, 0);
+    assert.ok(runtime.pendingPresence);
   }
 });
 
