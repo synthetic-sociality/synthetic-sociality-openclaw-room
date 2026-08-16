@@ -4,7 +4,7 @@ import {mkdtemp} from "node:fs/promises";
 import {tmpdir} from "node:os";
 import {join} from "node:path";
 import {canonicalRoomContext, commandInstruction, cyclePhaseInstruction, isAssignedEvent, isAssignedMessage, normalizeEvent, OpenClawRoomRuntime} from "../src/runtime.js";
-import {saveState} from "../src/state.js";
+import {loadState, saveState} from "../src/state.js";
 
 test("keeps durable rounds generic and bounded instead of imposing a room topic", () => {
   const cycle = {budgets: {perAgentTurns: 7}};
@@ -46,13 +46,22 @@ test("initializes one connector session when native startup and event polling ov
   let registrations = 0;
   let registrationBody;
   let connectorHeartbeats = 0;
+  let statusRequests = 0;
   const activities = [];
   const runtime = new OpenClawRoomRuntime({accountId: "default", stateFile, baseUrl: "https://room.example/api"}, {
     fetchImpl: async (url, init) => {
+      if (url.endsWith("/status")) {
+        statusRequests += 1;
+        return new Response(JSON.stringify({code: "request_validation_failed"}), {status: 400});
+      }
       if (url.endsWith("/connector/sessions")) {
         registrations += 1;
     registrationBody = JSON.parse(init.body);
-        return new Response(JSON.stringify({sessionId: "session-1", heartbeatIntervalSeconds: 60}), {status: 200});
+        return new Response(JSON.stringify({
+          sessionId: "session-1",
+          heartbeatIntervalSeconds: 60,
+          capabilities: ["events.long_poll", "messages.logical_contribution.v1"],
+        }), {status: 200});
       }
       if (url.endsWith("/heartbeat")) {
         connectorHeartbeats += 1;
@@ -70,11 +79,12 @@ test("initializes one connector session when native startup and event polling ov
   assert.equal(first.sessionId, "session-1");
   assert.equal(second.sessionId, "session-1");
   assert.equal(registrations, 1);
+  assert.equal(statusRequests, 0, "legacy Room deployments must not be blocked by an unauthenticated /status probe");
   assert.deepEqual(registrationBody.metadata, {
     runtimeName: "OpenClaw", runtimeVersion: "2026.7.1-2",
-    roomConnectorVersion: "0.2.26", roomConnectorCommit: "unknown", roomConnectorArtifact: "unknown",
     hostLabel: "default", transport: "long_poll", modelDescriptor: "host-selected",
   });
+  assert.equal((await loadState(stateFile)).messagePayloadDialect, "v2");
   assert.equal(activities.length, 1);
   assert.deepEqual(activities[0], {
     version: 1,
@@ -89,15 +99,21 @@ test("initializes one connector session when native startup and event polling ov
   await runtime.close();
 });
 
-test("verified build provenance is sent independently of OpenClaw core version", async () => {
+test("verified build provenance stays embedded without violating strict registration metadata", async () => {
   const directory=await mkdtemp(join(tmpdir(),"openclaw-room-provenance-")); const stateFile=join(directory,"default.json");
   await saveState(stateFile,{version:1,baseUrl:"https://room.example/api",roomId:"room-1",membershipId:"member-1",credential:"secret",clientInstanceId:"client-1",cursor:0});
   let metadata;
   const runtime=new OpenClawRoomRuntime({accountId:"default",stateFile,baseUrl:"https://room.example/api"},{releaseProvenance:{version:"0.2.26",sourceCommit:"a".repeat(40),artifactIdentity:"sha256:"+"b".repeat(64)},fetchImpl:async(url,init)=>{
+    if(url.endsWith("/status"))return new Response(JSON.stringify({protocolCapabilities:[]}),{status:200});
     if(url.endsWith("/connector/sessions")){metadata=JSON.parse(init.body).metadata;return new Response(JSON.stringify({sessionId:"s",heartbeatIntervalSeconds:60}),{status:200})}
     if(url.endsWith("/activity"))return new Response(JSON.stringify({acceptedStreamSeq:1}),{status:202}); throw new Error(url);
   }});
-  await runtime.initialize(); assert.equal(metadata.runtimeVersion,"2026.7.1-2"); assert.equal(metadata.roomConnectorVersion,"0.2.26"); assert.equal(metadata.roomConnectorCommit,"a".repeat(40)); assert.equal(metadata.roomConnectorArtifact,"sha256:"+"b".repeat(64)); await runtime.close();
+  await runtime.initialize();
+  assert.deepEqual(metadata, {runtimeName:"OpenClaw",runtimeVersion:"2026.7.1-2",hostLabel:"default",transport:"long_poll",modelDescriptor:"host-selected"});
+  assert.equal(runtime.releaseProvenance.version,"0.2.26");
+  assert.equal(runtime.releaseProvenance.sourceCommit,"a".repeat(40));
+  assert.equal(runtime.releaseProvenance.artifactIdentity,"sha256:"+"b".repeat(64));
+  await runtime.close();
 });
 
 test("activity relay failure never disconnects the canonical connector", async () => {
@@ -109,6 +125,7 @@ test("activity relay failure never disconnects the canonical connector", async (
   });
   const runtime = new OpenClawRoomRuntime({accountId: "default", stateFile, baseUrl: "https://room.example/api"}, {
     fetchImpl: async (url) => {
+      if (url.endsWith("/status")) return new Response(JSON.stringify({protocolCapabilities: []}), {status: 200});
       if (url.endsWith("/connector/sessions")) return new Response(JSON.stringify({sessionId: "session-1", heartbeatIntervalSeconds: 60}), {status: 200});
       if (url.endsWith("/activity")) return new Response(JSON.stringify({message: "relay unavailable"}), {status: 503});
       throw new Error(`Unexpected request: ${url}`);

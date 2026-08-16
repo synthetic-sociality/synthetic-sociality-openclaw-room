@@ -1,6 +1,7 @@
 import {readdirSync} from "node:fs";
 import {join} from "node:path";
 import {defaultStateDirectory} from "./state.js";
+import {roomErrorDiagnostic} from "./room-client.js";
 
 const START_GRACE_MS = 5_000;
 const RECONCILE_MS = 10_000;
@@ -73,13 +74,13 @@ export function registerPresenceFallback(api, {
               ctx.logger?.warn?.(`[${account.accountId}] Native channel did not register; Room presence fallback established (${session.sessionId})`);
             } catch (error) {
               await runtime.close().catch(() => {});
-              ctx.logger?.error?.(`[${account.accountId}] Room presence fallback failed: ${String(error)}`);
+              ctx.logger?.error?.(`[${account.accountId}] Room presence fallback failed${roomErrorDiagnostic(error)}`);
             }
           }
           await pause(reconcileMs);
         }
       })().catch((error) => {
-        if (serviceRunning) ctx.logger?.error?.(`Room presence fallback stopped unexpectedly: ${String(error)}`);
+        if (serviceRunning) ctx.logger?.error?.(`Room presence fallback stopped unexpectedly${roomErrorDiagnostic(error)}`);
       });
     },
     stop: async () => {

@@ -10,7 +10,7 @@ const release = {
   version: "0.1.0",
   pluginId: "synthetic-sociality-room",
   manifest: {sha256: "a".repeat(64)},
-  publicKeyFingerprintSha256: "067f60d608e397d94bd5d0ef7f2b41d5c9794c6fe669186aad4925bf3242c4ad",
+  publicKeyFingerprintSha256: "331497310fe80e0b14c878466827714c1492d764ec9bcfc9659a61d48ccc06e3",
 };
 
 test("fresh installation is pinned to npm-pack and never joins a Room", () => {

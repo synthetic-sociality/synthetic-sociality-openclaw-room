@@ -1,7 +1,35 @@
-import {randomUUID} from "node:crypto";
-import {RoomClient, RoomAPIError} from "./room-client.js";
+import {createHash, randomUUID} from "node:crypto";
+import {RoomAPIError, RoomClient, roomErrorDiagnostic} from "./room-client.js";
 import {loadState, saveState} from "./state.js";
 import {ROOM_CONNECTOR_PROVENANCE} from "./release-provenance.js";
+
+export const OPEN_EXCHANGE_PREAMBLE_VERSION = "Open Exchange – Room Behaviour Preamble v1";
+export const OPEN_EXCHANGE_PREAMBLE = `This room uses Open Exchange as its default form of interaction.
+
+Respond to the human participant’s current question or request directly and naturally. The Conversation Policy and this guidance apply throughout the exchange, but they must not distract you from answering the human.
+
+There is no predetermined speaking order unless the human participant or the Conversation Policy explicitly defines one. Every connected agent should receive a fair opportunity to participate, but equal consideration does not require an equal number of published messages.
+
+Before contributing again, review what has changed since your previous contribution. Attend to the contributions of other participants and, where relevant, refer to them explicitly. Contribute when you can add a genuinely new perspective, clarification, objection, extension or synthesis. If you have nothing meaningful to add, passing or remaining silent is a valid and constructive outcome.
+
+Agreement is welcome but not required. Preserve logically justified disagreement. You may agree, disagree, qualify a position, or agree to disagree, provided your reasoning is clear and you have considered the relevant contributions of others.
+
+Meta-reflection is permitted when it improves the exchange. You may ask whether the topic has been sufficiently explored, identify agreements and discrepancies, notice neglected perspectives, or examine whether technical conditions affected participation. Meta-reflection must remain proportionate and must not replace substantive engagement with the human’s question.
+
+You may seek a broad or even comprehensive synthesis. Do not manufacture consensus or erase minority positions. A valid conclusion may contain both convergences and unresolved, well-reasoned divergences.
+
+If your work is delayed or parked, reconsider it against the current state of the conversation before publishing. You may publish it, revise it, continue reasoning, or pass. Do not publish the same logical contribution more than once, including after retries, reconnects or model fallbacks.
+
+Follow an explicit speaking order or special instruction when the human participant or Conversation Policy provides one. If an instruction cannot be followed safely or coherently, state that briefly rather than silently ignoring it.`;
+export const OPEN_EXCHANGE_PREAMBLE_SHA256 = createHash("sha256").update(OPEN_EXCHANGE_PREAMBLE).digest("hex");
+export const MESSAGE_LOGICAL_CONTRIBUTION_CAPABILITY = "messages.logical_contribution.v1";
+
+function acceptedActivitySequence(receipt, expected) {
+  if (!Number.isSafeInteger(receipt?.acceptedStreamSeq) || receipt.acceptedStreamSeq !== expected) {
+    throw new Error("Room activity receipt sequence is invalid");
+  }
+  return receipt.acceptedStreamSeq;
+}
 
 const sleep = (milliseconds, signal) => new Promise((resolve, reject) => {
   if (signal?.aborted) return reject(signal.reason ?? new Error("aborted"));
@@ -48,20 +76,27 @@ export class OpenClawRoomRuntime {
     this.connectorSession = await this.client.register(this.state, {
       clientInstanceId: this.state.clientInstanceId,
       contractVersion: 1,
-      capabilities: ["events.long_poll", "activity.relay"],
+      capabilities: ["events.long_poll", "activity.relay", MESSAGE_LOGICAL_CONTRIBUTION_CAPABILITY],
       metadata: {
         runtimeName: "OpenClaw",
         runtimeVersion: "2026.7.1-2",
-    roomConnectorVersion: this.releaseProvenance.version,
-    roomConnectorCommit: this.releaseProvenance.sourceCommit,
-    roomConnectorArtifact: this.releaseProvenance.artifactIdentity,
         hostLabel: this.account.accountId,
         transport: "long_poll",
         modelDescriptor: "host-selected",
       },
     }, signal);
+    const capabilities = this.connectorSession?.capabilities;
+    if (capabilities !== undefined && (
+      !Array.isArray(capabilities) || !capabilities.every((item) => typeof item === "string")
+    )) throw new Error("Room registration returned malformed protocol capabilities");
+    this.state.messagePayloadCapabilities = [...new Set(capabilities ?? [])];
+    this.state.messagePayloadDialect = this.state.messagePayloadCapabilities.includes(
+      MESSAGE_LOGICAL_CONTRIBUTION_CAPABILITY,
+    ) ? "v2" : "v1";
+    this.state.deliveryIntents ??= {};
+    await saveState(this.account.stateFile, this.state);
     await this.publishPresence(signal);
-    if (this.activityError) this.logger?.warn?.(`Room activity signal unavailable: ${String(this.activityError)}`);
+    if (this.activityError) this.logger?.warn?.(`Room activity signal unavailable${roomErrorDiagnostic(this.activityError)}`);
     else this.logger?.info?.("Room activity signal established");
     this.runHeartbeat();
     return this.connectorSession;
@@ -100,18 +135,14 @@ export class OpenClawRoomRuntime {
   }
 
   async sharedRoomContext(event, signal) {
-    try {
-      const state = await this.client.roomState(this.state, signal);
-      const policy = await this.client.roomPolicy(this.state, signal);
-      const before = Math.max(0, Number(event?.seq ?? state.headSeq ?? this.state.cursor) - 50);
-      const page = await this.client.readEvents(this.state, before, {wait: 0, signal});
-      return canonicalRoomContext(state, page?.events, event?.id, policy);
-    } catch (error) {
-      // Context enrichment is bounded and best-effort. A temporarily
-      // unavailable context read must not stop canonical event processing.
-      this.logger?.warn?.(`Room context refresh unavailable: ${String(error).slice(0, 120)}`);
-      return "";
-    }
+    // Conversation Policy, saved Add guidance and canonical transcript are
+    // mandatory model input. If any read fails, leave the event unacknowledged
+    // and fail closed so a later retry cannot answer without owner guidance.
+    const state = await this.client.roomState(this.state, signal);
+    const policy = await this.client.roomPolicy(this.state, signal);
+    const before = Math.max(0, Number(event?.seq ?? state.headSeq ?? this.state.cursor) - 50);
+    const page = await this.client.readEvents(this.state, before, {wait: 0, signal});
+    return canonicalRoomContext(state, page?.events, event?.id, policy);
   }
 
   async prepareCycleAttempt(event, signal) {
@@ -191,55 +222,129 @@ export class OpenClawRoomRuntime {
     if (roomId !== this.state.roomId) throw new Error("Outbound Room does not match connector membership");
     const body = String(text ?? "").trim();
     if (!body) throw new Error("OpenClaw produced an empty Room response");
-    await this.markTurnPreparing(sourceEventId, signal);
-    const state = await this.client.roomState(this.state, signal);
-    const topicId = state.activeTopic?.id ?? null;
-    let granted = null;
-    let fresh = state;
-    if (!cycleAttempt) {
-      const requestKey = safeKey(`${idempotencyKey}:request`);
-      const turn = await this.client.requestTurn(this.state, {
-        observedSeq: state.headSeq,
-        idempotencyKey: requestKey,
-        ...(topicId ? {topicId} : {}),
-      }, signal);
-      granted = await this.waitForGrant(turn, signal);
-      fresh = await this.client.roomState(this.state, signal);
+    const deliveryKey = String(idempotencyKey ?? "").trim();
+    if (!deliveryKey) throw new Error("OpenClaw Room delivery has no durable idempotency key");
+    const requestedCycle = cycleAttempt ? {
+      cycleId: String(cycleAttempt.cycle.id),
+      attemptId: String(cycleAttempt.attempt.id),
+      generation: Number(cycleAttempt.cycle.generation),
+    } : null;
+    const requestedIdentity = {
+      roomId, body, replyToId: String(replyToId ?? ""),
+      sourceEventId: String(sourceEventId ?? ""), cycle: requestedCycle,
+    };
+    this.state.deliveryIntents ??= {};
+    let intent = this.state.deliveryIntents[deliveryKey];
+    if (intent) {
+      const frozenRequestedIdentity = {
+        roomId: intent.identity?.roomId, body: intent.identity?.body,
+        replyToId: intent.identity?.replyToId, sourceEventId: intent.identity?.sourceEventId,
+        cycle: intent.identity?.cycle ?? null,
+      };
+      if (JSON.stringify(frozenRequestedIdentity) !== JSON.stringify(requestedIdentity)) {
+        throw new Error("OpenClaw Room delivery key was reused with a different semantic intent");
+      }
+      if (!["v1", "v2"].includes(intent.messagePayloadDialect)) {
+        throw new Error("Existing OpenClaw Room delivery has no frozen message payload dialect");
+      }
+      if (intent.status === "posted" && intent.receipt) return intent.receipt;
+    } else {
+      const initialState = await this.client.roomState(this.state, signal);
+      const topicId = initialState.activeTopic?.id ?? null;
+      const policyEnvelope = cycleAttempt ? null : await this.client.roomPolicy(this.state, signal);
+      const policy = policyEnvelope?.policy && typeof policyEnvelope.policy === "object" ? policyEnvelope.policy : policyEnvelope;
+      const openExchange = String(policy?.coordinationMode ?? "coordinated") === "open";
+      const coordinationMode = cycleAttempt ? "cycle" : (openExchange ? "open" : "coordinated");
+      const nextRecipient = cycleAttempt ? nextCycleRecipient(cycleAttempt.cycle, this.state.membershipId) : "";
+      const payloadDialect = this.state.messagePayloadDialect ?? "v1";
+      if (!["v1", "v2"].includes(payloadDialect)) throw new Error("Room message payload dialect was not negotiated");
+      intent = {
+        version: 1,
+        status: "selected",
+        identity: {
+          ...requestedIdentity, coordinationMode, nextRecipient, topicId,
+          initialObservedSeq: Number(initialState.headSeq ?? 0),
+          initialEpochId: String(initialState.activeEpoch?.id ?? ""),
+        },
+        messagePayloadDialect: payloadDialect,
+        logicalContributionId: safeKey(`logical-contribution:${replyToId || sourceEventId || deliveryKey}`),
+        requestIdempotencyKey: safeKey(`${deliveryKey}:request`),
+        messageIdempotencyKey: safeKey(`${deliveryKey}:message`),
+        finishIdempotencyKey: safeKey(`${deliveryKey}:finish`),
+      };
+      if (coordinationMode === "coordinated") {
+        intent.turnRequest = {
+          observedSeq: intent.identity.initialObservedSeq,
+          idempotencyKey: intent.requestIdempotencyKey,
+          ...(topicId ? {topicId} : {}),
+        };
+      }
+      this.state.deliveryIntents[deliveryKey] = intent;
+      await this.persistState();
     }
-    const nextRecipient = cycleAttempt ? nextCycleRecipient(cycleAttempt.cycle, this.state.membershipId) : "";
-    const message = await this.client.postMessage(this.state, {
-      ...(granted ? {turnId: granted.turnId} : {}),
-      observedSeq: fresh.headSeq,
-      idempotencyKey: safeKey(`${idempotencyKey}:message`),
-      ...(topicId ? {topicId} : {}),
-      ...(fresh.activeEpoch?.id ? {observedEpochId: fresh.activeEpoch.id} : {}),
-      ...(replyToId ? {respondsTo: [replyToId]} : {}),
-      ...(nextRecipient ? {recipientSelectors: [{kind: "membership", membershipId: nextRecipient}]} : {}),
-      ...(cycleAttempt ? {
-        cycleId: cycleAttempt.cycle.id,
-        attemptId: cycleAttempt.attempt.id,
-        cycleGeneration: cycleAttempt.cycle.generation,
-      } : {}),
-      contributionType: nextRecipient ? "question" : "claim",
-      body,
-    }, signal);
-    if (cycleAttempt) {
-      await this.client.completeDiscussionAttempt(this.state, cycleAttempt.cycle.id, cycleAttempt.attempt.id, {
-        generation: cycleAttempt.cycle.generation,
+    await this.markTurnPreparing(intent.identity.sourceEventId, signal);
+    let granted = null;
+    if (intent.turn) {
+      granted = intent.turn;
+    } else if (intent.identity.coordinationMode === "coordinated") {
+      const turn = await this.client.requestTurn(this.state, intent.turnRequest, signal);
+      granted = await this.waitForGrant(turn, signal);
+      intent.turn = {turnId: granted.turnId};
+      await this.persistState();
+    }
+    if (!intent.post) {
+      const fresh = granted ? await this.client.roomState(this.state, signal) : {
+        headSeq: intent.identity.initialObservedSeq,
+        activeEpoch: intent.identity.initialEpochId ? {id: intent.identity.initialEpochId} : null,
+      };
+      intent.post = {
+        ...(granted ? {turnId: granted.turnId} : {}),
+        observedSeq: fresh.headSeq,
+        idempotencyKey: intent.messageIdempotencyKey,
+        ...(intent.messagePayloadDialect === "v2" ? {logicalContributionId: intent.logicalContributionId} : {}),
+        ...(intent.identity.topicId ? {topicId: intent.identity.topicId} : {}),
+        ...(fresh.activeEpoch?.id ? {observedEpochId: fresh.activeEpoch.id} : {}),
+        ...(intent.identity.replyToId ? {respondsTo: [intent.identity.replyToId]} : {}),
+        ...(intent.identity.nextRecipient ? {recipientSelectors: [{kind: "membership", membershipId: intent.identity.nextRecipient}]} : {}),
+        ...(intent.identity.cycle ? {
+          cycleId: intent.identity.cycle.cycleId,
+          attemptId: intent.identity.cycle.attemptId,
+          cycleGeneration: intent.identity.cycle.generation,
+        } : {}),
+        contributionType: intent.identity.nextRecipient ? "question" : "claim",
+        body: intent.identity.body,
+      };
+      await this.persistState();
+    }
+    const message = await this.client.postMessage(this.state, intent.post, signal);
+    intent.canonicalMessage = {id: message.id, seq: message.seq, ts: message.ts};
+    await this.persistState();
+    if (intent.identity.cycle) {
+      await this.client.completeDiscussionAttempt(this.state, intent.identity.cycle.cycleId, intent.identity.cycle.attemptId, {
+        generation: intent.identity.cycle.generation,
         action: "contribute",
         eventId: message.id,
       }, signal);
-      cycleAttempt.settled = true;
+      if (cycleAttempt) cycleAttempt.settled = true;
     }
     if (granted) {
-      await this.client.finishTurn(this.state, {
+      intent.finish ??= {
         turnId: granted.turnId,
         observedSeq: message.seq,
-        idempotencyKey: safeKey(`${idempotencyKey}:finish`),
-      }, signal);
+        idempotencyKey: intent.finishIdempotencyKey,
+      };
+      await this.persistState();
+      await this.client.finishTurn(this.state, intent.finish, signal);
     }
-    await this.markTurnPosted(sourceEventId, message.id, signal);
-    return {eventId: message.id, sentAt: Date.parse(message.ts) || Date.now()};
+    await this.markTurnPosted(intent.identity.sourceEventId, message.id, signal);
+    intent.status = "posted";
+    intent.receipt = {eventId: message.id, sentAt: Date.parse(message.ts) || Date.now()};
+    await this.persistState();
+    return intent.receipt;
+  }
+
+  async persistState() {
+    if (this.account?.stateFile) await saveState(this.account.stateFile, this.state);
   }
 
   async passDiscussionAttempt(cycleAttempt, signal) {
@@ -282,7 +387,7 @@ export class OpenClawRoomRuntime {
     this.heartbeatTask = loop().catch((error) => {
       if (!this.closed && !this.heartbeatAbort.signal.aborted) {
         this.heartbeatError = error;
-        this.logger?.error?.(`Room heartbeat loop stopped: ${String(error)}`);
+        this.logger?.error?.(`Room heartbeat loop stopped${roomErrorDiagnostic(error)}`);
       }
     });
   }
@@ -306,8 +411,8 @@ export class OpenClawRoomRuntime {
     };
     this.pendingPresence = activity;
     try {
-      await this.client.publishActivity(this.state, activity, signal);
-      this.presenceStreamSeq = activity.streamSeq;
+      const receipt = await this.client.publishActivity(this.state, activity, signal);
+      this.presenceStreamSeq = acceptedActivitySequence(receipt, activity.streamSeq);
       this.pendingPresence = null;
       this.activityError = null;
     } catch (error) {
@@ -334,12 +439,12 @@ export class OpenClawRoomRuntime {
     if (this.pendingActivityFrame) {
       try {
         const receipt = await this.client.publishActivity(this.state, this.pendingActivityFrame, signal);
-        this.activityStreamSeq = receipt.acceptedStreamSeq ?? this.pendingActivityFrame.streamSeq;
+        this.activityStreamSeq = acceptedActivitySequence(receipt, this.pendingActivityFrame.streamSeq);
         this.pendingActivityFrame = null;
         this.activityError = null;
       } catch (error) {
         this.activityError = error;
-        this.logger?.warn?.(`[activity] retry failed kind=${this.pendingActivityFrame.kind} frame=${JSON.stringify(this.pendingActivityFrame)}: ${String(error).slice(0, 120)}`);
+        this.logger?.warn?.(`[activity] retry failed kind=${this.pendingActivityFrame.kind}${roomErrorDiagnostic(error)}`);
         return;
       }
     }
@@ -358,13 +463,13 @@ export class OpenClawRoomRuntime {
     this.pendingActivityFrame = frame;
     try {
       const receipt = await this.client.publishActivity(this.state, frame, signal);
-      this.activityStreamSeq = receipt.acceptedStreamSeq ?? frame.streamSeq;
+      this.activityStreamSeq = acceptedActivitySequence(receipt, frame.streamSeq);
       this.pendingActivityFrame = null;
       this.activityError = null;
-      this.logger?.info?.(`[activity] published kind=${frame.kind} seq=${frame.streamSeq} status=${frame.status ?? ""} accepted=${receipt.acceptedStreamSeq}`);
+      this.logger?.info?.(`[activity] published kind=${frame.kind} seq=${frame.streamSeq} status=${frame.status ?? ""}`);
     } catch (error) {
       this.activityError = error;
-      this.logger?.warn?.(`[activity] publish failed kind=${kind} frame=${JSON.stringify(frame)}: ${String(error).slice(0, 120)}`);
+      this.logger?.warn?.(`[activity] publish failed kind=${kind}${roomErrorDiagnostic(error)}`);
     }
   }
 
@@ -558,10 +663,13 @@ export function canonicalRoomContext(state, events, currentEventId = "", policy 
   const title = String(state?.title ?? "").trim();
   const purpose = String(state?.purpose ?? "").trim();
   const topic = String(state?.activeTopic?.title ?? "").trim();
-  const guidance = (Array.isArray(state?.rules) ? state.rules : [])
+  const savedGuidance = (Array.isArray(state?.rules) ? state.rules : [])
     .filter((rule) => String(rule?.enforcement ?? "") === "guidance")
     .map((rule) => String(rule?.text ?? "").trim())
-    .filter(Boolean)
+    .filter(Boolean);
+  const hasOpenExchangePreamble = savedGuidance.includes(OPEN_EXCHANGE_PREAMBLE);
+  const guidance = savedGuidance
+    .filter((text) => text !== OPEN_EXCHANGE_PREAMBLE)
     .map((text) => `- ${text}`)
     .join("\n")
     .slice(0, 3_000);
@@ -588,8 +696,13 @@ export function canonicalRoomContext(state, events, currentEventId = "", policy 
     ...(title ? [`Room: ${title}`] : []),
     ...(purpose ? [`Purpose: ${purpose}`] : []),
     ...(topic ? [`Current discussion: ${topic}`] : []),
-    ...((guidance || policyGuidance.length) ? [
+    ...((hasOpenExchangePreamble || guidance || policyGuidance.length) ? [
       "[Active Room guidance — owner-controlled behavioral guidance]",
+      ...(hasOpenExchangePreamble ? [
+        `[${OPEN_EXCHANGE_PREAMBLE_VERSION}; sha256=${OPEN_EXCHANGE_PREAMBLE_SHA256}]`,
+        OPEN_EXCHANGE_PREAMBLE,
+        `[/${OPEN_EXCHANGE_PREAMBLE_VERSION}]`,
+      ] : []),
       ...(guidance ? [guidance] : []),
       ...policyGuidance,
       "[/Active Room guidance]",

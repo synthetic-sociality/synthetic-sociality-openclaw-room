@@ -27,16 +27,23 @@ export async function verifyRelease(options) {
   const publicKeyFingerprintSha256 = createHash("sha256").update(publicKeyDer.stdout).digest("hex");
   const archiveHash = createHash("sha256").update(await readFile(options.archive)).digest("hex");
   if (archiveHash !== manifest.sha256) throw new Error("Release archive hash does not match signed manifest");
+  const archiveFiles = archiveEntries(options.archive);
+  if (JSON.stringify(archiveFiles) !== JSON.stringify(manifest.files)) throw new Error("Release archive file list does not match signed manifest");
   const extractRoot = await mkdtemp(join(tmpdir(), "openclaw-room-verify-"));
   try {
     run("tar", ["-xzf", options.archive, "-C", extractRoot], dirname(options.archive));
     const packageJson = JSON.parse(await readFile(join(extractRoot, "package", "package.json"), "utf8"));
     const pluginManifest = JSON.parse(await readFile(join(extractRoot, "package", "openclaw.plugin.json"), "utf8"));
     if (packageJson.name !== manifest.package || packageJson.version !== manifest.version) throw new Error("Packaged identity does not match signed manifest");
+    if (pluginManifest.version !== manifest.version) throw new Error("Plugin version does not match signed manifest");
     if (packageJson.peerDependencies?.openclaw !== manifest.openclaw) throw new Error("Packaged OpenClaw compatibility does not match signed manifest");
     if (pluginManifest.id !== manifest.pluginId) throw new Error("Packaged plugin id does not match signed manifest");
-  const provenance = await readFile(join(extractRoot, "package", "src", "release-provenance.js"), "utf8");
-  for (const expected of [manifest.version, manifest.sourceCommit, manifest.artifactIdentity]) if (!provenance.includes(JSON.stringify(expected))) throw new Error("Packaged runtime provenance does not match signed manifest");
+    const expectedArtifactIdentity = `npm:${manifest.package}@${manifest.version}#git:${manifest.sourceCommit}`;
+    if (manifest.artifactIdentity !== expectedArtifactIdentity) throw new Error("Release artifact identity is inconsistent");
+    const provenance = await readPackagedProvenance(join(extractRoot, "package", "src", "release-provenance.js"));
+    if (provenance.version !== manifest.version || provenance.sourceCommit !== manifest.sourceCommit || provenance.artifactIdentity !== expectedArtifactIdentity) {
+      throw new Error("Packaged runtime provenance does not match signed manifest");
+    }
   } finally {
     await rm(extractRoot, {recursive: true, force: true});
   }
@@ -51,6 +58,36 @@ export function validateManifest(value) {
   if (!/^[a-f0-9]{64}$/.test(value.sha256)) throw new Error("Release manifest SHA-256 is invalid");
   if (value.archive.includes("/") || value.archive.includes("\\")) throw new Error("Release manifest archive name is unsafe");
   if (!/^[a-f0-9]{40}$/.test(value.sourceCommit)) throw new Error("Release source commit is invalid");
+  const expectedArtifactIdentity = `npm:${value.package}@${value.version}#git:${value.sourceCommit}`;
+  if (value.artifactIdentity !== expectedArtifactIdentity) throw new Error("Release artifact identity is inconsistent");
+  if (!Array.isArray(value.files) || value.files.length === 0 || value.files.some((file) => !safeArchiveEntry(file))) {
+    throw new Error("Release manifest file list is invalid");
+  }
+  if (new Set(value.files).size !== value.files.length || JSON.stringify([...value.files].sort()) !== JSON.stringify(value.files)) {
+    throw new Error("Release manifest file list is invalid");
+  }
+}
+
+function safeArchiveEntry(file) {
+  if (typeof file !== "string" || !file.startsWith("package/") || file.includes("\\") || file.includes("\0")) return false;
+  const segments = file.split("/");
+  return segments.every((segment, index) => segment !== ".." && (segment !== "" || index === segments.length - 1));
+}
+
+function archiveEntries(archivePath) {
+  const result = spawnSync("tar", ["-tzf", archivePath], {encoding: "utf8"});
+  if (result.status !== 0) throw new Error("Release archive file list could not be read");
+  return result.stdout.split(/\r?\n/).filter(Boolean).sort();
+}
+
+async function readPackagedProvenance(path) {
+  const source = await readFile(path, "utf8");
+  const match = source.match(/^export const ROOM_CONNECTOR_PROVENANCE = Object\.freeze\((\{[\s\S]*\})\);\s*$/);
+  if (!match) throw new Error("Packaged runtime provenance format is invalid");
+  let value;
+  try { value = JSON.parse(match[1]); } catch { throw new Error("Packaged runtime provenance format is invalid"); }
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Packaged runtime provenance format is invalid");
+  return value;
 }
 
 export function parseArguments(values) {

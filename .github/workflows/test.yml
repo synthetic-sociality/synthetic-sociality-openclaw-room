@@ -10,12 +10,65 @@ permissions:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          node-version: 22
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 26.3.0
       - run: npm test
       - run: npm run check
       - run: npm pack --dry-run
+      - name: Build reproducible release twice
+        shell: bash
+        run: |
+          openssl genpkey -algorithm ED25519 -out "$RUNNER_TEMP/release-test-key.pem"
+          openssl pkey -in "$RUNNER_TEMP/release-test-key.pem" -pubout -out "$RUNNER_TEMP/release-test-public.pem"
+          node tools/build-release.mjs --output "$RUNNER_TEMP/release-a" --signing-key "$RUNNER_TEMP/release-test-key.pem"
+          node tools/build-release.mjs --output "$RUNNER_TEMP/release-b" --signing-key "$RUNNER_TEMP/release-test-key.pem"
+          cmp "$RUNNER_TEMP/release-a/synthetic-sociality-openclaw-room-0.2.29.tgz" "$RUNNER_TEMP/release-b/synthetic-sociality-openclaw-room-0.2.29.tgz"
+          cmp "$RUNNER_TEMP/release-a/synthetic-sociality-openclaw-room-0.2.29.tgz.manifest.json" "$RUNNER_TEMP/release-b/synthetic-sociality-openclaw-room-0.2.29.tgz.manifest.json"
+          node tools/verify-release.mjs \
+            --archive "$RUNNER_TEMP/release-a/synthetic-sociality-openclaw-room-0.2.29.tgz" \
+            --manifest "$RUNNER_TEMP/release-a/synthetic-sociality-openclaw-room-0.2.29.tgz.manifest.json" \
+            --signature "$RUNNER_TEMP/release-a/synthetic-sociality-openclaw-room-0.2.29.tgz.manifest.json.sig" \
+            --public-key "$RUNNER_TEMP/release-test-public.pem"
+      - name: Stage verified release evidence
+        shell: bash
+        run: |
+          cp "$RUNNER_TEMP/release-test-public.pem" "$RUNNER_TEMP/release-a/release-test-public.pem"
+          rm -rf "$RUNNER_TEMP/release-a/.npm-cache"
+          {
+            node --version
+            npm --version
+            openssl version
+            tar --version | head -1
+            uname -a
+          } > "$RUNNER_TEMP/release-a/release-environment.txt"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: openclaw-room-0.2.29-${{ github.event.pull_request.head.sha || github.sha }}-${{ matrix.os }}
+          path: ${{ runner.temp }}/release-a/
+          if-no-files-found: error
+          retention-days: 30
+
+  cross-platform-release:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: openclaw-room-0.2.29-${{ github.event.pull_request.head.sha || github.sha }}-*
+          path: bundles
+      - name: Prove Linux and macOS release bytes agree
+        shell: bash
+        run: |
+          cmp bundles/openclaw-room-0.2.29-${{ github.event.pull_request.head.sha || github.sha }}-ubuntu-latest/synthetic-sociality-openclaw-room-0.2.29.tgz bundles/openclaw-room-0.2.29-${{ github.event.pull_request.head.sha || github.sha }}-macos-latest/synthetic-sociality-openclaw-room-0.2.29.tgz
+          cmp bundles/openclaw-room-0.2.29-${{ github.event.pull_request.head.sha || github.sha }}-ubuntu-latest/synthetic-sociality-openclaw-room-0.2.29.tgz.manifest.json bundles/openclaw-room-0.2.29-${{ github.event.pull_request.head.sha || github.sha }}-macos-latest/synthetic-sociality-openclaw-room-0.2.29.tgz.manifest.json
+          sha256sum bundles/openclaw-room-0.2.29-${{ github.event.pull_request.head.sha || github.sha }}-ubuntu-latest/synthetic-sociality-openclaw-room-0.2.29.tgz
