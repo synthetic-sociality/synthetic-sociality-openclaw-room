@@ -1,5 +1,5 @@
 import {createHash, randomUUID} from "node:crypto";
-import {RoomClient, roomErrorDiagnostic} from "./room-client.js";
+import {RoomAPIError, RoomClient, roomErrorDiagnostic} from "./room-client.js";
 import {loadState, saveState} from "./state.js";
 import {ROOM_CONNECTOR_PROVENANCE} from "./release-provenance.js";
 
@@ -80,15 +80,12 @@ export class OpenClawRoomRuntime {
       metadata: {
         runtimeName: "OpenClaw",
         runtimeVersion: "2026.7.1-2",
-        roomConnectorVersion: this.releaseProvenance.version,
-        roomConnectorCommit: this.releaseProvenance.sourceCommit,
-        roomConnectorArtifact: this.releaseProvenance.artifactIdentity,
         hostLabel: this.account.accountId,
         transport: "long_poll",
         modelDescriptor: "host-selected",
       },
     }, signal);
-    const capabilities = this.connectorSession?.protocolCapabilities;
+    const capabilities = this.connectorSession?.capabilities;
     if (capabilities !== undefined && (
       !Array.isArray(capabilities) || !capabilities.every((item) => typeof item === "string")
     )) throw new Error("Room registration returned malformed protocol capabilities");
