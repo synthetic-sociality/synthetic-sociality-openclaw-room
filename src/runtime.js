@@ -73,17 +73,6 @@ export class OpenClawRoomRuntime {
     this.state = await waitForState(this.account.stateFile, signal);
     if (this.account.baseUrl && this.state.baseUrl !== this.account.baseUrl) throw new Error("Configured Room origin does not match private reconnect state");
     this.client = new RoomClient({baseUrl: this.state.baseUrl, credential: this.state.credential, fetchImpl: this.fetchImpl});
-    const status = await this.client.status(signal);
-    const capabilities = status?.protocolCapabilities;
-    if (capabilities !== undefined && (
-      !Array.isArray(capabilities) || !capabilities.every((item) => typeof item === "string")
-    )) throw new Error("Room status returned malformed protocol capabilities");
-    this.state.messagePayloadCapabilities = [...new Set(capabilities ?? [])];
-    this.state.messagePayloadDialect = this.state.messagePayloadCapabilities.includes(
-      MESSAGE_LOGICAL_CONTRIBUTION_CAPABILITY,
-    ) ? "v2" : "v1";
-    this.state.deliveryIntents ??= {};
-    await saveState(this.account.stateFile, this.state);
     this.connectorSession = await this.client.register(this.state, {
       clientInstanceId: this.state.clientInstanceId,
       contractVersion: 1,
@@ -91,14 +80,24 @@ export class OpenClawRoomRuntime {
       metadata: {
         runtimeName: "OpenClaw",
         runtimeVersion: "2026.7.1-2",
-    roomConnectorVersion: this.releaseProvenance.version,
-    roomConnectorCommit: this.releaseProvenance.sourceCommit,
-    roomConnectorArtifact: this.releaseProvenance.artifactIdentity,
+        roomConnectorVersion: this.releaseProvenance.version,
+        roomConnectorCommit: this.releaseProvenance.sourceCommit,
+        roomConnectorArtifact: this.releaseProvenance.artifactIdentity,
         hostLabel: this.account.accountId,
         transport: "long_poll",
         modelDescriptor: "host-selected",
       },
     }, signal);
+    const capabilities = this.connectorSession?.protocolCapabilities;
+    if (capabilities !== undefined && (
+      !Array.isArray(capabilities) || !capabilities.every((item) => typeof item === "string")
+    )) throw new Error("Room registration returned malformed protocol capabilities");
+    this.state.messagePayloadCapabilities = [...new Set(capabilities ?? [])];
+    this.state.messagePayloadDialect = this.state.messagePayloadCapabilities.includes(
+      MESSAGE_LOGICAL_CONTRIBUTION_CAPABILITY,
+    ) ? "v2" : "v1";
+    this.state.deliveryIntents ??= {};
+    await saveState(this.account.stateFile, this.state);
     await this.publishPresence(signal);
     if (this.activityError) this.logger?.warn?.(`Room activity signal unavailable${roomErrorDiagnostic(this.activityError)}`);
     else this.logger?.info?.("Room activity signal established");

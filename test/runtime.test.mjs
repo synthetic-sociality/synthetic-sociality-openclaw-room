@@ -46,10 +46,14 @@ test("initializes one connector session when native startup and event polling ov
   let registrations = 0;
   let registrationBody;
   let connectorHeartbeats = 0;
+  let statusRequests = 0;
   const activities = [];
   const runtime = new OpenClawRoomRuntime({accountId: "default", stateFile, baseUrl: "https://room.example/api"}, {
     fetchImpl: async (url, init) => {
-      if (url.endsWith("/status")) return new Response(JSON.stringify({protocolCapabilities: []}), {status: 200});
+      if (url.endsWith("/status")) {
+        statusRequests += 1;
+        return new Response(JSON.stringify({code: "request_validation_failed"}), {status: 400});
+      }
       if (url.endsWith("/connector/sessions")) {
         registrations += 1;
     registrationBody = JSON.parse(init.body);
@@ -71,6 +75,7 @@ test("initializes one connector session when native startup and event polling ov
   assert.equal(first.sessionId, "session-1");
   assert.equal(second.sessionId, "session-1");
   assert.equal(registrations, 1);
+  assert.equal(statusRequests, 0, "legacy Room deployments must not be blocked by an unauthenticated /status probe");
   assert.deepEqual(registrationBody.metadata, {
     runtimeName: "OpenClaw", runtimeVersion: "2026.7.1-2",
     roomConnectorVersion: "0.2.29", roomConnectorCommit: "unbuilt",
