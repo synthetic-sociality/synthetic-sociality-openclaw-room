@@ -17,6 +17,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 26.3.0
@@ -51,7 +53,7 @@ jobs:
           } > "$RUNNER_TEMP/release-a/release-environment.txt"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: openclaw-room-0.2.29-${{ github.sha }}-${{ matrix.os }}
+          name: openclaw-room-0.2.29-${{ github.event.pull_request.head.sha || github.sha }}-${{ matrix.os }}
           path: ${{ runner.temp }}/release-a/
           if-no-files-found: error
           retention-days: 30
@@ -62,11 +64,11 @@ jobs:
     steps:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          pattern: openclaw-room-0.2.29-${{ github.sha }}-*
+          pattern: openclaw-room-0.2.29-${{ github.event.pull_request.head.sha || github.sha }}-*
           path: bundles
       - name: Prove Linux and macOS release bytes agree
         shell: bash
         run: |
-          cmp bundles/openclaw-room-0.2.29-${{ github.sha }}-ubuntu-latest/synthetic-sociality-openclaw-room-0.2.29.tgz bundles/openclaw-room-0.2.29-${{ github.sha }}-macos-latest/synthetic-sociality-openclaw-room-0.2.29.tgz
-          cmp bundles/openclaw-room-0.2.29-${{ github.sha }}-ubuntu-latest/synthetic-sociality-openclaw-room-0.2.29.tgz.manifest.json bundles/openclaw-room-0.2.29-${{ github.sha }}-macos-latest/synthetic-sociality-openclaw-room-0.2.29.tgz.manifest.json
-          sha256sum bundles/openclaw-room-0.2.29-${{ github.sha }}-ubuntu-latest/synthetic-sociality-openclaw-room-0.2.29.tgz
+          cmp bundles/openclaw-room-0.2.29-${{ github.event.pull_request.head.sha || github.sha }}-ubuntu-latest/synthetic-sociality-openclaw-room-0.2.29.tgz bundles/openclaw-room-0.2.29-${{ github.event.pull_request.head.sha || github.sha }}-macos-latest/synthetic-sociality-openclaw-room-0.2.29.tgz
+          cmp bundles/openclaw-room-0.2.29-${{ github.event.pull_request.head.sha || github.sha }}-ubuntu-latest/synthetic-sociality-openclaw-room-0.2.29.tgz.manifest.json bundles/openclaw-room-0.2.29-${{ github.event.pull_request.head.sha || github.sha }}-macos-latest/synthetic-sociality-openclaw-room-0.2.29.tgz.manifest.json
+          sha256sum bundles/openclaw-room-0.2.29-${{ github.event.pull_request.head.sha || github.sha }}-ubuntu-latest/synthetic-sociality-openclaw-room-0.2.29.tgz
