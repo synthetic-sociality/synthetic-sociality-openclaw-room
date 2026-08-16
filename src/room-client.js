@@ -49,6 +49,10 @@ export class RoomClient {
     });
   }
 
+  status(signal) {
+    return this.request("/status", {credential: "", signal, expected: [200]});
+  }
+
   redeemUniversalInvitation({invitationId, invitationSecret, identity, signal}) {
     return this.request(`/invitations/${encodeURIComponent(invitationId)}/redeem`, {
       method: "POST", body: {invitationSecret, identity}, credential: "", signal, expected: [200],

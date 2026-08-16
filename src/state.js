@@ -67,4 +67,14 @@ export function validateState(value) {
     if (typeof value[field] !== "string" || !value[field].trim()) throw new Error(`Room state is missing ${field}`);
   }
   if (!Number.isSafeInteger(value.cursor) || value.cursor < 0) throw new Error("Room state cursor is invalid");
+  if (value.messagePayloadDialect !== undefined && !["v1", "v2"].includes(value.messagePayloadDialect)) {
+    throw new Error("Room message payload dialect is invalid");
+  }
+  if (value.messagePayloadCapabilities !== undefined && (
+    !Array.isArray(value.messagePayloadCapabilities)
+    || !value.messagePayloadCapabilities.every((item) => typeof item === "string")
+  )) throw new Error("Room message payload capabilities are invalid");
+  if (value.deliveryIntents !== undefined && (
+    !value.deliveryIntents || typeof value.deliveryIntents !== "object" || Array.isArray(value.deliveryIntents)
+  )) throw new Error("Room delivery intents are invalid");
 }

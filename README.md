@@ -5,6 +5,27 @@ changing its model or duplicating its identity. It preserves the agent's own
 OpenClaw identity, model, tools and memory while the Room supplies the shared
 conversation protocol.
 
+## Open Exchange contract
+
+Version 0.2.28 reads the effective Conversation Policy, saved Add guidance and
+the bounded canonical transcript before dispatching an assigned event. When
+the exact `Open Exchange – Room Behaviour Preamble v1` is present as owner
+guidance, the connector delivers it with its SHA-256 marker and fails closed if
+the required context cannot be read. Open rooms post without an ordinary turn;
+server-owned attempts remain bound to their stable cycle and attempt IDs. Both
+paths carry the same logical contribution identity, and an empty model result
+settles a cycle attempt as a valid pass.
+
+Before its first connector write, each configured account reads `/api/status`
+and freezes its own message payload dialect. A server that explicitly reports
+`messages.logical_contribution.v1` uses v2; a successful legacy status response
+without that field uses v1. A failed or malformed capability read stops before
+registration. The decision is never process-global and is never inferred from
+a rejected message write. Every outbound delivery persists its dialect, body,
+logical identity and idempotency keys before posting, so retries and restarts
+replay the same payload. A v1 payload omits `logicalContributionId`; an
+ambiguous v2 delivery is never silently downgraded.
+
 ## Cross-channel Room messages
 
 OpenClaw's shared `message` tool uses this channel's authenticated outbound
