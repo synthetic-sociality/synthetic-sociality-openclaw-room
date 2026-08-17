@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import {mkdtemp} from "node:fs/promises";
+import {mkdtemp, writeFile} from "node:fs/promises";
 import {tmpdir} from "node:os";
 import {join} from "node:path";
 import {canonicalRoomContext, commandInstruction, cyclePhaseInstruction, isAssignedEvent, isAssignedMessage, normalizeEvent, OpenClawRoomRuntime} from "../src/runtime.js";
-import {loadState, saveState} from "../src/state.js";
+import {RoomAPIError} from "../src/room-client.js";
+import {loadState, saveState, validateState} from "../src/state.js";
 
 test("keeps durable rounds generic and bounded instead of imposing a room topic", () => {
   const cycle = {budgets: {perAgentTurns: 7}};
@@ -352,4 +353,675 @@ test("follow-up guidance searches for synthesis without forcing consensus", () =
   assert.match(result.instruction, /common ground or synthesis/);
   assert.match(result.instruction, /never force consensus/);
   assert.match(result.instruction, /justified disagreement may remain/);
+});
+
+function deliveryLifecycleRuntime() {
+  const runtime = new OpenClawRoomRuntime({accountId: "test", stateFile: "/unused", baseUrl: "https://room.example/api"});
+  runtime.state = {
+    version: 1, baseUrl: "https://room.example/api", roomId: "room-1",
+    membershipId: "member-1", credential: "redacted", clientInstanceId: "client-1",
+    cursor: 4, messagePayloadDialect: "v2", deliveryIntents: {},
+  };
+  runtime.markTurnPreparing = async () => {};
+  runtime.markTurnPosted = async () => {};
+  runtime.snapshots = [];
+  runtime.persistState = async () => { runtime.snapshots.push(structuredClone(runtime.state)); };
+  return runtime;
+}
+
+test("posted state requires a complete canonical receipt", () => {
+  const state = {
+    version: 1, baseUrl: "https://room.example/api", roomId: "room-1",
+    membershipId: "member-1", credential: "redacted", clientInstanceId: "client-1", cursor: 4,
+    deliveryIntents: {
+      "source-5:final": {
+        version: 2, status: "lifecycle_pending", deliveryState: "posted", lifecycleState: "pending",
+        identity: {roomId: "room-1", body: "Frozen", replyToId: "", sourceEventId: "source-5", cycle: {cycleId: "cycle-1", attemptId: "attempt-1", generation: 3}},
+        binding: {roomId: "room-1", membershipId: "member-1", clientInstanceId: "client-1"},
+        messagePayloadDialect: "v2",
+      },
+    },
+  };
+  assert.throws(() => validateState(state), /complete canonical receipt/);
+});
+
+test("selection persistence failure prevents message submission", async () => {
+  const runtime = deliveryLifecycleRuntime();
+  let posts = 0;
+  runtime.client = {
+    roomState: async () => ({headSeq: 5, activeEpoch: {id: "epoch-1"}}),
+    roomPolicy: async () => ({policy: {coordinationMode: "open"}}),
+    postMessage: async () => { posts += 1; throw new Error("must not post"); },
+  };
+  runtime.persistState = async () => { throw new Error("state persistence failed"); };
+  await assert.rejects(runtime.postAndFinish({
+    roomId: "room-1", text: "Frozen answer", replyToId: "human-1",
+    idempotencyKey: "delivery-persist-fail", sourceEventId: "source-5",
+  }), /state persistence failed/);
+  assert.equal(posts, 0);
+});
+
+test("canonical receipt persistence failure rolls back posted state and evidence", async () => {
+  const runtime = deliveryLifecycleRuntime();
+  let writes = 0;
+  let posts = 0;
+  runtime.persistState = async () => {
+    writes += 1;
+    if (writes === 4) throw new Error("receipt write failed");
+  };
+  runtime.client = {
+    roomState: async () => ({headSeq: 5, activeEpoch: {id: "epoch-1"}}),
+    roomPolicy: async () => ({policy: {coordinationMode: "open"}}),
+    postMessage: async () => {
+      posts += 1;
+      return {id: "posted-6", seq: 6, ts: "2026-08-17T00:00:00Z"};
+    },
+  };
+  runtime.pendingEvent = {id: "source-5", seq: 5};
+  await assert.rejects(runtime.postAndFinish({
+    roomId: "room-1", text: "Frozen answer", replyToId: "human-1",
+    idempotencyKey: "receipt-persist-fail", sourceEventId: "source-5",
+  }), /receipt write failed/);
+  const intent = runtime.state.deliveryIntents["receipt-persist-fail"];
+  assert.equal(posts, 1);
+  assert.equal(intent.deliveryState, "delivery_pending");
+  assert.equal(intent.status, "delivery_pending");
+  assert.equal(intent.canonicalMessage, undefined);
+  assert.equal(intent.receipt, undefined);
+  assert.equal(runtime.state.terminalEvidence, undefined);
+});
+
+test("canonical receipt is delivery success before cycle completion", async () => {
+  const runtime = deliveryLifecycleRuntime();
+  const calls = {post: 0, complete: 0};
+  runtime.client = {
+    roomState: async () => ({headSeq: 5, activeEpoch: {id: "epoch-1"}}),
+    postMessage: async () => {
+      calls.post += 1;
+      return {id: "posted-6", seq: 6, ts: "2026-08-17T00:00:00Z"};
+    },
+    completeDiscussionAttempt: async () => {
+      calls.complete += 1;
+      throw new RoomAPIError(503, {code: "busy", retryable: true});
+    },
+  };
+  const cycleAttempt = {
+    cycle: {id: "cycle-1", generation: 3},
+    attempt: {id: "attempt-1"},
+    settled: false,
+  };
+  runtime.pendingEvent = {id: "source-5", seq: 5};
+  const receipt = await runtime.postAndFinish({
+    roomId: "room-1", text: "Frozen answer", replyToId: "human-1",
+    idempotencyKey: "delivery-1", sourceEventId: "source-5", cycleAttempt,
+  });
+  assert.deepEqual(receipt, {eventId: "posted-6", sentAt: Date.parse("2026-08-17T00:00:00Z")});
+  assert.deepEqual(calls, {post: 1, complete: 1});
+  const intent = runtime.state.deliveryIntents["delivery-1"];
+  assert.equal(intent.deliveryState, "posted");
+  assert.equal(intent.lifecycleState, "pending");
+  assert.equal(intent.status, "lifecycle_pending");
+  assert.equal(intent.canonicalMessage.id, "posted-6");
+  assert.deepEqual(runtime.state.terminalEvidence["5"], {
+    status: "posted", sourceEventId: "source-5", sourceSeq: 5,
+    canonicalEventId: "posted-6", canonicalSeq: 6,
+    canonicalTs: "2026-08-17T00:00:00Z", reason: "",
+  });
+  assert.ok(runtime.snapshots.some(({deliveryIntents, terminalEvidence}) => {
+    const saved = deliveryIntents["delivery-1"];
+    return saved.deliveryState === "posted"
+      && saved.canonicalMessage?.id === "posted-6"
+      && terminalEvidence?.["5"]?.canonicalSeq === 6
+      && terminalEvidence?.["5"]?.canonicalTs === "2026-08-17T00:00:00Z";
+  }), "complete canonical receipt and source evidence must be persisted before completion");
+});
+
+test("restart after lifecycle failure never reposts and completes idempotently", async () => {
+  const runtime = deliveryLifecycleRuntime();
+  const calls = {post: 0, complete: 0};
+  let failCompletion = true;
+  runtime.client = {
+    roomState: async () => ({headSeq: 5, activeEpoch: {id: "epoch-1"}}),
+    postMessage: async () => {
+      calls.post += 1;
+      if (calls.post > 1) throw new Error("canonical receipt must prevent reposting");
+      return {id: "posted-6", seq: 6, ts: "2026-08-17T00:00:00Z"};
+    },
+    completeDiscussionAttempt: async () => {
+      calls.complete += 1;
+      if (failCompletion) throw new RoomAPIError(503, {code: "busy", retryable: true});
+      return {state: "completed"};
+    },
+  };
+  const request = {
+    roomId: "room-1", text: "Frozen answer", replyToId: "human-1",
+    idempotencyKey: "delivery-restart", sourceEventId: "source-5",
+    cycleAttempt: {cycle: {id: "cycle-1", generation: 3}, attempt: {id: "attempt-1"}, settled: false},
+  };
+  const first = await runtime.postAndFinish(request);
+  assert.equal(first.eventId, "posted-6");
+  assert.equal(runtime.state.deliveryIntents["delivery-restart"].status, "lifecycle_pending");
+
+  failCompletion = false;
+  const second = await runtime.postAndFinish(request);
+  assert.deepEqual(second, first);
+  assert.deepEqual(calls, {post: 1, complete: 2});
+  const intent = runtime.state.deliveryIntents["delivery-restart"];
+  assert.equal(intent.deliveryState, "posted");
+  assert.equal(intent.lifecycleState, "complete");
+  assert.equal(intent.status, "posted");
+});
+
+test("post-receipt lifecycle classification persistence failure cannot escape", async () => {
+  const runtime = deliveryLifecycleRuntime();
+  const intent = {
+    version: 2, status: "lifecycle_pending", deliveryState: "posted", lifecycleState: "pending", lifecycleAttempts: 0,
+    identity: {
+      roomId: "room-1", body: "Frozen answer", replyToId: "human-1", sourceEventId: "source-5",
+      cycle: {cycleId: "cycle-1", attemptId: "attempt-1", generation: 3},
+    },
+    binding: {roomId: "room-1", membershipId: "member-1", clientInstanceId: "client-1"},
+    messagePayloadDialect: "v2",
+    canonicalMessage: {id: "posted-6", seq: 6, ts: "2026-08-17T00:00:00Z"},
+    lifecycleRequest: {
+      kind: "cycle", cycleId: "cycle-1", attemptId: "attempt-1",
+      payload: {generation: 3, action: "contribute", eventId: "posted-6"},
+    },
+    receipt: {eventId: "posted-6", sentAt: Date.parse("2026-08-17T00:00:00Z")},
+  };
+  runtime.state.deliveryIntents["source-5:final"] = intent;
+  let persists = 0;
+  runtime.persistState = async () => {
+    persists += 1;
+    if (persists === 2) throw new Error("disk failed while classifying lifecycle debt");
+  };
+  runtime.client = {completeDiscussionAttempt: async () => { throw new Error("retryable lifecycle failure"); }};
+  assert.equal(await runtime.completeIntentLifecycle(intent), false);
+  assert.equal(persists, 2);
+  assert.equal(intent.deliveryState, "posted");
+  assert.equal(intent.lifecycleState, "pending");
+  assert.equal(intent.lifecycleAttempts, 1);
+  assert.equal(intent.lifecycleError, undefined);
+});
+
+test("production restart after receipt performs lifecycle only", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "openclaw-room-restart-lifecycle-"));
+  const stateFile = join(directory, "default.json");
+  const state = {
+    version: 1, baseUrl: "https://room.example/api", roomId: "room-1",
+    membershipId: "member-1", credential: "redacted", clientInstanceId: "client-1", cursor: 4,
+    deliveryIntents: {
+      "source-5:final": {
+        version: 2, status: "lifecycle_pending", deliveryState: "posted", lifecycleState: "pending", lifecycleAttempts: 1,
+        identity: {roomId: "room-1", body: "Frozen", replyToId: "human-1", sourceEventId: "source-5", cycle: {cycleId: "cycle-1", attemptId: "attempt-1", generation: 3}},
+        binding: {roomId: "room-1", membershipId: "member-1", clientInstanceId: "client-1"},
+        messagePayloadDialect: "v2",
+        canonicalMessage: {id: "posted-6", seq: 6, ts: "2026-08-17T00:00:00Z"},
+        lifecycleRequest: {kind: "cycle", cycleId: "cycle-1", attemptId: "attempt-1", payload: {generation: 3, action: "contribute", eventId: "posted-6"}},
+        receipt: {eventId: "posted-6", sentAt: Date.parse("2026-08-17T00:00:00Z")},
+      },
+    },
+  };
+  await saveState(stateFile, state);
+  const runtime = new OpenClawRoomRuntime({accountId: "test", stateFile, baseUrl: state.baseUrl});
+  runtime.state = await loadState(stateFile);
+  const calls = {post: 0, complete: 0};
+  runtime.client = {
+    postMessage: async () => { calls.post += 1; throw new Error("must not post"); },
+    completeDiscussionAttempt: async () => { calls.complete += 1; return {state: "completed"}; },
+  };
+  await runtime.repairPendingLifecycles();
+  const saved = await loadState(stateFile);
+  assert.deepEqual(calls, {post: 0, complete: 1});
+  assert.equal(saved.deliveryIntents["source-5:final"].deliveryState, "posted");
+  assert.equal(saved.deliveryIntents["source-5:final"].lifecycleState, "complete");
+});
+
+test("production load rejects a tampered turn lifecycle request before I/O", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "openclaw-room-turn-lifecycle-tamper-"));
+  const stateFile = join(directory, "default.json");
+  const state = {
+    version: 1, baseUrl: "https://room.example/api", roomId: "room-1",
+    membershipId: "member-1", credential: "redacted", clientInstanceId: "client-1", cursor: 4,
+    deliveryIntents: {
+      "source-5:final": {
+        version: 2, status: "lifecycle_pending", deliveryState: "posted", lifecycleState: "pending", lifecycleAttempts: 1,
+        identity: {roomId: "room-1", body: "Frozen", replyToId: "human-1", sourceEventId: "source-5"},
+        binding: {roomId: "room-1", membershipId: "member-1", clientInstanceId: "client-1"},
+        messagePayloadDialect: "v2", turn: {turnId: "turn-1"}, finishIdempotencyKey: "finish-good",
+        canonicalMessage: {id: "posted-6", seq: 6, ts: "2026-08-17T00:00:00Z"},
+        lifecycleRequest: {kind: "turn", turnId: "turn-1", observedSeq: 6, sourceEventId: "source-5", idempotencyKey: "finish-good"},
+        receipt: {eventId: "posted-6", sentAt: Date.parse("2026-08-17T00:00:00Z")},
+      },
+    },
+  };
+  await saveState(stateFile, state);
+  state.deliveryIntents["source-5:final"].lifecycleRequest = {
+    kind: "turn", turnId: "turn-EVIL", observedSeq: 999,
+    sourceEventId: "source-5", idempotencyKey: "finish-EVIL",
+  };
+  await writeFile(stateFile, `${JSON.stringify(state)}\n`, {mode: 0o600});
+  await assert.rejects(loadState(stateFile), /turn lifecycle request/);
+});
+
+test("retryable post failure before receipt stays durably parked", async () => {
+  const runtime = deliveryLifecycleRuntime();
+  runtime.client = {
+    roomState: async () => ({headSeq: 5, activeEpoch: {id: "epoch-1"}}),
+    roomPolicy: async () => ({policy: {coordinationMode: "open"}}),
+    postMessage: async () => { throw new RoomAPIError(503, {code: "busy", retryable: true}); },
+  };
+  await assert.rejects(runtime.postAndFinish({
+    roomId: "room-1", text: "Frozen answer", replyToId: "human-1",
+    idempotencyKey: "delivery-pending", sourceEventId: "source-5",
+  }), RoomAPIError);
+  const intent = runtime.state.deliveryIntents["delivery-pending"];
+  assert.equal(intent.deliveryState, "delivery_pending");
+  assert.equal(intent.lifecycleState, "not_started");
+  assert.equal(intent.status, "delivery_pending");
+  assert.equal(intent.canonicalMessage, undefined);
+  assert.ok(runtime.snapshots.some(({deliveryIntents}) =>
+    deliveryIntents["delivery-pending"]?.deliveryState === "delivery_pending"));
+});
+
+test("pending frozen delivery retries before dispatcher or model replay", async () => {
+  const runtime = deliveryLifecycleRuntime();
+  let posts = 0;
+  runtime.client = {
+    roomState: async () => ({headSeq: 5, activeEpoch: {id: "epoch-1"}, activeTopic: {id: "topic-1"}}),
+    roomPolicy: async () => ({policy: {coordinationMode: "open"}}),
+    postMessage: async () => {
+      posts += 1;
+      if (posts === 1) throw new RoomAPIError(503, {code: "busy", retryable: true});
+      return {id: "posted-6", seq: 6, ts: "2026-08-17T00:00:00Z"};
+    },
+  };
+  await assert.rejects(runtime.postAndFinish({
+    roomId: "room-1", text: "Frozen answer", replyToId: "human-1",
+    idempotencyKey: "source-5:final", sourceEventId: "source-5",
+  }), RoomAPIError);
+  const parked = runtime.state.deliveryIntents["source-5:final"];
+  const frozenBody = parked.post.body;
+  parked.post.body = "TAMPERED PLAINTEXT";
+  assert.throws(() => validateState(runtime.state), /frozen post/);
+  parked.post.body = frozenBody;
+  const frozenKey = parked.post.idempotencyKey;
+  parked.post.idempotencyKey = "tampered-key";
+  assert.throws(() => validateState(runtime.state), /frozen post/);
+  parked.post.idempotencyKey = frozenKey;
+  const frozenTopic = parked.post.topicId;
+  parked.post.topicId = "topic-EVIL";
+  assert.throws(() => validateState(runtime.state), /frozen post/);
+  parked.post.topicId = frozenTopic;
+  const frozenEpoch = parked.post.observedEpochId;
+  parked.post.observedEpochId = "epoch-EVIL";
+  assert.throws(() => validateState(runtime.state), /frozen post/);
+  parked.post.observedEpochId = frozenEpoch;
+  const frozenObservedSeq = parked.post.observedSeq;
+  parked.post.observedSeq = 999;
+  assert.throws(() => validateState(runtime.state), /frozen post/);
+  parked.post.observedSeq = frozenObservedSeq;
+  const event = {id: "source-5", seq: 5};
+  assert.equal(await runtime.recoverPendingDelivery(event), true);
+  assert.equal(posts, 2);
+  const intent = runtime.state.deliveryIntents["source-5:final"];
+  assert.equal(intent.identity.body, "Frozen answer");
+  assert.equal(intent.deliveryState, "posted");
+  assert.equal(intent.status, "posted");
+  assert.equal(runtime.state.terminalEvidence["5"].canonicalEventId, "posted-6");
+});
+
+test("incomplete successful post response never becomes posted or calls lifecycle", async () => {
+  for (const [name, response] of [
+    ["missing id", {seq: 6, ts: "2026-08-17T00:00:00Z"}],
+    ["boolean sequence", {id: "posted-6", seq: true, ts: "2026-08-17T00:00:00Z"}],
+    ["missing timestamp", {id: "posted-6", seq: 6}],
+    ["malformed timestamp", {id: "posted-6", seq: 6, ts: "not-a-timestamp"}],
+    ["timezone-less timestamp", {id: "posted-6", seq: 6, ts: "2026-08-17T00:00:00"}],
+    ["impossible calendar date", {id: "posted-6", seq: 6, ts: "2026-02-30T00:00:00Z"}],
+  ]) {
+    const runtime = deliveryLifecycleRuntime();
+    const calls = {post: 0, complete: 0};
+    runtime.client = {
+      roomState: async () => ({headSeq: 5, activeEpoch: {id: "epoch-1"}}),
+      postMessage: async () => { calls.post += 1; return response; },
+      completeDiscussionAttempt: async () => { calls.complete += 1; },
+    };
+    await assert.rejects(runtime.postAndFinish({
+      roomId: "room-1", text: "Frozen answer", replyToId: "human-1",
+      idempotencyKey: `incomplete-${name}`, sourceEventId: "source-5",
+      cycleAttempt: {cycle: {id: "cycle-1", generation: 3}, attempt: {id: "attempt-1"}},
+    }), /requires event ID, sequence, and timestamp/);
+    const intent = runtime.state.deliveryIntents[`incomplete-${name}`];
+    assert.equal(intent.deliveryState, "delivery_pending");
+    assert.equal(intent.lifecycleState, "not_started");
+    assert.equal(intent.canonicalMessage, undefined);
+    assert.equal(intent.receipt, undefined);
+    assert.deepEqual(calls, {post: 1, complete: 0});
+  }
+});
+
+test("complete canonical message without receipt wrapper recovers before model dispatch", async () => {
+  const runtime = deliveryLifecycleRuntime();
+  runtime.state.deliveryIntents["source-5:final"] = {
+    version: 2, status: "lifecycle_pending", deliveryState: "posted", lifecycleState: "pending",
+    identity: {
+      roomId: "room-1", body: "Frozen answer", replyToId: "human-1", sourceEventId: "source-5",
+      cycle: {cycleId: "cycle-1", attemptId: "attempt-1", generation: 3},
+    },
+    binding: {roomId: "room-1", membershipId: "member-1", clientInstanceId: "client-1"},
+    messagePayloadDialect: "v2",
+    canonicalMessage: {id: "posted-6", seq: 6, ts: "2026-08-17T00:00:00Z"},
+    lifecycleRequest: {
+      kind: "cycle", cycleId: "cycle-1", attemptId: "attempt-1",
+      payload: {generation: 3, action: "contribute", eventId: "posted-6"},
+    },
+  };
+  const event = {id: "source-5", seq: 5};
+  assert.equal(await runtime.recoverPostedEvidence(event), true);
+  const intent = runtime.state.deliveryIntents["source-5:final"];
+  assert.equal(intent.receipt.eventId, "posted-6");
+  assert.equal(runtime.state.terminalEvidence["5"].canonicalSeq, 6);
+});
+
+test("production load migrates authentic 0.2.29 receipt without repost", async () => {
+  const seed = deliveryLifecycleRuntime();
+  seed.state.deliveryIntents["source-5:final"] = {
+    version: 1,
+    status: "selected",
+    identity: {
+      roomId: "room-1", body: "Frozen legacy answer", replyToId: "human-1",
+      sourceEventId: "source-5", coordinationMode: "cycle", nextRecipient: "",
+      topicId: "topic-1", initialObservedSeq: 4, initialEpochId: "epoch-1",
+      cycle: {cycleId: "cycle-1", attemptId: "attempt-1", generation: 3},
+    },
+    messagePayloadDialect: "v2",
+    logicalContributionId: "logical-legacy",
+    messageIdempotencyKey: "legacy-message-key",
+    finishIdempotencyKey: "legacy-finish-key",
+    post: {
+      observedSeq: 5, idempotencyKey: "legacy-message-key", logicalContributionId: "logical-legacy",
+      topicId: "topic-1", observedEpochId: "epoch-1", respondsTo: ["human-1"],
+      cycleId: "cycle-1", attemptId: "attempt-1", cycleGeneration: 3,
+      contributionType: "claim", body: "Frozen legacy answer",
+    },
+    canonicalMessage: {id: "posted-6", seq: 6, ts: "2026-08-17T00:00:00Z"},
+  };
+  const directory = await mkdtemp(join(tmpdir(), "openclaw-room-authentic-legacy-receipt-"));
+  const stateFile = join(directory, "default.json");
+  await writeFile(stateFile, `${JSON.stringify(seed.state, null, 2)}\n`, {mode: 0o600});
+  const runtime = new OpenClawRoomRuntime({accountId: "test", stateFile, baseUrl: seed.state.baseUrl});
+  runtime.state = await loadState(stateFile);
+  const calls = {post: 0, complete: 0};
+  runtime.client = {
+    postMessage: async () => { calls.post += 1; throw new Error("must not repost"); },
+    completeDiscussionAttempt: async (_state, cycleId, attemptId, payload) => {
+      calls.complete += 1;
+      assert.equal(cycleId, "cycle-1");
+      assert.equal(attemptId, "attempt-1");
+      assert.deepEqual(payload, {generation: 3, action: "contribute", eventId: "posted-6"});
+      return {state: "completed"};
+    },
+  };
+  await runtime.repairPendingLifecycles();
+  assert.deepEqual(calls, {post: 0, complete: 1});
+  const intent = runtime.state.deliveryIntents["source-5:final"];
+  assert.equal(intent.version, 2);
+  assert.equal(intent.deliveryState, "posted");
+  assert.equal(intent.lifecycleState, "complete");
+  assert.equal(intent.receipt.eventId, "posted-6");
+  assert.deepEqual(intent.lifecycleRequest, {
+    kind: "cycle", cycleId: "cycle-1", attemptId: "attempt-1",
+    payload: {generation: 3, action: "contribute", eventId: "posted-6"},
+  });
+});
+
+test("production load replays authentic 0.2.29 frozen request with original idempotency key", async () => {
+  const seed = deliveryLifecycleRuntime();
+  seed.state.deliveryIntents["source-5:final"] = {
+    version: 1,
+    status: "selected",
+    identity: {
+      roomId: "room-1", body: "Frozen legacy answer", replyToId: "human-1",
+      sourceEventId: "source-5", coordinationMode: "open", nextRecipient: "",
+      topicId: "topic-1", initialObservedSeq: 4, initialEpochId: "epoch-1", cycle: null,
+    },
+    messagePayloadDialect: "v2",
+    logicalContributionId: "logical-legacy",
+    messageIdempotencyKey: "legacy-message-key",
+    finishIdempotencyKey: "legacy-finish-key",
+    post: {
+      observedSeq: 5, idempotencyKey: "legacy-message-key", logicalContributionId: "logical-legacy",
+      topicId: "topic-1", observedEpochId: "epoch-1", respondsTo: ["human-1"],
+      contributionType: "claim", body: "Frozen legacy answer",
+    },
+  };
+  const directory = await mkdtemp(join(tmpdir(), "openclaw-room-authentic-legacy-frozen-"));
+  const stateFile = join(directory, "default.json");
+  await writeFile(stateFile, `${JSON.stringify(seed.state, null, 2)}\n`, {mode: 0o600});
+  const runtime = new OpenClawRoomRuntime({accountId: "test", stateFile, baseUrl: seed.state.baseUrl});
+  runtime.state = await loadState(stateFile);
+  let postedPayload;
+  runtime.client = {
+    postMessage: async (_state, payload) => {
+      postedPayload = structuredClone(payload);
+      return {id: "posted-6", seq: 6, ts: "2026-08-17T00:00:00Z"};
+    },
+  };
+  assert.equal(await runtime.recoverPendingDelivery({id: "source-5", seq: 5}), true);
+  assert.equal(postedPayload.idempotencyKey, "legacy-message-key");
+  assert.equal(postedPayload.body, "Frozen legacy answer");
+  assert.equal(runtime.state.deliveryIntents["source-5:final"].deliveryState, "posted");
+});
+
+test("production load migrates bound 0.2.29 receipt without repost", async () => {
+  const seed = deliveryLifecycleRuntime();
+  seed.state.deliveryIntents["source-5:final"] = {
+    version: 1,
+    status: "selected",
+    identity: {
+      roomId: "room-1", body: "Frozen legacy answer", replyToId: "human-1",
+      sourceEventId: "source-5", cycle: {cycleId: "cycle-1", attemptId: "attempt-1", generation: 3},
+    },
+    binding: {roomId: "room-1", membershipId: "member-1", clientInstanceId: "client-1"},
+    messagePayloadDialect: "v2",
+    canonicalMessage: {id: "posted-6", seq: 6, ts: "2026-08-17T00:00:00Z"},
+    lifecycleRequest: {
+      kind: "cycle", cycleId: "cycle-1", attemptId: "attempt-1",
+      payload: {generation: 3, action: "contribute", eventId: "posted-6"},
+    },
+  };
+  const directory = await mkdtemp(join(tmpdir(), "openclaw-room-legacy-migration-"));
+  const stateFile = join(directory, "default.json");
+  await saveState(stateFile, seed.state);
+  const runtime = new OpenClawRoomRuntime({accountId: "test", stateFile, baseUrl: seed.state.baseUrl});
+  runtime.state = await loadState(stateFile);
+  const calls = {post: 0, complete: 0};
+  runtime.client = {
+    postMessage: async () => { calls.post += 1; throw new Error("must not repost"); },
+    completeDiscussionAttempt: async (_state, cycleId, attemptId, payload) => {
+      calls.complete += 1;
+      assert.equal(cycleId, "cycle-1");
+      assert.equal(attemptId, "attempt-1");
+      assert.deepEqual(payload, {generation: 3, action: "contribute", eventId: "posted-6"});
+      return {state: "completed"};
+    },
+  };
+  await runtime.repairPendingLifecycles();
+  await runtime.repairPendingLifecycles();
+  assert.deepEqual(calls, {post: 0, complete: 1});
+  const intent = runtime.state.deliveryIntents["source-5:final"];
+  assert.equal(intent.deliveryState, "posted");
+  assert.equal(intent.lifecycleState, "complete");
+  assert.equal(intent.status, "posted");
+  assert.equal(intent.receipt.eventId, "posted-6");
+  const foreign = structuredClone(seed.state);
+  foreign.deliveryIntents["source-5:final"].identity.roomId = "room-foreign";
+  const blockedRuntime = deliveryLifecycleRuntime();
+  blockedRuntime.state = foreign;
+  let blockedCalls = 0;
+  blockedRuntime.client = {completeDiscussionAttempt: async () => { blockedCalls += 1; }};
+  await blockedRuntime.repairPendingLifecycles();
+  assert.equal(blockedCalls, 0);
+  assert.equal(blockedRuntime.state.deliveryIntents["source-5:final"].lifecycleState, "blocked");
+});
+
+test("posted gap acknowledges contiguous terminal tail and preserves lifecycle journal", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "openclaw-room-lifecycle-ack-"));
+  const stateFile = join(directory, "default.json");
+  const state = {
+    version: 1, baseUrl: "https://room.example/api", roomId: "room-1",
+    membershipId: "member-1", credential: "redacted", clientInstanceId: "client-1", cursor: 4,
+    deliveryIntents: {
+      "source-5:final": {
+        version: 2, status: "lifecycle_pending", deliveryState: "posted", lifecycleState: "pending",
+        identity: {
+          roomId: "room-1", body: "Frozen answer", replyToId: "human-1", sourceEventId: "source-5",
+          cycle: {cycleId: "cycle-1", attemptId: "attempt-1", generation: 3},
+        },
+        binding: {roomId: "room-1", membershipId: "member-1", clientInstanceId: "client-1"},
+        messagePayloadDialect: "v2",
+        canonicalMessage: {id: "posted-6", seq: 6, ts: "2026-08-17T00:00:00Z"},
+        lifecycleRequest: {
+          kind: "cycle", cycleId: "cycle-1", attemptId: "attempt-1",
+          payload: {generation: 3, action: "contribute", eventId: "posted-6"},
+        },
+        receipt: {eventId: "posted-6", sentAt: Date.parse("2026-08-17T00:00:00Z")},
+      },
+    },
+    terminalEvidence: {
+      "5": {
+        status: "posted", sourceEventId: "source-5", sourceSeq: 5,
+        canonicalEventId: "posted-6", canonicalSeq: 6,
+        canonicalTs: "2026-08-17T00:00:00Z", reason: "",
+      },
+      "7": {status: "ignored", sourceEventId: "event-7", sourceSeq: 7, canonicalEventId: "", canonicalSeq: 0, canonicalTs: "", reason: "self_event"},
+    },
+  };
+  await saveState(stateFile, state);
+  const runtime = new OpenClawRoomRuntime({accountId: "test", stateFile, baseUrl: state.baseUrl});
+  runtime.state = await loadState(stateFile);
+  runtime.pendingEvent = {id: "source-5", seq: 5};
+  const acknowledgements = [];
+  runtime.client = {
+    acknowledge: async (_state, seq) => {
+      acknowledgements.push(seq);
+      return {acknowledgedSeq: seq};
+    },
+  };
+  await runtime.ack("source-5");
+  let saved = await loadState(stateFile);
+  assert.deepEqual(acknowledgements, [5]);
+  assert.equal(saved.cursor, 5);
+  assert.ok(saved.terminalEvidence["7"]);
+  runtime.state.terminalEvidence["6"] = {
+    status: "posted", sourceEventId: "event-6", sourceSeq: 6,
+    canonicalEventId: "posted-8", canonicalSeq: 8,
+    canonicalTs: "2026-08-17T00:01:00Z", reason: "",
+  };
+  await runtime.ackEvent({id: "event-6", seq: 6});
+  saved = await loadState(stateFile);
+  assert.deepEqual(acknowledgements, [5, 7]);
+  assert.equal(saved.cursor, 7);
+  assert.equal(saved.deliveryIntents["source-5:final"].deliveryState, "posted");
+  assert.equal(saved.deliveryIntents["source-5:final"].lifecycleState, "pending");
+});
+
+test("legacy posted evidence without full receipt loads but cannot acknowledge", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "openclaw-room-legacy-evidence-"));
+  const stateFile = join(directory, "default.json");
+  const state = {
+    version: 1, baseUrl: "https://room.example/api", roomId: "room-1",
+    membershipId: "member-1", credential: "redacted", clientInstanceId: "client-1", cursor: 4,
+    terminalEvidence: {
+      "5": {status: "posted", sourceEventId: "source-5", sourceSeq: 5, canonicalEventId: "posted-6", reason: ""},
+    },
+  };
+  await saveState(stateFile, state);
+  const runtime = new OpenClawRoomRuntime({accountId: "test", stateFile, baseUrl: state.baseUrl});
+  runtime.state = await loadState(stateFile);
+  runtime.pendingEvent = {id: "source-5", seq: 5};
+  let acknowledgements = 0;
+  runtime.client = {acknowledge: async () => { acknowledgements += 1; }};
+  await assert.rejects(runtime.ack("source-5"), /requires durable terminal evidence/);
+  assert.equal(acknowledgements, 0);
+  assert.equal(runtime.state.cursor, 4);
+});
+
+test("acknowledgement requires an exact explicit server frontier", async () => {
+  for (const response of [{}, {acknowledgedSeq: 9}]) {
+    const runtime = deliveryLifecycleRuntime();
+    runtime.state.terminalEvidence = {
+      "5": {status: "ignored", sourceEventId: "source-5", sourceSeq: 5, canonicalEventId: "", canonicalSeq: 0, canonicalTs: "", reason: "test"},
+    };
+    runtime.client = {acknowledge: async () => response};
+    await assert.rejects(runtime.ackEvent({id: "source-5", seq: 5}), /locally proven contiguous frontier/);
+    assert.equal(runtime.state.cursor, 4);
+    assert.ok(runtime.state.terminalEvidence["5"]);
+  }
+});
+
+test("non-retryable lifecycle failure blocks delivery without another automatic call", async () => {
+  const runtime = deliveryLifecycleRuntime();
+  const intent = {
+    version: 2, status: "lifecycle_pending", deliveryState: "posted", lifecycleState: "pending",
+    lifecycleAttempts: 2,
+    identity: {
+      roomId: "room-1", body: "Frozen answer", replyToId: "human-1", sourceEventId: "source-5",
+      cycle: {cycleId: "cycle-1", attemptId: "attempt-1", generation: 3},
+    },
+    binding: {roomId: "room-1", membershipId: "member-1", clientInstanceId: "client-1"},
+    messagePayloadDialect: "v2",
+    canonicalMessage: {id: "posted-6", seq: 6, ts: "2026-08-17T00:00:00Z"},
+    lifecycleRequest: {
+      kind: "cycle", cycleId: "cycle-1", attemptId: "attempt-1",
+      payload: {generation: 3, action: "contribute", eventId: "posted-6"},
+    },
+    receipt: {eventId: "posted-6", sentAt: Date.parse("2026-08-17T00:00:00Z")},
+  };
+  runtime.state.deliveryIntents["source-5:final"] = intent;
+  let lifecycleCalls = 0;
+  runtime.client = {
+    completeDiscussionAttempt: async () => {
+      lifecycleCalls += 1;
+      throw new RoomAPIError(409, {code: "cycle_conflict", retryable: false});
+    },
+  };
+  assert.equal(await runtime.completeIntentLifecycle(intent), false);
+  await runtime.repairPendingLifecycles();
+  assert.equal(lifecycleCalls, 1);
+  assert.equal(intent.deliveryState, "posted");
+  assert.equal(intent.lifecycleState, "blocked");
+  assert.equal(intent.status, "lifecycle_blocked");
+  assert.equal(intent.lifecycleAttempts, 3);
+  intent.lifecycleState = "pending";
+  intent.status = "lifecycle_pending";
+  await runtime.repairPendingLifecycles();
+  assert.equal(lifecycleCalls, 1);
+  assert.equal(intent.lifecycleState, "blocked");
+  assert.equal(intent.status, "lifecycle_blocked");
+});
+
+test("non-retryable post failure is quarantined and cannot repost", async () => {
+  const runtime = deliveryLifecycleRuntime();
+  let posts = 0;
+  runtime.client = {
+    roomState: async () => ({headSeq: 5, activeEpoch: {id: "epoch-1"}}),
+    roomPolicy: async () => ({policy: {coordinationMode: "open"}}),
+    postMessage: async () => {
+      posts += 1;
+      throw new RoomAPIError(409, {code: "validation_error", retryable: false});
+    },
+  };
+  const request = {
+    roomId: "room-1", text: "Frozen answer", replyToId: "human-1",
+    idempotencyKey: "delivery-quarantined", sourceEventId: "source-5",
+  };
+  await assert.rejects(runtime.postAndFinish(request), RoomAPIError);
+  await assert.rejects(runtime.postAndFinish(request), /quarantined for operator recovery/);
+  assert.equal(posts, 1);
+  const intent = runtime.state.deliveryIntents["delivery-quarantined"];
+  assert.equal(intent.deliveryState, "quarantined");
+  assert.equal(intent.lifecycleState, "not_started");
+  assert.equal(intent.canonicalMessage, undefined);
 });

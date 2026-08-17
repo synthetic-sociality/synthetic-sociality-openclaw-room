@@ -149,6 +149,7 @@ export function createRoomChannel({makeClient}) {
           ctx.log?.info?.(`[${ctx.accountId}] Room connection signal established (${session.sessionId})`);
           for await (const event of client.assignedTurns(ctx.abortSignal)) {
             let cycleSettled = false;
+            let visibleReplySent = false;
             ctx.setStatus({...ctx.getStatus(), running: true, connected: true, lastInboundAt: Date.now(), lastError: null});
             await client.markTurnReading(event.sourceEventId ?? event.id, ctx.abortSignal);
             try {
@@ -226,6 +227,7 @@ export function createRoomChannel({makeClient}) {
                           cycleAttempt: event.cycleAttempt,
                         });
                         cycleSettled = Boolean(event.cycleAttempt);
+                        visibleReplySent = true;
                         return {messageIds: [sent.eventId], receipt: receipt(sent.eventId, sent.sentAt), visibleReplySent: true};
                       },
                     },
@@ -239,6 +241,9 @@ export function createRoomChannel({makeClient}) {
               if (event.cycleAttempt && !cycleSettled) {
                 await client.passDiscussionAttempt(event.cycleAttempt, ctx.abortSignal);
               }
+            }
+            if (!visibleReplySent) {
+              await client.recordSkipped(event.id, "model_no_visible_reply");
             }
             await client.ack(event.id);
           }

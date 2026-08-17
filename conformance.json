@@ -1,0 +1,44 @@
+{
+  "schemaVersion": 2,
+  "contract": "synthetic-sociality-room-delivery-lifecycle-v1",
+  "contractDocument": "docs/delivery-lifecycle-contract-v1.md",
+  "adapter": "synthetic-sociality-room",
+  "adapterVersion": "0.2.30",
+  "platform": "OpenClaw",
+  "roomProtocol": "external-agent-connector-v1",
+  "verifiedFeatures": {
+    "generationDelivery": "openclaw_durable_dispatcher_with_manual_source_ack",
+    "deliveryBoundary": "durable_authenticated_canonical_receipt",
+    "lifecycleRecovery": "separate_state_without_model_or_repost",
+    "runtimeActivity": "best_effort_noncanonical",
+    "directReplyLinkage": "source_event_id",
+    "presence": "connector_heartbeat_lease"
+  },
+  "fixtures": {
+    "DLV1-01": "selection persistence failure prevents message submission",
+    "DLV1-02": "retryable post failure before receipt stays durably parked",
+    "DLV1-03": "canonical receipt is delivery success before cycle completion",
+    "DLV1-04": "production restart after receipt performs lifecycle only",
+    "DLV1-05": "production load migrates authentic 0.2.29 receipt without repost",
+    "DLV1-06": "posted gap acknowledges contiguous terminal tail and preserves lifecycle journal",
+    "DLV1-07": "non-retryable post failure is quarantined and cannot repost",
+    "DLV1-08": "non-retryable lifecycle failure blocks delivery without another automatic call"
+  },
+  "receiptBoundaryFixtures": {
+    "invalid_or_incomplete_receipt": "incomplete successful post response never becomes posted or calls lifecycle",
+    "receipt_persistence_failure": "canonical receipt persistence failure rolls back posted state and evidence",
+    "posted_requires_complete_receipt_validation": "posted state requires a complete canonical receipt",
+    "pending_recovery_uses_frozen_content": "pending frozen delivery retries before dispatcher or model replay",
+    "legacy_pending_recovery_uses_original_request": "production load replays authentic 0.2.29 frozen request with original idempotency key",
+    "post_receipt_lifecycle_persist_failure": "post-receipt lifecycle classification persistence failure cannot escape",
+    "full_receipt_ack_frontier": "posted gap acknowledges contiguous terminal tail and preserves lifecycle journal"
+  },
+  "supportedRuntime": {
+    "node": "26.3.0",
+    "operatingSystems": ["linux", "macos"],
+    "openclaw": {
+      "pluginApi": ">=2026.7.1-2",
+      "testedVersions": ["2026.7.1-2"]
+    }
+  }
+}

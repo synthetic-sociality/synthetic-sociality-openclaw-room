@@ -24,6 +24,186 @@ Follow an explicit speaking order or special instruction when the human particip
 export const OPEN_EXCHANGE_PREAMBLE_SHA256 = createHash("sha256").update(OPEN_EXCHANGE_PREAMBLE).digest("hex");
 export const MESSAGE_LOGICAL_CONTRIBUTION_CAPABILITY = "messages.logical_contribution.v1";
 
+function validCanonicalTimestamp(value) {
+  if (typeof value !== "string" || !value.trim()) return false;
+  const match = /^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(?:Z|[+-](\d{2}):(\d{2}))$/.exec(value);
+  if (!match || !Number.isFinite(Date.parse(value))) return false;
+  const [, yearText, monthText, dayText, hourText, minuteText, secondText, offsetHourText, offsetMinuteText] = match;
+  const year = Number(yearText);
+  const month = Number(monthText);
+  const day = Number(dayText);
+  const hour = Number(hourText);
+  const minute = Number(minuteText);
+  const second = Number(secondText);
+  const offsetHour = Number(offsetHourText ?? 0);
+  const offsetMinute = Number(offsetMinuteText ?? 0);
+  if (month < 1 || month > 12 || hour > 23 || minute > 59 || second > 59 || offsetHour > 23 || offsetMinute > 59) return false;
+  const daysInMonth = new Date(Date.UTC(year, month, 0)).getUTCDate();
+  return day >= 1 && day <= daysInMonth;
+}
+
+function validCanonicalMessage(message) {
+  return Boolean(
+    message
+    && typeof message.id === "string"
+    && message.id.trim()
+    && Number.isSafeInteger(message.seq)
+    && message.seq > 0
+    && validCanonicalTimestamp(message.ts)
+  );
+}
+
+function validFrozenPost(intent) {
+  const post = intent?.post;
+  const identity = intent?.identity;
+  const legacy = intent?.version === 1;
+  if (!post || typeof post !== "object" || !identity) return false;
+  if (post.body !== identity.body || post.idempotencyKey !== intent.messageIdempotencyKey) return false;
+  if (!Number.isSafeInteger(post.observedSeq) || post.observedSeq < 0) return false;
+  if (!legacy || identity.postObservedSeq !== undefined) {
+    if (post.observedSeq !== identity.postObservedSeq) return false;
+  }
+  if (identity.topicId ? post.topicId !== identity.topicId : post.topicId !== undefined) return false;
+  if (!legacy || identity.postObservedEpochId !== undefined) {
+    if (identity.postObservedEpochId ? post.observedEpochId !== identity.postObservedEpochId : post.observedEpochId !== undefined) return false;
+  } else if (post.observedEpochId !== undefined && typeof post.observedEpochId !== "string") return false;
+  if (intent.messagePayloadDialect === "v2" ? post.logicalContributionId !== intent.logicalContributionId : post.logicalContributionId !== undefined) return false;
+  if (identity.replyToId ? JSON.stringify(post.respondsTo) !== JSON.stringify([identity.replyToId]) : post.respondsTo !== undefined) return false;
+  if (identity.nextRecipient ? JSON.stringify(post.recipientSelectors) !== JSON.stringify([{kind: "membership", membershipId: identity.nextRecipient}]) : post.recipientSelectors !== undefined) return false;
+  if (identity.cycle) {
+    if (post.cycleId !== identity.cycle.cycleId || post.attemptId !== identity.cycle.attemptId || post.cycleGeneration !== identity.cycle.generation) return false;
+  } else if (post.cycleId !== undefined || post.attemptId !== undefined || post.cycleGeneration !== undefined) return false;
+  if (intent.turn?.turnId ? post.turnId !== intent.turn.turnId : post.turnId !== undefined) return false;
+  return post.contributionType === (identity.nextRecipient ? "question" : "claim");
+}
+
+function validCycleIdentity(cycle) {
+  return Boolean(
+    cycle
+    && typeof cycle.cycleId === "string"
+    && cycle.cycleId.trim()
+    && typeof cycle.attemptId === "string"
+    && cycle.attemptId.trim()
+    && Number.isSafeInteger(cycle.generation)
+    && cycle.generation >= 0
+  );
+}
+
+function migrateLegacyIntentToV2(deliveryKey, intent, state) {
+  if (!intent || intent.version !== 1 || !intent.identity) return false;
+  const identity = intent.identity;
+  if (deliveryKey !== `${identity.sourceEventId}:final` || identity.roomId !== state.roomId) return false;
+  if (intent.binding && (
+    intent.binding.roomId !== state.roomId
+    || intent.binding.membershipId !== state.membershipId
+    || intent.binding.clientInstanceId !== state.clientInstanceId
+  )) return false;
+  if (!["selected", "posted"].includes(intent.status) || !["v1", "v2"].includes(intent.messagePayloadDialect)) return false;
+  if (intent.post && !validFrozenPost(intent)) return false;
+  if (intent.canonicalMessage && !validCanonicalMessage(intent.canonicalMessage)) return false;
+  if (intent.receipt && intent.receipt.eventId !== intent.canonicalMessage?.id) return false;
+
+  if (intent.post) {
+    identity.postObservedSeq = intent.post.observedSeq;
+    identity.postObservedEpochId = String(intent.post.observedEpochId ?? "");
+  }
+  intent.binding = {
+    roomId: state.roomId,
+    membershipId: state.membershipId,
+    clientInstanceId: state.clientInstanceId,
+  };
+  if (intent.canonicalMessage) {
+    if (validCycleIdentity(identity.cycle)) {
+      intent.lifecycleRequest ??= {
+        kind: "cycle",
+        cycleId: identity.cycle.cycleId,
+        attemptId: identity.cycle.attemptId,
+        payload: {
+          generation: identity.cycle.generation,
+          action: "contribute",
+          eventId: intent.canonicalMessage.id,
+        },
+      };
+    } else if (intent.turn?.turnId && intent.finishIdempotencyKey) {
+      const legacyFinish = intent.finish;
+      if (legacyFinish && (
+        legacyFinish.turnId !== intent.turn.turnId
+        || legacyFinish.observedSeq !== intent.canonicalMessage.seq
+        || legacyFinish.idempotencyKey !== intent.finishIdempotencyKey
+      )) return false;
+      intent.lifecycleRequest ??= {
+        kind: "turn",
+        turnId: intent.turn.turnId,
+        observedSeq: intent.canonicalMessage.seq,
+        sourceEventId: identity.sourceEventId,
+        idempotencyKey: intent.finishIdempotencyKey,
+      };
+    } else if (identity.cycle || intent.turn) return false;
+    intent.deliveryState = "posted";
+    intent.receipt ??= {
+      eventId: intent.canonicalMessage.id,
+      sentAt: Date.parse(intent.canonicalMessage.ts),
+    };
+    const needsLifecycle = Boolean(identity.cycle || intent.turn);
+    intent.lifecycleState = needsLifecycle
+      ? (intent.status === "posted" ? "complete" : "pending")
+      : "not_required";
+    intent.status = intent.lifecycleState === "pending" ? "lifecycle_pending" : "posted";
+    intent.lifecycleAttempts ??= 0;
+  } else if (intent.post) {
+    intent.deliveryState = "delivery_pending";
+    intent.lifecycleState = "not_started";
+    intent.status = "delivery_pending";
+  } else {
+    intent.deliveryState = "selected";
+    intent.lifecycleState = "not_started";
+  }
+  intent.version = 2;
+  return true;
+}
+
+function repairIntentBoundToState(deliveryKey, intent, state) {
+  if (!intent || ![1, 2].includes(intent.version) || !validCanonicalMessage(intent.canonicalMessage)) return false;
+  if (!["v1", "v2"].includes(intent.messagePayloadDialect)) return false;
+  if (!intent.identity || intent.identity.roomId !== state.roomId || !String(intent.identity.sourceEventId ?? "")) return false;
+  if (intent.receipt && intent.receipt.eventId !== intent.canonicalMessage.id) return false;
+  if (!validCycleIdentity(intent.identity.cycle) && !String(intent.turn?.turnId ?? "")) return false;
+  if (intent.identity.cycle) {
+    const request = intent.lifecycleRequest;
+    if (!request || request.kind !== "cycle"
+        || request.cycleId !== intent.identity.cycle.cycleId
+        || request.attemptId !== intent.identity.cycle.attemptId
+        || request.payload?.generation !== intent.identity.cycle.generation
+        || request.payload?.action !== "contribute"
+        || request.payload?.eventId !== intent.canonicalMessage.id) return false;
+  } else if (intent.turn) {
+    const request = intent.lifecycleRequest;
+    if (!request || request.kind !== "turn"
+        || request.turnId !== intent.turn.turnId
+        || request.observedSeq !== intent.canonicalMessage.seq
+        || request.sourceEventId !== intent.identity.sourceEventId
+        || request.idempotencyKey !== intent.finishIdempotencyKey) return false;
+  }
+  if (!intent.binding
+      || intent.binding.roomId !== state.roomId
+      || intent.binding.membershipId !== state.membershipId
+      || intent.binding.clientInstanceId !== state.clientInstanceId) return false;
+  if (intent.version === 2) return true;
+  return deliveryKey === `${intent.identity.sourceEventId}:final` && intent.status === "selected";
+}
+
+function validTerminalEvidence(evidence) {
+  if (!evidence || !["posted", "skipped", "cancelled", "superseded", "ignored"].includes(evidence.status)) return false;
+  if (!Number.isSafeInteger(evidence.sourceSeq) || evidence.sourceSeq < 1 || !String(evidence.sourceEventId ?? "")) return false;
+  return evidence.status === "posted"
+    ? Boolean(
+      typeof evidence.canonicalEventId === "string" && evidence.canonicalEventId
+      && Number.isSafeInteger(evidence.canonicalSeq) && evidence.canonicalSeq > 0
+      && validCanonicalTimestamp(evidence.canonicalTs)
+    )
+    : Boolean(String(evidence.reason ?? ""));
+}
+
 function acceptedActivitySequence(receipt, expected) {
   if (!Number.isSafeInteger(receipt?.acceptedStreamSeq) || receipt.acceptedStreamSeq !== expected) {
     throw new Error("Room activity receipt sequence is invalid");
@@ -94,7 +274,9 @@ export class OpenClawRoomRuntime {
       MESSAGE_LOGICAL_CONTRIBUTION_CAPABILITY,
     ) ? "v2" : "v1";
     this.state.deliveryIntents ??= {};
+    this.state.terminalEvidence ??= {};
     await saveState(this.account.stateFile, this.state);
+    await this.repairPendingLifecycles(signal);
     await this.publishPresence(signal);
     if (this.activityError) this.logger?.warn?.(`Room activity signal unavailable${roomErrorDiagnostic(this.activityError)}`);
     else this.logger?.info?.("Room activity signal established");
@@ -112,7 +294,18 @@ export class OpenClawRoomRuntime {
       await retry(() => this.maintainPresence(signal), signal);
       for (const event of page.events ?? []) {
         if (event.seq <= this.state.cursor) continue;
+        if (await this.recoverPostedEvidence(event)) {
+          this.pendingEvent = event;
+          await this.ackEvent(event);
+          continue;
+        }
+        if (await this.recoverPendingDelivery(event, signal)) {
+          this.pendingEvent = event;
+          await this.ackEvent(event);
+          continue;
+        }
         if (!isAssignedEvent(event, this.state.membershipId)) {
+          await this.recordTerminalEvidence(event, "ignored", {reason: "not_assigned_or_technical"});
           await this.ackEvent(event);
           continue;
         }
@@ -124,6 +317,7 @@ export class OpenClawRoomRuntime {
         }
         const cycleAttempt = await this.prepareCycleAttempt(event, signal);
         if (cycleAttempt === false) {
+          await this.recordTerminalEvidence(event, "skipped", {reason: "coordination_handled_without_model"});
           await this.ackEvent(event);
           continue;
         }
@@ -211,11 +405,137 @@ export class OpenClawRoomRuntime {
     await this.ackEvent(pending);
   }
 
+  async recordSkipped(eventId, reason = "model_no_visible_reply") {
+    const pending = this.pendingEvent;
+    if (!pending || pending.id !== eventId) throw new Error("Room skipped outcome is out of order");
+    if (!this.terminalEvidenceFor(pending)) {
+      await this.recordTerminalEvidence(pending, "skipped", {reason});
+    }
+  }
+
+  terminalEvidenceFor(event) {
+    const evidence = this.state.terminalEvidence?.[String(event?.seq ?? 0)];
+    return validTerminalEvidence(evidence) && evidence.sourceEventId === event?.id ? evidence : null;
+  }
+
+  async recordTerminalEvidence(event, status, {
+    canonicalEventId = "", canonicalSeq = 0, canonicalTs = "", reason = "",
+  } = {}) {
+    if (!event?.id || !Number.isSafeInteger(event.seq) || event.seq < 1) {
+      throw new Error("Room terminal evidence requires a canonical source event");
+    }
+    const evidence = {
+      status,
+      sourceEventId: event.id,
+      sourceSeq: event.seq,
+      canonicalEventId: String(canonicalEventId || ""),
+      canonicalSeq,
+      canonicalTs,
+      reason: String(reason || ""),
+    };
+    if (!validTerminalEvidence(evidence)) throw new Error("Room terminal evidence is invalid");
+    this.state.terminalEvidence ??= {};
+    this.state.terminalEvidence[String(event.seq)] = evidence;
+    await this.persistState();
+    return evidence;
+  }
+
+  async migrateLegacyIntent(deliveryKey, intent) {
+    if (intent?.version !== 1) return false;
+    const previous = structuredClone(intent);
+    if (!migrateLegacyIntentToV2(deliveryKey, intent, this.state)) return false;
+    try {
+      await this.persistState();
+      return true;
+    } catch (error) {
+      for (const key of Object.keys(intent)) delete intent[key];
+      Object.assign(intent, previous);
+      throw error;
+    }
+  }
+
+  async recoverPostedEvidence(event) {
+    if (this.terminalEvidenceFor(event)) return true;
+    for (const [deliveryKey, intent] of Object.entries(this.state.deliveryIntents ?? {})) {
+      if (
+        intent?.identity?.sourceEventId !== event.id
+        || intent.identity.roomId !== this.state.roomId
+        || deliveryKey !== `${event.id}:final`
+        || intent.deliveryState !== "posted"
+        || !repairIntentBoundToState(deliveryKey, intent, this.state)
+      ) continue;
+      if (!intent.receipt) {
+        intent.receipt = {
+          eventId: intent.canonicalMessage.id,
+          sentAt: Date.parse(intent.canonicalMessage.ts),
+        };
+      }
+      await this.recordTerminalEvidence(event, "posted", {
+        canonicalEventId: intent.canonicalMessage.id,
+        canonicalSeq: intent.canonicalMessage.seq,
+        canonicalTs: intent.canonicalMessage.ts,
+      });
+      return true;
+    }
+    return false;
+  }
+
+  async recoverPendingDelivery(event, signal) {
+    const deliveryKey = `${event?.id ?? ""}:final`;
+    const intent = this.state.deliveryIntents?.[deliveryKey];
+    if (intent?.version === 1 && !await this.migrateLegacyIntent(deliveryKey, intent)) return false;
+    if (
+      !intent || intent.version !== 2
+      || !["selected", "delivery_pending"].includes(intent.deliveryState)
+      || intent.canonicalMessage
+      || intent.identity?.sourceEventId !== event?.id
+      || intent.identity?.roomId !== this.state.roomId
+      || intent.binding?.roomId !== this.state.roomId
+      || intent.binding?.membershipId !== this.state.membershipId
+      || intent.binding?.clientInstanceId !== this.state.clientInstanceId
+      || !["v1", "v2"].includes(intent.messagePayloadDialect)
+      || !validFrozenPost(intent)
+    ) return false;
+    const cycle = intent.identity.cycle;
+    const cycleAttempt = cycle ? {
+      cycle: {id: cycle.cycleId, generation: cycle.generation},
+      attempt: {id: cycle.attemptId},
+      settled: false,
+    } : null;
+    this.pendingEvent = event;
+    await this.postAndFinish({
+      roomId: intent.identity.roomId,
+      text: intent.identity.body,
+      replyToId: intent.identity.replyToId,
+      idempotencyKey: deliveryKey,
+      sourceEventId: intent.identity.sourceEventId,
+      cycleAttempt,
+      signal,
+    });
+    return true;
+  }
+
   async ackEvent(event) {
-    const cursor = await this.client.acknowledge(this.state, event.seq);
-    this.state.cursor = cursor.acknowledgedSeq ?? event.seq;
+    const evidence = this.terminalEvidenceFor(event);
+    if (!evidence) throw new Error("Room event acknowledgement requires durable terminal evidence");
+    let frontier = this.state.cursor;
+    while (true) {
+      const next = this.state.terminalEvidence?.[String(frontier + 1)];
+      if (!validTerminalEvidence(next) || next.sourceSeq !== frontier + 1) break;
+      frontier += 1;
+    }
+    if (frontier <= this.state.cursor) throw new Error("Room event acknowledgement has a non-contiguous terminal ledger");
+    const response = await this.client.acknowledge(this.state, frontier);
+    const authoritative = response?.acknowledgedSeq;
+    if (!Number.isSafeInteger(authoritative) || authoritative !== frontier) {
+      throw new Error("Room acknowledgement exceeded the locally proven contiguous frontier");
+    }
+    this.state.cursor = authoritative;
+    this.state.terminalEvidence = Object.fromEntries(
+      Object.entries(this.state.terminalEvidence ?? {}).filter(([seq]) => Number(seq) > authoritative),
+    );
     await saveState(this.account.stateFile, this.state);
-    if (this.pendingEvent?.id === event.id) this.pendingEvent = null;
+    if (this.pendingEvent && this.pendingEvent.seq <= authoritative) this.pendingEvent = null;
   }
 
   async postAndFinish({roomId, text, replyToId, idempotencyKey, signal, sourceEventId, cycleAttempt = null}) {
@@ -247,24 +567,39 @@ export class OpenClawRoomRuntime {
       if (!["v1", "v2"].includes(intent.messagePayloadDialect)) {
         throw new Error("Existing OpenClaw Room delivery has no frozen message payload dialect");
       }
-      if (intent.status === "posted" && intent.receipt) return intent.receipt;
+      // 0.2.29 already persisted canonicalMessage before lifecycle completion.
+      // Upgrade only an exact, binding-tied state; malformed or foreign state
+      // must never trigger authenticated lifecycle I/O.
+      if (intent.canonicalMessage && !repairIntentBoundToState(deliveryKey, intent, this.state)) {
+        throw new Error("Existing canonical Room delivery is not safely bound to this connector state");
+      }
+      if (validCanonicalMessage(intent.canonicalMessage) && intent.deliveryState !== "posted") {
+        intent.deliveryState = "posted";
+        intent.lifecycleState = intent.identity?.cycle || intent.turn ? "pending" : "not_required";
+        intent.status = intent.lifecycleState === "pending" ? "lifecycle_pending" : "posted";
+        intent.receipt ??= {
+          eventId: intent.canonicalMessage.id,
+          sentAt: Date.parse(intent.canonicalMessage.ts),
+        };
+        await this.persistState();
+      }
+      if (intent.deliveryState === "posted" && intent.lifecycleState !== "pending" && intent.receipt) return intent.receipt;
+      if (intent.deliveryState === "quarantined" || intent.status === "quarantined") {
+        throw new Error("OpenClaw Room delivery is quarantined for operator recovery");
+      }
     } else {
-      const initialState = await this.client.roomState(this.state, signal);
-      const topicId = initialState.activeTopic?.id ?? null;
-      const policyEnvelope = cycleAttempt ? null : await this.client.roomPolicy(this.state, signal);
-      const policy = policyEnvelope?.policy && typeof policyEnvelope.policy === "object" ? policyEnvelope.policy : policyEnvelope;
-      const openExchange = String(policy?.coordinationMode ?? "coordinated") === "open";
-      const coordinationMode = cycleAttempt ? "cycle" : (openExchange ? "open" : "coordinated");
-      const nextRecipient = cycleAttempt ? nextCycleRecipient(cycleAttempt.cycle, this.state.membershipId) : "";
       const payloadDialect = this.state.messagePayloadDialect ?? "v1";
       if (!["v1", "v2"].includes(payloadDialect)) throw new Error("Room message payload dialect was not negotiated");
       intent = {
-        version: 1,
+        version: 2,
         status: "selected",
-        identity: {
-          ...requestedIdentity, coordinationMode, nextRecipient, topicId,
-          initialObservedSeq: Number(initialState.headSeq ?? 0),
-          initialEpochId: String(initialState.activeEpoch?.id ?? ""),
+        deliveryState: "selected",
+        lifecycleState: "not_started",
+        identity: {...requestedIdentity},
+        binding: {
+          roomId: this.state.roomId,
+          membershipId: this.state.membershipId,
+          clientInstanceId: this.state.clientInstanceId,
         },
         messagePayloadDialect: payloadDialect,
         logicalContributionId: safeKey(`logical-contribution:${replyToId || sourceEventId || deliveryKey}`),
@@ -272,6 +607,25 @@ export class OpenClawRoomRuntime {
         messageIdempotencyKey: safeKey(`${deliveryKey}:message`),
         finishIdempotencyKey: safeKey(`${deliveryKey}:finish`),
       };
+      this.state.deliveryIntents[deliveryKey] = intent;
+      // Freeze semantic identity and all keys before any connector read/write.
+      await this.persistState();
+    }
+    if (!intent.identity.coordinationMode) {
+      const initialState = await this.client.roomState(this.state, signal);
+      const topicId = initialState.activeTopic?.id ?? null;
+      const policyEnvelope = cycleAttempt ? null : await this.client.roomPolicy(this.state, signal);
+      const policy = policyEnvelope?.policy && typeof policyEnvelope.policy === "object" ? policyEnvelope.policy : policyEnvelope;
+      const openExchange = String(policy?.coordinationMode ?? "coordinated") === "open";
+      const coordinationMode = cycleAttempt ? "cycle" : (openExchange ? "open" : "coordinated");
+      const nextRecipient = cycleAttempt ? nextCycleRecipient(cycleAttempt.cycle, this.state.membershipId) : "";
+      Object.assign(intent.identity, {
+        coordinationMode,
+        nextRecipient,
+        topicId,
+        initialObservedSeq: Number(initialState.headSeq ?? 0),
+        initialEpochId: String(initialState.activeEpoch?.id ?? ""),
+      });
       if (coordinationMode === "coordinated") {
         intent.turnRequest = {
           observedSeq: intent.identity.initialObservedSeq,
@@ -279,7 +633,6 @@ export class OpenClawRoomRuntime {
           ...(topicId ? {topicId} : {}),
         };
       }
-      this.state.deliveryIntents[deliveryKey] = intent;
       await this.persistState();
     }
     await this.markTurnPreparing(intent.identity.sourceEventId, signal);
@@ -297,9 +650,11 @@ export class OpenClawRoomRuntime {
         headSeq: intent.identity.initialObservedSeq,
         activeEpoch: intent.identity.initialEpochId ? {id: intent.identity.initialEpochId} : null,
       };
+      intent.identity.postObservedSeq = Number(fresh.headSeq);
+      intent.identity.postObservedEpochId = String(fresh.activeEpoch?.id ?? "");
       intent.post = {
         ...(granted ? {turnId: granted.turnId} : {}),
-        observedSeq: fresh.headSeq,
+        observedSeq: intent.identity.postObservedSeq,
         idempotencyKey: intent.messageIdempotencyKey,
         ...(intent.messagePayloadDialect === "v2" ? {logicalContributionId: intent.logicalContributionId} : {}),
         ...(intent.identity.topicId ? {topicId: intent.identity.topicId} : {}),
@@ -314,33 +669,229 @@ export class OpenClawRoomRuntime {
         contributionType: intent.identity.nextRecipient ? "question" : "claim",
         body: intent.identity.body,
       };
+      intent.deliveryState = "delivery_pending";
+      intent.lifecycleState = "not_started";
+      intent.status = "delivery_pending";
       await this.persistState();
     }
-    const message = await this.client.postMessage(this.state, intent.post, signal);
-    intent.canonicalMessage = {id: message.id, seq: message.seq, ts: message.ts};
-    await this.persistState();
-    if (intent.identity.cycle) {
-      await this.client.completeDiscussionAttempt(this.state, intent.identity.cycle.cycleId, intent.identity.cycle.attemptId, {
-        generation: intent.identity.cycle.generation,
-        action: "contribute",
-        eventId: message.id,
-      }, signal);
-      if (cycleAttempt) cycleAttempt.settled = true;
+    if (!validFrozenPost(intent)) {
+      throw new Error("Persisted Room post does not match its frozen delivery identity");
     }
-    if (granted) {
-      intent.finish ??= {
-        turnId: granted.turnId,
-        observedSeq: message.seq,
-        idempotencyKey: intent.finishIdempotencyKey,
-      };
+    let message;
+    if (intent.deliveryState === "posted" && validCanonicalMessage(intent.canonicalMessage)) {
+      message = intent.canonicalMessage;
+    } else {
+      try {
+        message = await this.client.postMessage(this.state, intent.post, signal);
+      } catch (error) {
+        if (error instanceof RoomAPIError && !error.retryable) {
+          intent.deliveryState = "quarantined";
+          intent.status = "quarantined";
+        } else {
+          intent.deliveryState = "delivery_pending";
+          intent.status = "delivery_pending";
+        }
+        intent.lifecycleState = "not_started";
+        intent.deliveryErrorCode = error instanceof RoomAPIError ? error.code : "";
+        intent.deliveryError = String(error?.message ?? error).slice(0, 1000);
+        await this.persistState();
+        throw error;
+      }
+      if (!validCanonicalMessage(message)) {
+        throw new Error("Room canonical delivery receipt requires event ID, sequence, and timestamp");
+      }
+      const previousIntent = structuredClone(intent);
+      const previousTerminalEvidence = this.state.terminalEvidence === undefined
+        ? undefined : structuredClone(this.state.terminalEvidence);
+      try {
+        intent.canonicalMessage = {id: message.id, seq: message.seq, ts: message.ts};
+        intent.deliveryState = "posted";
+        intent.lifecycleState = intent.identity.cycle || granted ? "pending" : "not_required";
+        intent.status = intent.lifecycleState === "pending" ? "lifecycle_pending" : "posted";
+        intent.receipt = {eventId: message.id, sentAt: Date.parse(message.ts)};
+        if (intent.identity.cycle) {
+          intent.lifecycleRequest = {
+            kind: "cycle",
+            cycleId: intent.identity.cycle.cycleId,
+            attemptId: intent.identity.cycle.attemptId,
+            payload: {
+              generation: intent.identity.cycle.generation,
+              action: "contribute",
+              eventId: message.id,
+            },
+          };
+        } else if (granted) {
+          intent.lifecycleRequest = {
+            kind: "turn",
+            turnId: intent.turn.turnId,
+            observedSeq: message.seq,
+            sourceEventId: intent.identity.sourceEventId,
+            idempotencyKey: intent.finishIdempotencyKey,
+          };
+        }
+        delete intent.deliveryError;
+        delete intent.deliveryErrorCode;
+        if (intent.identity.sourceEventId && this.pendingEvent) {
+          const source = this.pendingEvent;
+          if (source.id !== intent.identity.sourceEventId) {
+            throw new Error("Canonical delivery cannot be tied to a different pending source event");
+          }
+          this.state.terminalEvidence ??= {};
+          this.state.terminalEvidence[String(source.seq)] = {
+            status: "posted",
+            sourceEventId: source.id,
+            sourceSeq: source.seq,
+            canonicalEventId: message.id,
+            canonicalSeq: message.seq,
+            canonicalTs: message.ts,
+            reason: "",
+          };
+        }
+        // This write is the canonical delivery and source-evidence boundary and
+        // must complete before any cycle/turn lifecycle request is attempted.
+        await this.persistState();
+      } catch (error) {
+        for (const key of Object.keys(intent)) delete intent[key];
+        Object.assign(intent, previousIntent);
+        if (previousTerminalEvidence === undefined) delete this.state.terminalEvidence;
+        else this.state.terminalEvidence = previousTerminalEvidence;
+        throw error;
+      }
+    }
+    if (intent.lifecycleState === "pending") {
+      await this.completeIntentLifecycle(intent, signal, cycleAttempt);
+    } else {
+      intent.status = "posted";
       await this.persistState();
-      await this.client.finishTurn(this.state, intent.finish, signal);
     }
     await this.markTurnPosted(intent.identity.sourceEventId, message.id, signal);
-    intent.status = "posted";
-    intent.receipt = {eventId: message.id, sentAt: Date.parse(message.ts) || Date.now()};
-    await this.persistState();
     return intent.receipt;
+  }
+
+  async completeIntentLifecycle(intent, signal, cycleAttempt = null) {
+    const message = intent.canonicalMessage;
+    if (intent.deliveryState !== "posted" || !validCanonicalMessage(message)) {
+      throw new Error("Lifecycle completion requires a complete canonical delivery receipt");
+    }
+    intent.lifecycleAttempts = Number(intent.lifecycleAttempts ?? 0) + 1;
+    intent.lifecycleLastAttemptAt = new Date().toISOString();
+    await this.persistState();
+    const persistedAttemptState = structuredClone(intent);
+    try {
+      if (intent.identity.cycle) {
+        const request = intent.lifecycleRequest;
+        if (!request || request.kind !== "cycle"
+            || request.cycleId !== intent.identity.cycle.cycleId
+            || request.attemptId !== intent.identity.cycle.attemptId
+            || request.payload?.generation !== intent.identity.cycle.generation
+            || request.payload?.action !== "contribute"
+            || request.payload?.eventId !== message.id) {
+          throw new Error("Cycle lifecycle request is not durably bound to the canonical receipt");
+        }
+        await this.client.completeDiscussionAttempt(
+          this.state, request.cycleId, request.attemptId, structuredClone(request.payload), signal,
+        );
+        if (cycleAttempt) cycleAttempt.settled = true;
+      } else if (intent.turn) {
+        const request = intent.lifecycleRequest;
+        if (!request || request.kind !== "turn"
+            || request.turnId !== intent.turn.turnId
+            || request.observedSeq !== message.seq
+            || request.sourceEventId !== intent.identity.sourceEventId
+            || request.idempotencyKey !== intent.finishIdempotencyKey) {
+          throw new Error("Turn lifecycle request is not durably bound to the canonical receipt");
+        }
+        await this.client.finishTurn(this.state, {
+          turnId: request.turnId,
+          observedSeq: request.observedSeq,
+          idempotencyKey: request.idempotencyKey,
+        }, signal);
+      }
+      intent.lifecycleState = "complete";
+      intent.status = "posted";
+      delete intent.lifecycleError;
+      delete intent.lifecycleErrorCode;
+      delete intent.lifecycleFailedAt;
+      delete intent.lifecycleAutomaticRetry;
+      await this.persistState();
+      return true;
+    } catch (error) {
+      // Delivery is immutable after a canonical receipt. Retry lifecycle only
+      // when classified safe, and bound automatic attempts to prevent an
+      // unbounded authenticated startup loop.
+      intent.deliveryState = "posted";
+      const retryable = !(error instanceof RoomAPIError) || error.retryable;
+      const automaticRetryAllowed = Boolean(retryable && intent.lifecycleAttempts < 3);
+      intent.lifecycleState = automaticRetryAllowed ? "pending" : "blocked";
+      intent.status = automaticRetryAllowed ? "lifecycle_pending" : "lifecycle_blocked";
+      intent.lifecycleAutomaticRetry = automaticRetryAllowed;
+      intent.lifecycleErrorCode = error instanceof RoomAPIError ? error.code : "";
+      intent.lifecycleError = String(error?.message ?? error).slice(0, 1000);
+      intent.lifecycleFailedAt = new Date().toISOString();
+      try {
+        await this.persistState();
+      } catch (persistError) {
+        for (const key of Object.keys(intent)) delete intent[key];
+        Object.assign(intent, persistedAttemptState);
+        this.logger?.warn?.(`Room lifecycle classification was not persisted; durable attempt remains pending: ${String(persistError?.message ?? persistError)}`);
+      }
+      return false;
+    }
+  }
+
+  async repairPendingLifecycles(signal) {
+    this.state.deliveryIntents ??= {};
+    for (const [deliveryKey, intent] of Object.entries(this.state.deliveryIntents)) {
+      if (!intent || typeof intent !== "object" || !intent.canonicalMessage) continue;
+      if (intent.version === 1 && !await this.migrateLegacyIntent(deliveryKey, intent)) {
+        intent.recoveryBlocked = "invalid_or_foreign_legacy_canonical_state";
+        intent.lifecycleState = "blocked";
+        intent.status = "lifecycle_blocked";
+        await this.persistState();
+        continue;
+      }
+      if (!repairIntentBoundToState(deliveryKey, intent, this.state)) {
+        intent.recoveryBlocked = "invalid_or_foreign_canonical_state";
+        intent.lifecycleState = "blocked";
+        intent.status = "lifecycle_blocked";
+        await this.persistState();
+        continue;
+      }
+      let migrated = false;
+      if (intent.deliveryState === "posted" && !intent.receipt) {
+        intent.receipt = {
+          eventId: intent.canonicalMessage.id,
+          sentAt: Date.parse(intent.canonicalMessage.ts),
+        };
+        migrated = true;
+      }
+      if (intent.deliveryState !== "posted") {
+        intent.version = 2;
+        intent.binding = {
+          roomId: this.state.roomId,
+          membershipId: this.state.membershipId,
+          clientInstanceId: this.state.clientInstanceId,
+        };
+        intent.deliveryState = "posted";
+        intent.receipt ??= {
+          eventId: intent.canonicalMessage.id,
+          sentAt: Date.parse(intent.canonicalMessage.ts),
+        };
+        intent.lifecycleState = intent.identity?.cycle || intent.turn ? "pending" : "not_required";
+        intent.status = intent.lifecycleState === "pending" ? "lifecycle_pending" : "posted";
+        intent.lifecycleAttempts ??= 0;
+        migrated = true;
+      }
+      if (migrated) await this.persistState();
+      if (intent.lifecycleState === "pending" && Number(intent.lifecycleAttempts ?? 0) >= 3) {
+        intent.lifecycleState = "blocked";
+        intent.status = "lifecycle_blocked";
+        intent.lifecycleAutomaticRetry = false;
+        await this.persistState();
+      } else if (intent.lifecycleState === "pending" && intent.lifecycleAutomaticRetry !== false) {
+        await this.completeIntentLifecycle(intent, signal);
+      }
+    }
   }
 
   async persistState() {

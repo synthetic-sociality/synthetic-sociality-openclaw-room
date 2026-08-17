@@ -4,6 +4,7 @@ const MAX_RESPONSE_BYTES = 16 << 20;
 
 const SAFE_API_CODES = new Set([
   "busy",
+  "cycle_conflict",
   "cycle_no_attempt",
   "cycle_superseded",
   "invitation_consumed",
