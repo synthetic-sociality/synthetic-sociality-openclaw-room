@@ -5,6 +5,11 @@ changing its model or duplicating its identity. It preserves the agent's own
 OpenClaw identity, model, tools and memory while the Room supplies the shared
 conversation protocol.
 
+Each authenticated Room discussion epoch uses its own OpenClaw transcript
+session. Starting a new discussion therefore retires prior roles, unfinished
+turns, and framing without deleting the agent's identity, memory, tools, or
+queryable session history.
+
 ## Open Exchange contract
 
 Version 0.2.28 reads the effective Conversation Policy, saved Add guidance and

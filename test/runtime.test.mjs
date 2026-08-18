@@ -3,9 +3,47 @@ import test from "node:test";
 import {mkdtemp, writeFile} from "node:fs/promises";
 import {tmpdir} from "node:os";
 import {join} from "node:path";
-import {canonicalRoomContext, commandInstruction, cyclePhaseInstruction, isAssignedEvent, isAssignedMessage, normalizeEvent, OpenClawRoomRuntime} from "../src/runtime.js";
+import {canonicalRoomContext, commandInstruction, cyclePhaseInstruction, epochConversationId, eventEpochId, isAssignedEvent, isAssignedMessage, normalizeEvent, OpenClawRoomRuntime, validateActiveEpochPage} from "../src/runtime.js";
 import {RoomAPIError} from "../src/room-client.js";
 import {loadState, saveState, validateState} from "../src/state.js";
+
+test("derives stable epoch-scoped conversations and rotates them between epochs", () => {
+  assert.match(epochConversationId("room-1", "epoch-1"), /^room-1:epoch:[a-f0-9]{32}$/);
+  assert.equal(epochConversationId("room-1", "epoch-1"), epochConversationId("room-1", "epoch-1"));
+  assert.notEqual(epochConversationId("room-1", "epoch-1"), epochConversationId("room-1", "epoch-2"));
+  assert.throws(() => epochConversationId("room-1", ""), /active epoch/);
+});
+
+test("extracts the canonical epoch from discussion, cycle, message, and page metadata", () => {
+  assert.equal(eventEpochId({type: "discussion.started", payload: {epoch: {id: "epoch-1"}}}), "epoch-1");
+  assert.equal(eventEpochId({type: "discussion.cycle_attempt_ready", payload: {epochId: "epoch-2"}}), "epoch-2");
+  assert.equal(eventEpochId({type: "message.posted", payload: {epochId: "epoch-3"}}), "epoch-3");
+  assert.equal(eventEpochId({type: "message.posted", payload: {topic: {epochId: "epoch-4"}}}), "epoch-4");
+  assert.equal(eventEpochId({type: "human.command", payload: {}}, "epoch-page"), "epoch-page");
+});
+
+test("normalizes the epoch-scoped conversation while preserving the raw room target", () => {
+  const normalized = normalizeEvent({
+    id: "message-1", type: "message.posted", actorRole: "human_owner",
+    payload: {body: "Current task", epochId: "epoch-5"},
+  }, "room-1", null, "", "epoch-5");
+  assert.equal(normalized.roomId, "room-1");
+  assert.equal(normalized.epochId, "epoch-5");
+  assert.equal(normalized.conversationId, epochConversationId("room-1", "epoch-5"));
+});
+
+test("preserves an existing binding's baseline epoch and rotates the next epoch", () => {
+  const baseline = normalizeEvent({
+    id: "message-1", type: "message.posted", actorRole: "human_owner",
+    payload: {body: "Old current task", epochId: "epoch-5"},
+  }, "room-1", null, "", "epoch-5", "epoch-5");
+  const next = normalizeEvent({
+    id: "message-2", type: "message.posted", actorRole: "human_owner",
+    payload: {body: "New task", epochId: "epoch-6"},
+  }, "room-1", null, "", "epoch-6", "epoch-5");
+  assert.equal(baseline.conversationId, "room-1");
+  assert.equal(next.conversationId, epochConversationId("room-1", "epoch-6"));
+});
 
 test("keeps durable rounds generic and bounded instead of imposing a room topic", () => {
   const cycle = {budgets: {perAgentTurns: 7}};
@@ -216,7 +254,7 @@ test("cycle-ready events wake only their assigned membership and retain the huma
   const normalized = normalizeEvent(event, "room-1", {
     attempt: {id: "attempt-2", round: 2},
     cycle: {id: "cycle-1", budgets: {totalTurns: 10}, totalTurns: 1},
-  }, "[Canonical Room context]\nPaula: Europe needs public compute infrastructure.\n[/Canonical Room context]");
+  }, "[Canonical Room context]\nPaula: Europe needs public compute infrastructure.\n[/Canonical Room context]", "epoch-1");
   assert.equal(normalized.sourceEventId, "ready-event-1");
   assert.equal(normalized.respondsToId, "human-message-1");
   assert.match(normalized.text, /Continue the autonomous discussion/);
@@ -255,7 +293,7 @@ test("canonical Room context carries topic and recent named contributions withou
   }, "room-1", {
     attempt: {id: "attempt-1", round: 1},
     cycle: {id: "cycle-1", totalTurns: 0, budgets: {totalTurns: 4, perAgentTurns: 2}},
-  }, context);
+  }, context, "epoch-1");
   assert.match(direct.text, /Current discussion: Compute sovereignty/);
   assert.match(direct.text, /What is your direct answer to this question/);
 });
@@ -717,6 +755,9 @@ test("complete canonical message without receipt wrapper recovers before model d
       payload: {generation: 3, action: "contribute", eventId: "posted-6"},
     },
   };
+  runtime.state.terminalEvidence = {
+    "5": {status: "superseded", sourceEventId: "source-5", sourceSeq: 5, reason: "historical_epoch"},
+  };
   const event = {id: "source-5", seq: 5};
   assert.equal(await runtime.recoverPostedEvidence(event), true);
   const intent = runtime.state.deliveryIntents["source-5:final"];
@@ -803,6 +844,7 @@ test("production load replays authentic 0.2.29 frozen request with original idem
   runtime.state = await loadState(stateFile);
   let postedPayload;
   runtime.client = {
+    roomState: async () => ({headSeq: 5, activeEpoch: {id: "epoch-1"}}),
     postMessage: async (_state, payload) => {
       postedPayload = structuredClone(payload);
       return {id: "posted-6", seq: 6, ts: "2026-08-17T00:00:00Z"};
@@ -1024,4 +1066,190 @@ test("non-retryable post failure is quarantined and cannot repost", async () => 
   assert.equal(intent.deliveryState, "quarantined");
   assert.equal(intent.lifecycleState, "not_started");
   assert.equal(intent.canonicalMessage, undefined);
+});
+
+test("active epoch page metadata is an inseparable validated pair and sequence is authoritative", () => {
+  assert.deepEqual(validateActiveEpochPage({activeEpochId: "epoch-new", activeEpochStartsAtSeq: 10}), {
+    id: "epoch-new", startsAtSeq: 10,
+  });
+  for (const page of [
+    {activeEpochId: "epoch-new"},
+    {activeEpochStartsAtSeq: 10},
+    {activeEpochId: "", activeEpochStartsAtSeq: 10},
+    {activeEpochId: 7, activeEpochStartsAtSeq: 10},
+    {activeEpochId: "epoch-new", activeEpochStartsAtSeq: 0},
+    {activeEpochId: "epoch-new", activeEpochStartsAtSeq: 1.5},
+  ]) assert.throws(() => validateActiveEpochPage(page), /active epoch/i);
+
+  assert.equal(eventEpochId({seq: 9, payload: {}}, "epoch-new", 10), "");
+  assert.equal(eventEpochId({seq: 10, payload: {}}, "epoch-new", 10), "epoch-new");
+  assert.equal(eventEpochId({seq: 9, payload: {epochId: "epoch-old"}}, "epoch-new", 10), "epoch-old");
+  assert.throws(() => eventEpochId({seq: 10, payload: {epochId: "epoch-old"}}, "epoch-new", 10), /contradicts/i);
+  assert.throws(() => eventEpochId({seq: 10, payload: {epochId: "epoch-new", epoch: {id: "epoch-other"}}}, "epoch-new", 10), /contradictory/i);
+  assert.throws(() => eventEpochId({seq: 10, payload: {epochId: 7}}, "epoch-new", 10), /malformed/i);
+  for (const event of [
+    {seq: 2, type: "human.command", payload: {}},
+    {seq: 3, type: "discussion.started", payload: {}},
+    {seq: 4, type: "message.posted", payload: {body: "legacy"}},
+  ]) assert.equal(eventEpochId(event, "epoch-new", 10), "", `${event.type} must remain historical without payload metadata`);
+});
+
+test("epoch conversation discriminator is bounded, opaque, and stable", () => {
+  const first = epochConversationId("room-1", "epoch/private?one");
+  const again = epochConversationId("room-1", "epoch/private?one");
+  const other = epochConversationId("room-1", "epoch/private?two");
+  assert.equal(first, again);
+  assert.notEqual(first, other);
+  assert.match(first, /^room-1:epoch:[a-f0-9]{32}$/);
+  assert.equal(first.includes("private"), false);
+  assert.throws(() => epochConversationId("room-1", "x".repeat(513)), /epoch id/i);
+});
+
+test("authenticated epoch IDs retain exact whitespace-distinct identity at every routing boundary", () => {
+  assert.deepEqual(validateActiveEpochPage({activeEpochId: " epoch ", activeEpochStartsAtSeq: 10}), {
+    id: " epoch ", startsAtSeq: 10,
+  });
+  assert.equal(eventEpochId({seq: 10, payload: {epochId: " epoch "}}, " epoch ", 10), " epoch ");
+  assert.notEqual(epochConversationId("room-1", "epoch"), epochConversationId("room-1", " epoch "));
+  assert.throws(() => validateActiveEpochPage({activeEpochId: "   ", activeEpochStartsAtSeq: 10}), /active epoch/i);
+  assert.throws(() => eventEpochId({seq: 10, payload: {epochId: "epoch"}}, " epoch ", 10), /contradicts/i);
+  const event = {id: "current", seq: 10, type: "message.posted", actorRole: "human_owner", payload: {body: "continue", epochId: " epoch "}};
+  assert.equal(normalizeEvent(event, "room-1", null, "", " epoch ", "epoch").conversationId,
+    epochConversationId("room-1", " epoch "));
+  assert.equal(normalizeEvent(event, "room-1", null, "", " epoch ", " epoch ").conversationId, "room-1");
+});
+
+test("canonical context excludes all prior-epoch messages by sequence", () => {
+  const context = canonicalRoomContext({activeEpoch: {id: "epoch-new", startsAtSeq: 10}}, [
+    {id: "old-1", seq: 8, type: "message.posted", payload: {body: "OLD SECRET"}},
+    {id: "new-1", seq: 10, type: "message.posted", payload: {body: "NEW CONTEXT"}},
+  ], "current", {}, 10);
+  assert.doesNotMatch(context, /OLD SECRET/);
+  assert.match(context, /NEW CONTEXT/);
+});
+
+test("posted terminal evidence is monotonic and cannot be downgraded", async () => {
+  const runtime = deliveryLifecycleRuntime();
+  runtime.state.terminalEvidence = {
+    "5": {
+      status: "posted", sourceEventId: "source-5", sourceSeq: 5,
+      canonicalEventId: "posted-6", canonicalSeq: 6,
+      canonicalTs: "2026-08-17T00:00:00Z", reason: "",
+    },
+  };
+  const evidence = await runtime.recordTerminalEvidence({id: "source-5", seq: 5}, "superseded", {reason: "historical_epoch"});
+  assert.equal(evidence.status, "posted");
+  assert.equal(runtime.state.terminalEvidence["5"].canonicalEventId, "posted-6");
+});
+
+test("historical pending delivery is durably superseded before acknowledgement", async () => {
+  const runtime = deliveryLifecycleRuntime();
+  runtime.state.deliveryIntents["source-5:final"] = {
+    version: 2, status: "delivery_pending", deliveryState: "delivery_pending", lifecycleState: "not_started",
+    identity: {
+      roomId: "room-1", body: "STALE OUTPUT", replyToId: "source-5", sourceEventId: "source-5",
+      sourceEpochId: "epoch-old", coordinationMode: "open", nextRecipient: "", topicId: null,
+      initialObservedSeq: 5, initialEpochId: "epoch-old", postObservedSeq: 5, postObservedEpochId: "epoch-old", cycle: null,
+    },
+    binding: {roomId: "room-1", membershipId: "member-1", clientInstanceId: "client-1"},
+    messagePayloadDialect: "v2", logicalContributionId: "logical-source-5",
+    requestIdempotencyKey: "request-source-5", messageIdempotencyKey: "message-source-5", finishIdempotencyKey: "finish-source-5",
+    post: {
+      observedSeq: 5, observedEpochId: "epoch-old", idempotencyKey: "message-source-5",
+      logicalContributionId: "logical-source-5", respondsTo: ["source-5"], contributionType: "claim", body: "STALE OUTPUT",
+    },
+  };
+  await runtime.supersedeHistoricalEvent({id: "source-5", seq: 5}, "epoch-old");
+  const intent = runtime.state.deliveryIntents["source-5:final"];
+  assert.equal(intent.deliveryState, "superseded");
+  assert.equal(intent.status, "superseded");
+  assert.equal(runtime.state.terminalEvidence["5"].status, "superseded");
+  assert.ok(runtime.snapshots.some((snapshot) => snapshot.deliveryIntents["source-5:final"]?.status === "superseded"
+    && snapshot.terminalEvidence?.["5"]?.status === "superseded"));
+});
+
+test("historical acknowledgement fails closed for mismatched or aliased occupied intents", async () => {
+  const mismatched = deliveryLifecycleRuntime();
+  mismatched.state.deliveryIntents["source-5:final"] = {
+    version: 2, status: "selected", deliveryState: "selected", lifecycleState: "not_started",
+    identity: {roomId: "room-1", body: "wrong", replyToId: "", sourceEventId: "other-source"},
+    binding: {roomId: "room-1", membershipId: "member-1", clientInstanceId: "client-1"},
+    messagePayloadDialect: "v2",
+  };
+  await assert.rejects(mismatched.supersedeHistoricalEvent({id: "source-5", seq: 5}), /exactly bound/i);
+  assert.equal(mismatched.state.terminalEvidence?.["5"], undefined);
+
+  const aliased = deliveryLifecycleRuntime();
+  aliased.state.deliveryIntents["legacy-arbitrary-key"] = {
+    version: 2, status: "selected", deliveryState: "selected", lifecycleState: "not_started",
+    identity: {roomId: "room-1", body: "pending", replyToId: "", sourceEventId: "source-5"},
+    binding: {roomId: "room-1", membershipId: "member-1", clientInstanceId: "client-1"},
+    messagePayloadDialect: "v2",
+  };
+  await assert.rejects(aliased.supersedeHistoricalEvent({id: "source-5", seq: 5}), /non-canonical key/i);
+  assert.equal(aliased.state.terminalEvidence?.["5"], undefined);
+
+  const postedWithAlias = deliveryLifecycleRuntime();
+  postedWithAlias.state.terminalEvidence = {
+    "5": {status: "posted", sourceEventId: "source-5", sourceSeq: 5,
+      canonicalEventId: "posted-6", canonicalSeq: 6, canonicalTs: "2026-08-17T00:00:00Z", reason: ""},
+  };
+  postedWithAlias.state.deliveryIntents["legacy-arbitrary-key"] = structuredClone(
+    aliased.state.deliveryIntents["legacy-arbitrary-key"],
+  );
+  assert.throws(() => postedWithAlias.assertHistoricalIntentSafety({id: "source-5", seq: 5}), /non-canonical key/i);
+  await assert.rejects(postedWithAlias.supersedeHistoricalEvent({id: "source-5", seq: 5}), /non-canonical key/i);
+  assert.equal(postedWithAlias.state.deliveryIntents["legacy-arbitrary-key"].status, "selected");
+});
+
+test("model output is suppressed when the source epoch advances before posting", async () => {
+  const runtime = deliveryLifecycleRuntime();
+  runtime.pendingEvent = {id: "source-5", seq: 5};
+  const calls = {policy: 0, turn: 0, post: 0};
+  runtime.client = {
+    roomState: async () => ({headSeq: 9, activeEpoch: {id: "epoch-new", startsAtSeq: 8}}),
+    roomPolicy: async () => { calls.policy += 1; return {policy: {coordinationMode: "open"}}; },
+    requestTurn: async () => { calls.turn += 1; },
+    postMessage: async () => { calls.post += 1; },
+  };
+  const result = await runtime.postAndFinish({
+    roomId: "room-1", text: "STALE MODEL OUTPUT", replyToId: "source-5",
+    idempotencyKey: "source-5:final", sourceEventId: "source-5", sourceEpochId: "epoch-old",
+  });
+  assert.deepEqual(result, {superseded: true});
+  assert.deepEqual(calls, {policy: 0, turn: 0, post: 0});
+  assert.equal(runtime.state.terminalEvidence["5"].status, "superseded");
+});
+
+test("baseline epoch migration survives production save and load while future epochs rotate", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "openclaw-room-epoch-baseline-"));
+  const stateFile = join(directory, "default.json");
+  const state = {
+    version: 1, baseUrl: "https://room.example/api", roomId: "room-1",
+    membershipId: "member-1", credential: "redacted", clientInstanceId: "client-1", cursor: 40,
+    epochSessionRoutingInitialized: true, legacySessionEpochId: "epoch-current", rotateCurrentEpochSession: false,
+  };
+  await saveState(stateFile, state);
+  const loaded = await loadState(stateFile);
+  assert.equal(normalizeEvent({
+    id: "current", seq: 41, type: "message.posted", actorRole: "human_owner",
+    payload: {body: "continue", epochId: "epoch-current"},
+  }, loaded.roomId, null, "", "epoch-current", loaded.legacySessionEpochId).conversationId, "room-1");
+  assert.equal(normalizeEvent({
+    id: "future", seq: 50, type: "message.posted", actorRole: "human_owner",
+    payload: {body: "rotate", epochId: "epoch-future"},
+  }, loaded.roomId, null, "", "epoch-future", loaded.legacySessionEpochId).conversationId,
+  epochConversationId("room-1", "epoch-future"));
+});
+
+test("epoch transition during context loading fails closed before model dispatch", async () => {
+  const runtime = deliveryLifecycleRuntime();
+  runtime.client = {
+    roomState: async () => ({headSeq: 12, activeEpoch: {id: "epoch-current", startsAtSeq: 10}}),
+    roomPolicy: async () => ({policy: {coordinationMode: "open"}}),
+    readEvents: async () => ({activeEpochId: "epoch-next", activeEpochStartsAtSeq: 13, events: []}),
+  };
+  await assert.rejects(runtime.sharedRoomContext(
+    {id: "source-12", seq: 12}, {id: "epoch-current", startsAtSeq: 10},
+  ), /advanced while loading model context/);
 });

@@ -106,6 +106,18 @@ export function validateState(value) {
     if (typeof value[field] !== "string" || !value[field].trim()) throw new Error(`Room state is missing ${field}`);
   }
   if (!Number.isSafeInteger(value.cursor) || value.cursor < 0) throw new Error("Room state cursor is invalid");
+  if (value.epochSessionRoutingInitialized !== undefined && typeof value.epochSessionRoutingInitialized !== "boolean") {
+    throw new Error("Room epoch session routing marker is invalid");
+  }
+  if (value.legacySessionEpochId !== undefined && (
+    typeof value.legacySessionEpochId !== "string" || value.legacySessionEpochId.length > 512
+    || /[\u0000-\u001f\u007f]/.test(value.legacySessionEpochId)
+  )) {
+    throw new Error("Room legacy session epoch is invalid");
+  }
+  if (value.rotateCurrentEpochSession !== undefined && typeof value.rotateCurrentEpochSession !== "boolean") {
+    throw new Error("Room current epoch rotation marker is invalid");
+  }
   if (value.messagePayloadDialect !== undefined && !["v1", "v2"].includes(value.messagePayloadDialect)) {
     throw new Error("Room message payload dialect is invalid");
   }
@@ -166,6 +178,7 @@ function validFrozenPost(intent) {
   if (!legacy || identity.postObservedEpochId !== undefined) {
     if (identity.postObservedEpochId ? post.observedEpochId !== identity.postObservedEpochId : post.observedEpochId !== undefined) return false;
   } else if (post.observedEpochId !== undefined && typeof post.observedEpochId !== "string") return false;
+  if (identity.sourceEpochId && post.observedEpochId !== identity.sourceEpochId) return false;
   if (intent.messagePayloadDialect === "v2" ? post.logicalContributionId !== intent.logicalContributionId : post.logicalContributionId !== undefined) return false;
   if (identity.replyToId ? JSON.stringify(post.respondsTo) !== JSON.stringify([identity.replyToId]) : post.respondsTo !== undefined) return false;
   if (identity.nextRecipient ? JSON.stringify(post.recipientSelectors) !== JSON.stringify([{kind: "membership", membershipId: identity.nextRecipient}]) : post.recipientSelectors !== undefined) return false;
@@ -180,7 +193,7 @@ function validateDeliveryIntent(key, intent, state) {
   if (!key || !intent || typeof intent !== "object" || ![1, 2].includes(intent.version)) {
     throw new Error("Room delivery intent version is invalid");
   }
-  if (!["selected", "preparing", "delivery_pending", "lifecycle_pending", "posted", "quarantined", "lifecycle_blocked"].includes(intent.status)) {
+  if (!["selected", "preparing", "delivery_pending", "lifecycle_pending", "posted", "quarantined", "lifecycle_blocked", "superseded"].includes(intent.status)) {
     throw new Error("Room delivery intent status is invalid");
   }
   if (!["v1", "v2"].includes(intent.messagePayloadDialect)) throw new Error("Room delivery intent dialect is invalid");
@@ -188,6 +201,15 @@ function validateDeliveryIntent(key, intent, state) {
   if (!identity || identity.roomId !== state.roomId || typeof identity.body !== "string" || typeof identity.sourceEventId !== "string") {
     throw new Error("Room delivery intent identity is invalid");
   }
+  // Canonical source-event delivery slots must be inseparably bound. Older
+  // dispatcher/proactive keys remain loadable for compatibility, but the
+  // historical fence scans and rejects any such pending alias before ack.
+  if (intent.version === 2 && key.endsWith(":final") && key !== `${identity.sourceEventId}:final`) {
+    throw new Error("Room delivery intent key is not bound to its source event");
+  }
+  if (identity.sourceEpochId !== undefined && (
+    typeof identity.sourceEpochId !== "string" || identity.sourceEpochId.length > 512 || /[\u0000-\u001f\u007f]/.test(identity.sourceEpochId)
+  )) throw new Error("Room delivery source epoch is invalid");
   if (identity.cycle !== null && identity.cycle !== undefined && (
     typeof identity.cycle.cycleId !== "string" || !identity.cycle.cycleId
     || typeof identity.cycle.attemptId !== "string" || !identity.cycle.attemptId
@@ -227,8 +249,22 @@ function validateDeliveryIntent(key, intent, state) {
   if (intent.receipt !== undefined && (
     !intent.canonicalMessage || intent.receipt?.eventId !== intent.canonicalMessage.id
   )) throw new Error("Room delivery receipt does not match its canonical event");
-  if (intent.deliveryState !== undefined && !["selected", "delivery_pending", "posted", "quarantined"].includes(intent.deliveryState)) {
+  if (intent.deliveryState !== undefined && !["selected", "delivery_pending", "posted", "quarantined", "superseded"].includes(intent.deliveryState)) {
     throw new Error("Room delivery state is invalid");
+  }
+  if (intent.version === 2) {
+    const expectedDeliveryState = {
+      selected: "selected",
+      delivery_pending: "delivery_pending",
+      lifecycle_pending: "posted",
+      posted: "posted",
+      quarantined: "quarantined",
+      lifecycle_blocked: "posted",
+      superseded: "superseded",
+    }[intent.status];
+    if (!expectedDeliveryState || intent.deliveryState !== expectedDeliveryState) {
+      throw new Error("Room delivery status and delivery state are inconsistent");
+    }
   }
   if (intent.deliveryState === "posted" && (
     !intent.canonicalMessage

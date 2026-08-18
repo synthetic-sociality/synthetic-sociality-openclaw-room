@@ -122,6 +122,72 @@ test("gateway finalizes ownership and status even when client close rejects", as
   await assert.doesNotReject(() => channel.plugin.gateway.startAccount(replacement));
 });
 
+test("routes each Room epoch to a fresh transcript while preserving the outbound Room target and real peer binding", async (t) => {
+  let resolveAgentRoute;
+  try {
+    ({resolveAgentRoute} = await import("openclaw/plugin-sdk/routing"));
+  } catch {
+    t.skip("exact OpenClaw peer dependency is unavailable");
+    return;
+  }
+  const captured = [];
+  const routeInputs = [];
+  const events = [
+    {id: "event-1", sourceEventId: "event-1", respondsToId: "event-1", roomId: "room-1", epochId: "epoch-1", conversationId: "room-1:epoch:epoch-1", senderId: "human-1", senderName: "Owner", senderKind: "human", text: "first", occurredAt: 1, raw: {}},
+    {id: "event-2", sourceEventId: "event-2", respondsToId: "event-2", roomId: "room-1", epochId: "epoch-2", conversationId: "room-1:epoch:epoch-2", senderId: "human-1", senderName: "Owner", senderKind: "human", text: "second", occurredAt: 2, raw: {}},
+  ];
+  const channel = createRoomChannel({makeClient: () => ({
+    initialize: async () => ({sessionId: "session-1"}),
+    assignedTurns: async function* () { for (const event of events) yield event; },
+    markTurnReading: async () => {},
+    recordSkipped: async () => {},
+    ack: async () => {},
+    close: async () => {},
+  })});
+  const ctx = context({accountId: "default", stateFile: join(home, "epoch-routing.json")});
+  ctx.cfg = {
+    agents: {list: [{id: "main", default: true}, {id: "special"}]},
+    bindings: [{
+      agentId: "special",
+      match: {channel: ID, accountId: "default", peer: {kind: "group", id: "room-1"}},
+    }],
+  };
+  const rawRoute = resolveAgentRoute({
+    cfg: ctx.cfg, channel: ID, accountId: "default", peer: {kind: "group", id: "room-1"},
+  });
+  ctx.channelRuntime = {
+    inbound: {run: async ({raw, adapter}) => {
+      const input = adapter.ingest(raw);
+      captured.push(adapter.resolveTurn(input));
+    }},
+    routing: {resolveAgentRoute: (input) => {
+      routeInputs.push(input);
+      return resolveAgentRoute(input);
+    }},
+    session: {resolveStorePath: () => "/tmp/session-store", recordInboundSession: async () => {}},
+    reply: {dispatchReplyWithBufferedBlockDispatcher: async () => {}},
+  };
+
+  await channel.plugin.gateway.startAccount(ctx);
+
+  assert.equal(captured.length, 2);
+  assert.equal(captured[0].agentId, "special");
+  assert.equal(captured[0].agentId, rawRoute.agentId);
+  assert.equal(captured[0].accountId, rawRoute.accountId);
+  assert.equal(captured[0].ctxPayload.route.mainSessionKey, rawRoute.mainSessionKey);
+  assert.match(captured[0].routeSessionKey, /room-1:epoch:epoch-1$/);
+  assert.match(captured[1].routeSessionKey, /room-1:epoch:epoch-2$/);
+  assert.notEqual(captured[0].routeSessionKey, captured[1].routeSessionKey);
+  assert.equal(captured[0].ctxPayload.reply.to, "room-1");
+  assert.equal(captured[1].ctxPayload.reply.deliveryTarget, "room-1");
+  assert.deepEqual(routeInputs.map((input) => input.parentPeer), [
+    {kind: "group", id: "room-1"},
+    {kind: "group", id: "room-1"},
+  ]);
+  assert.equal(captured[0].agentId, captured[1].agentId);
+  assert.equal(captured[0].accountId, captured[1].accountId);
+});
+
 async function eventually(predicate) {
   for (let attempt = 0; attempt < 100; attempt += 1) {
     if (predicate()) return;

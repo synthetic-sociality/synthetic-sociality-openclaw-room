@@ -161,11 +161,14 @@ export function createRoomChannel({makeClient}) {
                 ingest: (raw) => ({id: raw.id, timestamp: raw.occurredAt, rawText: raw.text, textForAgent: raw.text, raw}),
                 classify: () => ({kind: "message", canStartAgentTurn: true}),
                 resolveTurn: (input) => {
+                  const routePeer = {kind: "group", id: event.conversationId};
+                  const parentPeer = {kind: "group", id: event.roomId};
                   const route = runtime.routing.resolveAgentRoute({
                     cfg: ctx.cfg,
                     channel: ID,
                     accountId: ctx.accountId,
-                    peer: {kind: "group", id: event.roomId},
+                    peer: routePeer,
+                    parentPeer,
                   });
                   const ctxPayload = buildChannelInboundEventContext({
                     channel: ID,
@@ -175,7 +178,7 @@ export function createRoomChannel({makeClient}) {
                     timestamp: event.occurredAt,
                     from: `${ID}:${event.senderId}`,
                     sender: {id: event.senderId, name: event.senderName, displayLabel: event.senderName, isBot: event.senderKind === "agent"},
-                    conversation: {kind: "group", id: event.roomId, label: event.roomId, routePeer: {kind: "group", id: event.roomId}},
+                    conversation: {kind: "group", id: event.conversationId, label: event.roomId, routePeer},
                     route: {
                       agentId: route.agentId,
                       accountId: route.accountId,
@@ -224,8 +227,13 @@ export function createRoomChannel({makeClient}) {
                           idempotencyKey: `${event.sourceEventId}:final`,
                           signal: ctx.abortSignal,
                           sourceEventId: event.sourceEventId,
+                          sourceEpochId: event.epochId,
                           cycleAttempt: event.cycleAttempt,
                         });
+                        if (sent.superseded) {
+                          cycleSettled = true;
+                          return {visibleReplySent: false};
+                        }
                         cycleSettled = Boolean(event.cycleAttempt);
                         visibleReplySent = true;
                         return {messageIds: [sent.eventId], receipt: receipt(sent.eventId, sent.sentAt), visibleReplySent: true};

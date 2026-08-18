@@ -67,6 +67,7 @@ function validFrozenPost(intent) {
   if (!legacy || identity.postObservedEpochId !== undefined) {
     if (identity.postObservedEpochId ? post.observedEpochId !== identity.postObservedEpochId : post.observedEpochId !== undefined) return false;
   } else if (post.observedEpochId !== undefined && typeof post.observedEpochId !== "string") return false;
+  if (identity.sourceEpochId && post.observedEpochId !== identity.sourceEpochId) return false;
   if (intent.messagePayloadDialect === "v2" ? post.logicalContributionId !== intent.logicalContributionId : post.logicalContributionId !== undefined) return false;
   if (identity.replyToId ? JSON.stringify(post.respondsTo) !== JSON.stringify([identity.replyToId]) : post.respondsTo !== undefined) return false;
   if (identity.nextRecipient ? JSON.stringify(post.recipientSelectors) !== JSON.stringify([{kind: "membership", membershipId: identity.nextRecipient}]) : post.recipientSelectors !== undefined) return false;
@@ -107,6 +108,7 @@ function migrateLegacyIntentToV2(deliveryKey, intent, state) {
     identity.postObservedSeq = intent.post.observedSeq;
     identity.postObservedEpochId = String(intent.post.observedEpochId ?? "");
   }
+  identity.sourceEpochId ??= String(identity.initialEpochId ?? identity.postObservedEpochId ?? "");
   intent.binding = {
     roomId: state.roomId,
     membershipId: state.membershipId,
@@ -288,13 +290,40 @@ export class OpenClawRoomRuntime {
     await this.initialize(signal);
     while (!signal.aborted && !this.closed) {
       const page = await retry(() => this.client.readEvents(this.state, this.state.cursor, {wait: 20, signal}), signal);
+      const pageEpoch = validateActiveEpochPage(page);
+      const pageActiveEpochId = pageEpoch.id;
+      if (this.state.epochSessionRoutingInitialized !== true) {
+        const initialEpochId = pageActiveEpochId;
+        // Cursor position is not installation provenance: a pre-marker state
+        // may already own a legacy transcript even when cursor is zero.
+        this.state.legacySessionEpochId = this.state.rotateCurrentEpochSession === true
+          ? ""
+          : initialEpochId;
+        this.state.epochSessionRoutingInitialized = true;
+        this.state.rotateCurrentEpochSession = false;
+        await saveState(this.account.stateFile, this.state);
+      }
       // Long-poll completion is an independent liveness clock. Maintaining
       // presence here prevents a failed timer task from leaving a locally
       // green but remotely expired connector.
       await retry(() => this.maintainPresence(signal), signal);
       for (const event of page.events ?? []) {
         if (event.seq <= this.state.cursor) continue;
+        const historical = event.seq < pageEpoch.startsAtSeq;
+        const canonicalEventEpochId = eventEpochId(event, pageActiveEpochId, pageEpoch.startsAtSeq);
+        if (historical) this.assertHistoricalIntentSafety(event);
+        const existingTerminalEvidence = this.terminalEvidenceFor(event);
         if (await this.recoverPostedEvidence(event)) {
+          this.pendingEvent = event;
+          await this.ackEvent(event);
+          continue;
+        }
+        if (historical) {
+          await this.supersedeHistoricalEvent(event, canonicalEventEpochId);
+          await this.ackEvent(event);
+          continue;
+        }
+        if (existingTerminalEvidence) {
           this.pendingEvent = event;
           await this.ackEvent(event);
           continue;
@@ -322,21 +351,37 @@ export class OpenClawRoomRuntime {
           continue;
         }
         this.pendingEvent = event;
-        const sharedContext = await this.sharedRoomContext(event, signal);
-        yield normalizeEvent(event, this.state.roomId, cycleAttempt || null, sharedContext);
+        const sharedContext = await this.sharedRoomContext(event, pageEpoch, signal);
+        yield normalizeEvent(
+          event,
+          this.state.roomId,
+          cycleAttempt || null,
+          sharedContext,
+          pageActiveEpochId,
+          this.state.legacySessionEpochId,
+        );
       }
     }
   }
 
-  async sharedRoomContext(event, signal) {
+  async sharedRoomContext(event, sourceEpoch, signal) {
     // Conversation Policy, saved Add guidance and canonical transcript are
     // mandatory model input. If any read fails, leave the event unacknowledged
     // and fail closed so a later retry cannot answer without owner guidance.
     const state = await this.client.roomState(this.state, signal);
+    const stateEpochId = exactEpochId(state?.activeEpoch?.id, "Room state active epoch");
+    const stateStartsAtSeq = Number(state?.activeEpoch?.startsAtSeq ?? sourceEpoch.startsAtSeq);
+    if (stateEpochId !== sourceEpoch.id || stateStartsAtSeq !== sourceEpoch.startsAtSeq) {
+      throw new Error("Room active epoch advanced before model dispatch");
+    }
     const policy = await this.client.roomPolicy(this.state, signal);
-    const before = Math.max(0, Number(event?.seq ?? state.headSeq ?? this.state.cursor) - 50);
+    const before = Math.max(sourceEpoch.startsAtSeq - 1, Number(event?.seq ?? state.headSeq ?? this.state.cursor) - 50);
     const page = await this.client.readEvents(this.state, before, {wait: 0, signal});
-    return canonicalRoomContext(state, page?.events, event?.id, policy);
+    const fetchedEpoch = validateActiveEpochPage(page);
+    if (fetchedEpoch.id !== sourceEpoch.id || fetchedEpoch.startsAtSeq !== sourceEpoch.startsAtSeq) {
+      throw new Error("Room active epoch advanced while loading model context");
+    }
+    return canonicalRoomContext(state, page?.events, event?.id, policy, sourceEpoch.startsAtSeq);
   }
 
   async prepareCycleAttempt(event, signal) {
@@ -424,6 +469,12 @@ export class OpenClawRoomRuntime {
     if (!event?.id || !Number.isSafeInteger(event.seq) || event.seq < 1) {
       throw new Error("Room terminal evidence requires a canonical source event");
     }
+    const existing = this.terminalEvidenceFor(event);
+    if (existing?.status === "posted") return existing;
+    const occupied = this.state.terminalEvidence?.[String(event.seq)];
+    if (occupied && occupied.sourceEventId !== event.id) {
+      throw new Error("Room terminal evidence sequence is already bound to a different source event");
+    }
     const evidence = {
       status,
       sourceEventId: event.id,
@@ -434,6 +485,68 @@ export class OpenClawRoomRuntime {
       reason: String(reason || ""),
     };
     if (!validTerminalEvidence(evidence)) throw new Error("Room terminal evidence is invalid");
+    this.state.terminalEvidence ??= {};
+    this.state.terminalEvidence[String(event.seq)] = evidence;
+    await this.persistState();
+    return evidence;
+  }
+
+  assertHistoricalIntentSafety(event) {
+    const deliveryKey = `${event?.id ?? ""}:final`;
+    const intents = this.state.deliveryIntents ?? {};
+    const exact = intents[deliveryKey];
+    if (exact && (exact.identity?.sourceEventId !== event.id || exact.identity?.roomId !== this.state.roomId)) {
+      throw new Error("Historical Room delivery intent is not exactly bound to its source");
+    }
+    const aliases = Object.entries(intents)
+      .filter(([, intent]) => intent?.identity?.sourceEventId === event.id)
+      .filter(([key]) => key !== deliveryKey);
+    if (aliases.length) {
+      throw new Error("Historical Room source has a delivery intent under a non-canonical key");
+    }
+    if (this.terminalEvidenceFor(event)?.status === "posted" && exact
+        && (exact.deliveryState !== "posted" || !validCanonicalMessage(exact.canonicalMessage))) {
+      throw new Error("Posted historical evidence conflicts with an occupied pending delivery intent");
+    }
+  }
+
+  async supersedeHistoricalEvent(event, sourceEpochId = "") {
+    if (!event?.id || !Number.isSafeInteger(event.seq) || event.seq < 1) {
+      throw new Error("Historical Room event requires a canonical source event");
+    }
+    this.assertHistoricalIntentSafety(event);
+    const existing = this.terminalEvidenceFor(event);
+    if (existing?.status === "posted") return existing;
+    const deliveryKey = `${event.id}:final`;
+    const sourceIntents = Object.entries(this.state.deliveryIntents ?? {})
+      .filter(([, candidate]) => candidate?.identity?.sourceEventId === event.id);
+    if (sourceIntents.some(([key]) => key !== deliveryKey)) {
+      throw new Error("Historical Room source has a delivery intent under a non-canonical key");
+    }
+    const intent = this.state.deliveryIntents?.[deliveryKey];
+    if (intent) {
+      if (intent.identity?.sourceEventId !== event.id || intent.identity?.roomId !== this.state.roomId) {
+        throw new Error("Historical Room delivery intent is not exactly bound to its source");
+      }
+      if (intent.version === 1 && !migrateLegacyIntentToV2(`${event.id}:final`, intent, this.state)) {
+        throw new Error("Historical legacy Room delivery cannot be safely terminalized");
+      }
+      if (intent.deliveryState === "posted" && validCanonicalMessage(intent.canonicalMessage)) {
+        throw new Error("Canonical posted evidence must be recovered before historical handling");
+      }
+      if (!["selected", "delivery_pending"].includes(intent.deliveryState)) {
+        throw new Error("Historical Room delivery intent is not a recognized pending state");
+      }
+      intent.deliveryState = "superseded";
+      intent.lifecycleState = "not_required";
+      intent.status = "superseded";
+      intent.supersededReason = "historical_epoch";
+      intent.supersededSourceEpochId = String(sourceEpochId ?? "");
+    }
+    const evidence = {
+      status: "superseded", sourceEventId: event.id, sourceSeq: event.seq,
+      canonicalEventId: "", canonicalSeq: 0, canonicalTs: "", reason: "historical_epoch",
+    };
     this.state.terminalEvidence ??= {};
     this.state.terminalEvidence[String(event.seq)] = evidence;
     await this.persistState();
@@ -455,7 +568,8 @@ export class OpenClawRoomRuntime {
   }
 
   async recoverPostedEvidence(event) {
-    if (this.terminalEvidenceFor(event)) return true;
+    const existing = this.terminalEvidenceFor(event);
+    if (existing?.status === "posted") return true;
     for (const [deliveryKey, intent] of Object.entries(this.state.deliveryIntents ?? {})) {
       if (
         intent?.identity?.sourceEventId !== event.id
@@ -509,6 +623,7 @@ export class OpenClawRoomRuntime {
       replyToId: intent.identity.replyToId,
       idempotencyKey: deliveryKey,
       sourceEventId: intent.identity.sourceEventId,
+      sourceEpochId: intent.identity.sourceEpochId || intent.identity.initialEpochId || intent.identity.postObservedEpochId || "",
       cycleAttempt,
       signal,
     });
@@ -538,7 +653,7 @@ export class OpenClawRoomRuntime {
     if (this.pendingEvent && this.pendingEvent.seq <= authoritative) this.pendingEvent = null;
   }
 
-  async postAndFinish({roomId, text, replyToId, idempotencyKey, signal, sourceEventId, cycleAttempt = null}) {
+  async postAndFinish({roomId, text, replyToId, idempotencyKey, signal, sourceEventId, sourceEpochId = "", cycleAttempt = null}) {
     if (roomId !== this.state.roomId) throw new Error("Outbound Room does not match connector membership");
     const body = String(text ?? "").trim();
     if (!body) throw new Error("OpenClaw produced an empty Room response");
@@ -551,16 +666,33 @@ export class OpenClawRoomRuntime {
     } : null;
     const requestedIdentity = {
       roomId, body, replyToId: String(replyToId ?? ""),
-      sourceEventId: String(sourceEventId ?? ""), cycle: requestedCycle,
+      sourceEventId: String(sourceEventId ?? ""), sourceEpochId: exactOptionalEpochId(sourceEpochId, "Room source epoch"), cycle: requestedCycle,
     };
+    if (requestedIdentity.sourceEpochId) {
+      const current = await this.client.roomState(this.state, signal);
+      if (exactEpochId(current?.activeEpoch?.id, "Room state active epoch") !== requestedIdentity.sourceEpochId) {
+        if (!this.pendingEvent || this.pendingEvent.id !== requestedIdentity.sourceEventId) {
+          throw new Error("Room source epoch advanced without a bound pending event");
+        }
+        await this.supersedeHistoricalEvent(this.pendingEvent, requestedIdentity.sourceEpochId);
+        return {superseded: true};
+      }
+    }
     this.state.deliveryIntents ??= {};
     let intent = this.state.deliveryIntents[deliveryKey];
     if (intent) {
       const frozenRequestedIdentity = {
         roomId: intent.identity?.roomId, body: intent.identity?.body,
         replyToId: intent.identity?.replyToId, sourceEventId: intent.identity?.sourceEventId,
+        sourceEpochId: requestedIdentity.sourceEpochId ? (intent.identity?.sourceEpochId ?? "") : "",
         cycle: intent.identity?.cycle ?? null,
       };
+      if (requestedIdentity.sourceEpochId && !intent.identity?.sourceEpochId
+          && [intent.identity?.initialEpochId, intent.identity?.postObservedEpochId].includes(requestedIdentity.sourceEpochId)) {
+        intent.identity.sourceEpochId = requestedIdentity.sourceEpochId;
+        frozenRequestedIdentity.sourceEpochId = requestedIdentity.sourceEpochId;
+        await this.persistState();
+      }
       if (JSON.stringify(frozenRequestedIdentity) !== JSON.stringify(requestedIdentity)) {
         throw new Error("OpenClaw Room delivery key was reused with a different semantic intent");
       }
@@ -613,6 +745,12 @@ export class OpenClawRoomRuntime {
     }
     if (!intent.identity.coordinationMode) {
       const initialState = await this.client.roomState(this.state, signal);
+      const initialEpochId = exactOptionalEpochId(initialState.activeEpoch?.id, "Room state active epoch");
+      if (requestedIdentity.sourceEpochId && initialEpochId !== requestedIdentity.sourceEpochId) {
+        await this.supersedeHistoricalEvent(this.pendingEvent, requestedIdentity.sourceEpochId);
+        return {superseded: true};
+      }
+      intent.identity.sourceEpochId ||= initialEpochId;
       const topicId = initialState.activeTopic?.id ?? null;
       const policyEnvelope = cycleAttempt ? null : await this.client.roomPolicy(this.state, signal);
       const policy = policyEnvelope?.policy && typeof policyEnvelope.policy === "object" ? policyEnvelope.policy : policyEnvelope;
@@ -624,7 +762,7 @@ export class OpenClawRoomRuntime {
         nextRecipient,
         topicId,
         initialObservedSeq: Number(initialState.headSeq ?? 0),
-        initialEpochId: String(initialState.activeEpoch?.id ?? ""),
+        initialEpochId: requestedIdentity.sourceEpochId || String(initialState.activeEpoch?.id ?? ""),
       });
       if (coordinationMode === "coordinated") {
         intent.turnRequest = {
@@ -646,19 +784,20 @@ export class OpenClawRoomRuntime {
       await this.persistState();
     }
     if (!intent.post) {
-      const fresh = granted ? await this.client.roomState(this.state, signal) : {
-        headSeq: intent.identity.initialObservedSeq,
-        activeEpoch: intent.identity.initialEpochId ? {id: intent.identity.initialEpochId} : null,
-      };
+      const fresh = await this.client.roomState(this.state, signal);
+      if (intent.identity.sourceEpochId && exactEpochId(fresh?.activeEpoch?.id, "Room state active epoch") !== intent.identity.sourceEpochId) {
+        await this.supersedeHistoricalEvent(this.pendingEvent, intent.identity.sourceEpochId);
+        return {superseded: true};
+      }
       intent.identity.postObservedSeq = Number(fresh.headSeq);
-      intent.identity.postObservedEpochId = String(fresh.activeEpoch?.id ?? "");
+      intent.identity.postObservedEpochId = intent.identity.sourceEpochId || String(fresh.activeEpoch?.id ?? "");
       intent.post = {
         ...(granted ? {turnId: granted.turnId} : {}),
         observedSeq: intent.identity.postObservedSeq,
         idempotencyKey: intent.messageIdempotencyKey,
         ...(intent.messagePayloadDialect === "v2" ? {logicalContributionId: intent.logicalContributionId} : {}),
         ...(intent.identity.topicId ? {topicId: intent.identity.topicId} : {}),
-        ...(fresh.activeEpoch?.id ? {observedEpochId: fresh.activeEpoch.id} : {}),
+        ...(intent.identity.postObservedEpochId ? {observedEpochId: intent.identity.postObservedEpochId} : {}),
         ...(intent.identity.replyToId ? {respondsTo: [intent.identity.replyToId]} : {}),
         ...(intent.identity.nextRecipient ? {recipientSelectors: [{kind: "membership", membershipId: intent.identity.nextRecipient}]} : {}),
         ...(intent.identity.cycle ? {
@@ -1135,9 +1274,65 @@ function nextCycleRecipient(cycle, membershipId) {
   return "";
 }
 
-export function normalizeEvent(event, roomId, cycleAttempt = null, sharedContext = "") {
+function exactEpochId(value, label = "Room epoch") {
+  if (typeof value !== "string" || !value.trim() || value.length > 512 || /[\u0000-\u001f\u007f]/.test(value)) {
+    throw new Error(`${label} is invalid`);
+  }
+  return value;
+}
+
+function exactOptionalEpochId(value, label = "Room epoch") {
+  if (value === undefined || value === null || value === "") return "";
+  return exactEpochId(value, label);
+}
+
+export function validateActiveEpochPage(page) {
+  const id = exactEpochId(page?.activeEpochId, "Room event page active epoch metadata");
+  const startsAtSeq = page?.activeEpochStartsAtSeq;
+  if (!Number.isSafeInteger(startsAtSeq) || startsAtSeq < 1) {
+    throw new Error("Room event page active epoch metadata is invalid or incomplete");
+  }
+  return {id, startsAtSeq};
+}
+
+export function eventEpochId(event, pageActiveEpochId = "", pageActiveEpochStartsAtSeq = 0) {
+  const payload = eventPayload(event?.payload);
+  const evidence = [payload.epochId, payload.epoch?.id, payload.epoch?.topic?.epochId, payload.topic?.epochId]
+    .filter((value) => value !== undefined && value !== null && value !== "")
+    .map((value) => {
+      return exactEpochId(value, "Malformed Room event epoch evidence");
+    });
+  const unique = [...new Set(evidence)];
+  if (unique.length > 1) throw new Error("Room event contains contradictory epoch evidence");
+  const payloadEpochId = unique[0] ?? "";
+  const historical = Number.isSafeInteger(event?.seq) && Number.isSafeInteger(pageActiveEpochStartsAtSeq)
+    && pageActiveEpochStartsAtSeq > 0 && event.seq < pageActiveEpochStartsAtSeq;
+  if (!historical && payloadEpochId && pageActiveEpochId && payloadEpochId !== pageActiveEpochId) {
+    throw new Error("Room event epoch evidence contradicts the authoritative active epoch boundary");
+  }
+  return payloadEpochId || (historical ? "" : exactEpochId(pageActiveEpochId, "Room page active epoch"));
+}
+
+export function epochConversationId(roomId, epochId) {
+  const room = typeof roomId === "string" ? roomId.trim() : "";
+  const epoch = exactEpochId(epochId, "Room event active epoch id");
+  if (!room) throw new Error("Room event has no room id");
+
+  const discriminator = createHash("sha256").update(epoch).digest("hex").slice(0, 32);
+  return `${room}:epoch:${discriminator}`;
+}
+
+export function normalizeEvent(
+  event,
+  roomId,
+  cycleAttempt = null,
+  sharedContext = "",
+  pageActiveEpochId = "",
+  legacySessionEpochId = "",
+) {
   const payload = eventPayload(event.payload);
   const actorRole = String(event.actorRole ?? "");
+  const epochId = eventEpochId(event, pageActiveEpochId);
   const normalized = {
     id: event.id,
     // Delivery/idempotency identity must remain the unique canonical event.
@@ -1147,6 +1342,10 @@ export function normalizeEvent(event, roomId, cycleAttempt = null, sharedContext
       ? String(payload.sourceEventId || event.id)
       : event.id,
     roomId,
+    epochId,
+    conversationId: epochId === exactOptionalEpochId(legacySessionEpochId, "Room legacy session epoch")
+      ? roomId
+      : epochConversationId(roomId, epochId),
     senderId: event.actorId,
     senderName: payload.actorDisplayName || payload.displayName || event.actorRole || "Room participant",
     senderKind: actorRole === "human" || actorRole.startsWith("human_") ? "human" : "agent",
@@ -1209,7 +1408,7 @@ export function commandInstruction(payload = {}) {
   return String(payload?.visibleText ?? "").trim();
 }
 
-export function canonicalRoomContext(state, events, currentEventId = "", policy = {}) {
+export function canonicalRoomContext(state, events, currentEventId = "", policy = {}, startsAtSeq = 0) {
   const policyView = policy?.policy && typeof policy.policy === "object" ? policy.policy : policy;
   const title = String(state?.title ?? "").trim();
   const purpose = String(state?.purpose ?? "").trim();
@@ -1233,7 +1432,9 @@ export function canonicalRoomContext(state, events, currentEventId = "", policy 
     ...(researchMode ? [`Research grounding policy: ${researchMode}${researchMaxSources > 0 ? `; use at most ${researchMaxSources} sources when research tools are available` : ""}${researchFreshness > 0 ? `; freshness window ${researchFreshness} seconds` : ""}.`] : []),
   ];
   const transcript = (Array.isArray(events) ? events : [])
-    .filter((item) => item?.type === "message.posted" && String(item.id ?? "") !== String(currentEventId ?? ""))
+    .filter((item) => item?.type === "message.posted"
+      && (!startsAtSeq || (Number.isSafeInteger(item.seq) && item.seq >= startsAtSeq))
+      && String(item.id ?? "") !== String(currentEventId ?? ""))
     .map((item) => {
       const payload = eventPayload(item.payload);
       const body = String(payload.body ?? payload.text ?? "").trim();

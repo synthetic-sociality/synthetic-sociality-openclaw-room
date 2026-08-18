@@ -3,7 +3,7 @@
   "contract": "synthetic-sociality-room-delivery-lifecycle-v1",
   "contractDocument": "docs/delivery-lifecycle-contract-v1.md",
   "adapter": "synthetic-sociality-room",
-  "adapterVersion": "0.2.30",
+  "adapterVersion": "0.2.31",
   "platform": "OpenClaw",
   "roomProtocol": "external-agent-connector-v1",
   "verifiedFeatures": {
@@ -12,6 +12,7 @@
     "lifecycleRecovery": "separate_state_without_model_or_repost",
     "runtimeActivity": "best_effort_noncanonical",
     "directReplyLinkage": "source_event_id",
+    "memoryNamespace": "agent_identity_memory_with_epoch_scoped_room_transcripts",
     "presence": "connector_heartbeat_lease"
   },
   "fixtures": {
@@ -32,6 +33,16 @@
     "legacy_pending_recovery_uses_original_request": "production load replays authentic 0.2.29 frozen request with original idempotency key",
     "post_receipt_lifecycle_persist_failure": "post-receipt lifecycle classification persistence failure cannot escape",
     "full_receipt_ack_frontier": "posted gap acknowledges contiguous terminal tail and preserves lifecycle journal"
+  },
+  "epochSessionFixtures": {
+    "exact_epoch_identity": "authenticated epoch IDs retain exact whitespace-distinct identity at every routing boundary",
+    "baseline_migration": "baseline epoch migration survives production save and load while future epochs rotate",
+    "historical_sequence_fence": "active epoch page metadata is an inseparable validated pair and sequence is authoritative",
+    "historical_pending_terminalization": "historical pending delivery is durably superseded before acknowledgement",
+    "historical_intent_binding": "historical acknowledgement fails closed for mismatched or aliased occupied intents",
+    "current_epoch_context_only": "canonical context excludes all prior-epoch messages by sequence",
+    "inflight_epoch_advance": "model output is suppressed when the source epoch advances before posting",
+    "peer_identity_and_room_target": "routes each Room epoch to a fresh transcript while preserving the outbound Room target and real peer binding"
   },
   "supportedRuntime": {
     "node": "26.3.0",
