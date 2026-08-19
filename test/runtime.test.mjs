@@ -1094,6 +1094,28 @@ test("active epoch page metadata is an inseparable validated pair and sequence i
   ]) assert.equal(eventEpochId(event, "epoch-new", 10), "", `${event.type} must remain historical without payload metadata`);
 });
 
+test("accepts only interrupted-cycle cleanup after a new epoch boundary", () => {
+  const cleanup = {
+    seq: 11,
+    type: "discussion.cycle_terminal",
+    actorRole: "human_owner",
+    payload: {
+      cycleId: "cycle-old",
+      epochId: "epoch-old",
+      state: "interrupted",
+      reason: "human_interrupted",
+      interruptedByEventId: "discussion-new",
+    },
+  };
+
+  assert.equal(eventEpochId(cleanup, "epoch-new", 10), "epoch-old");
+  assert.equal(eventEpochId({...cleanup, actorRole: "system", payload: {...cleanup.payload, interruptedByEventId: undefined}}, "epoch-new", 10), "epoch-old");
+  assert.throws(() => eventEpochId({...cleanup, type: "message.posted"}, "epoch-new", 10), /contradicts/i);
+  assert.throws(() => eventEpochId({...cleanup, type: "discussion.cycle_attempt_ready"}, "epoch-new", 10), /contradicts/i);
+  assert.throws(() => eventEpochId({...cleanup, payload: {...cleanup.payload, state: "completed"}}, "epoch-new", 10), /contradicts/i);
+  assert.throws(() => eventEpochId({...cleanup, payload: {...cleanup.payload, reason: "budget_exhausted"}}, "epoch-new", 10), /contradicts/i);
+});
+
 test("epoch conversation discriminator is bounded, opaque, and stable", () => {
   const first = epochConversationId("room-1", "epoch/private?one");
   const again = epochConversationId("room-1", "epoch/private?one");

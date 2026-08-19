@@ -1307,7 +1307,12 @@ export function eventEpochId(event, pageActiveEpochId = "", pageActiveEpochStart
   const payloadEpochId = unique[0] ?? "";
   const historical = Number.isSafeInteger(event?.seq) && Number.isSafeInteger(pageActiveEpochStartsAtSeq)
     && pageActiveEpochStartsAtSeq > 0 && event.seq < pageActiveEpochStartsAtSeq;
-  if (!historical && payloadEpochId && pageActiveEpochId && payloadEpochId !== pageActiveEpochId) {
+  const interruptedCycleCleanup = event?.type === "discussion.cycle_terminal"
+    && String(payload.cycleId ?? "").trim() !== ""
+    && String(payload.state ?? "") === "interrupted"
+    && String(payload.reason ?? "") === "human_interrupted";
+  if (!historical && payloadEpochId && pageActiveEpochId && payloadEpochId !== pageActiveEpochId
+    && !interruptedCycleCleanup) {
     throw new Error("Room event epoch evidence contradicts the authoritative active epoch boundary");
   }
   return payloadEpochId || (historical ? "" : exactEpochId(pageActiveEpochId, "Room page active epoch"));
