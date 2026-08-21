@@ -8,7 +8,7 @@ import {fileURLToPath} from "node:url";
 import {parseArguments as parseReleaseArguments, verifyRelease} from "./verify-release.mjs";
 
 const PLUGIN_ID = "synthetic-sociality-room";
-const TRUSTED_SIGNER_FINGERPRINT = "067f60d608e397d94bd5d0ef7f2b41d5c9794c6fe669186aad4925bf3242c4ad";
+const TRUSTED_SIGNER_FINGERPRINT = "331497310fe80e0b14c878466827714c1492d764ec9bcfc9659a61d48ccc06e3";
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   await main(process.argv.slice(2));
