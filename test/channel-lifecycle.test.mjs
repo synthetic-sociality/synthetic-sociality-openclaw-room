@@ -57,6 +57,54 @@ function context(account, controller = new AbortController()) {
   };
 }
 
+test("generic OpenClaw operational fallback passes without canonical Room post", async () => {
+  const fallback = "⚠️ Something went wrong while processing your request. Please try again, or use /new to start a fresh session.";
+  const calls = {post: 0, pass: 0, skipped: [], ack: []};
+  const event = {
+    id: "event-error", sourceEventId: "event-error", respondsToId: "event-error",
+    roomId: "room-1", epochId: "epoch-1", conversationId: "room-1:epoch:error",
+    senderId: "human-1", senderName: "Owner", senderKind: "human",
+    text: "question", occurredAt: 1, raw: {},
+    cycleAttempt: {cycle: {id: "cycle-1", generation: 3}, attempt: {id: "attempt-1"}},
+  };
+  const client = {
+    initialize: async () => ({sessionId: "session-1"}),
+    assignedTurns: async function* () { yield event; },
+    markTurnReading: async () => {},
+    postAndFinish: async () => { calls.post += 1; return {eventId: "posted-error", sentAt: 1}; },
+    passDiscussionAttempt: async (attempt) => {
+      calls.pass += 1;
+      assert.equal(attempt, event.cycleAttempt);
+    },
+    recordSkipped: async (eventId, reason) => calls.skipped.push([eventId, reason]),
+    ack: async (eventId) => calls.ack.push(eventId),
+    close: async () => {},
+  };
+  const channel = createRoomChannel({makeClient: () => client});
+  const ctx = context({accountId: "default", stateFile: join(home, "operational-fallback.json")});
+  ctx.channelRuntime = {
+    inbound: {run: async ({raw, adapter}) => {
+      const turn = adapter.resolveTurn(adapter.ingest(raw));
+      const first = await turn.delivery.deliver({text: fallback});
+      const replay = await turn.delivery.deliver({text: fallback});
+      assert.equal(first.visibleReplySent, false);
+      assert.equal(replay.visibleReplySent, false);
+    }},
+    routing: {resolveAgentRoute: () => ({agentId: "main", accountId: "default", sessionKey: "session", mainSessionKey: "main"})},
+    session: {resolveStorePath: () => "/tmp/session-store", recordInboundSession: async () => {}},
+    reply: {dispatchReplyWithBufferedBlockDispatcher: async () => {}},
+  };
+
+  await channel.plugin.gateway.startAccount(ctx);
+
+  assert.deepEqual(calls, {
+    post: 0,
+    pass: 1,
+    skipped: [["event-error", "gateway_operational_error"]],
+    ack: ["event-error"],
+  });
+});
+
 test("real channel discovery maps Zurie 3-to-2 and Aura 3-to-3", async () => {
   const root = await mkdtemp(join(tmpdir(), "openclaw-room-channel-topology-"));
   const real = join(root, "real");

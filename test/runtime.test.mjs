@@ -298,6 +298,75 @@ test("canonical Room context carries topic and recent named contributions withou
   assert.match(direct.text, /What is your direct answer to this question/);
 });
 
+test("receive-boundary acknowledgement precedes coordination and model dispatch", async () => {
+  const runtime = new OpenClawRoomRuntime({accountId: "default", stateFile: "/unused", baseUrl: "https://room.example/api"});
+  const controller = new AbortController();
+  const event = {
+    id: "source-5", seq: 5, type: "message.posted", actorId: "human-1", actorRole: "human_owner",
+    payload: {body: "Question", epochId: "epoch-1"},
+  };
+  const trace = [];
+  let releaseCoordination;
+  const coordinationGate = new Promise((resolve) => { releaseCoordination = resolve; });
+  runtime.state = {
+    roomId: "room-1", membershipId: "member-1", cursor: 4,
+    epochSessionRoutingInitialized: true, legacySessionEpochId: "epoch-1",
+    deliveryIntents: {}, terminalEvidence: {},
+  };
+  runtime.connectorSession = {sessionId: "session-1"};
+  runtime.client = {
+    readEvents: async () => ({
+      activeEpochId: "epoch-1", activeEpochStartsAtSeq: 1,
+      events: [event],
+    }),
+  };
+  runtime.maintainPresence = async () => { trace.push("presence"); };
+  runtime.recoverPostedEvidence = async () => false;
+  runtime.recoverPendingDelivery = async () => false;
+  runtime.markContextAcknowledged = async (source) => {
+    trace.push(`context_acknowledged:${source.id}:${source.seq}`);
+  };
+  runtime.prepareCycleAttempt = async () => {
+    trace.push("coordination");
+    await coordinationGate;
+    return null;
+  };
+  runtime.sharedRoomContext = async () => {
+    trace.push("model_context");
+    return "";
+  };
+
+  const iterator = runtime.assignedTurns(controller.signal);
+  const pending = iterator.next();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(trace, ["presence", "context_acknowledged:source-5:5", "coordination"]);
+  assert.equal(runtime.state.cursor, 4);
+  releaseCoordination();
+  const delivered = await pending;
+  assert.equal(delivered.value.sourceEventId, "source-5");
+  assert.deepEqual(trace, ["presence", "context_acknowledged:source-5:5", "coordination", "model_context"]);
+  controller.abort();
+  await iterator.return();
+});
+
+test("durable cursor acknowledgement does not emit presentation acknowledgement", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "openclaw-room-ack-separation-"));
+  const runtime = deliveryLifecycleRuntime();
+  runtime.account.stateFile = join(directory, "state.json");
+  runtime.state.terminalEvidence = {
+    "5": {status: "skipped", sourceEventId: "source-5", sourceSeq: 5, reason: "model_skip"},
+  };
+  await saveState(runtime.account.stateFile, runtime.state);
+  let presentationCalls = 0;
+  runtime.publishActivityFrame = async () => { presentationCalls += 1; };
+  runtime.client = {acknowledge: async (_state, seq) => ({acknowledgedSeq: seq})};
+
+  await runtime.ackEvent({id: "source-5", seq: 5});
+
+  assert.equal(runtime.state.cursor, 5);
+  assert.equal(presentationCalls, 0);
+});
+
 test("human source starts one server-owned cycle but only its ready event claims the attempt", async () => {
   const runtime = new OpenClawRoomRuntime({accountId: "default", stateFile: "/unused", baseUrl: "https://room.example/api"});
   runtime.state = {roomId: "room-1", membershipId: "aura-member"};

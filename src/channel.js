@@ -21,6 +21,7 @@ import {
 } from "./reply-policy.js";
 
 const ID = "synthetic-sociality-room";
+const GENERIC_OPENCLAW_OPERATIONAL_FALLBACK = "⚠️ Something went wrong while processing your request. Please try again, or use /new to start a fresh session.";
 
 const receipt = (eventId, sentAt) => ({
   primaryPlatformMessageId: eventId,
@@ -150,6 +151,7 @@ export function createRoomChannel({makeClient}) {
           for await (const event of client.assignedTurns(ctx.abortSignal)) {
             let cycleSettled = false;
             let visibleReplySent = false;
+            let operationalFallbackSuppressed = false;
             ctx.setStatus({...ctx.getStatus(), running: true, connected: true, lastInboundAt: Date.now(), lastError: null});
             await client.markTurnReading(event.sourceEventId ?? event.id, ctx.abortSignal);
             try {
@@ -218,6 +220,11 @@ export function createRoomChannel({makeClient}) {
                     delivery: {
                       durable: {to: event.roomId, replyToId: event.respondsToId},
                       deliver: async (payload) => {
+                        if (payload.text === GENERIC_OPENCLAW_OPERATIONAL_FALLBACK) {
+                          operationalFallbackSuppressed = true;
+                          ctx.log?.error?.(`[${ctx.accountId}] Suppressed OpenClaw operational fallback for Room source ${event.sourceEventId}`);
+                          return {visibleReplySent: false};
+                        }
                         const text = payload.text?.trim();
                         if (!text) return {visibleReplySent: false};
                         const sent = await client.postAndFinish({
@@ -251,7 +258,7 @@ export function createRoomChannel({makeClient}) {
               }
             }
             if (!visibleReplySent) {
-              await client.recordSkipped(event.id, "model_no_visible_reply");
+              await client.recordSkipped(event.id, operationalFallbackSuppressed ? "gateway_operational_error" : "model_no_visible_reply");
             }
             await client.ack(event.id);
           }
