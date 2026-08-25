@@ -220,7 +220,10 @@ export function createRoomChannel({makeClient}) {
                     delivery: {
                       durable: {to: event.roomId, replyToId: event.respondsToId},
                       deliver: async (payload) => {
-                        if (payload.text === GENERIC_OPENCLAW_OPERATIONAL_FALLBACK) {
+                        if (
+                          payload?.isError === true
+                          && payload.text === GENERIC_OPENCLAW_OPERATIONAL_FALLBACK
+                        ) {
                           operationalFallbackSuppressed = true;
                           ctx.log?.error?.(`[${ctx.accountId}] Suppressed OpenClaw operational fallback for Room source ${event.sourceEventId}`);
                           return {visibleReplySent: false};

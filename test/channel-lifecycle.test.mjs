@@ -85,8 +85,8 @@ test("generic OpenClaw operational fallback passes without canonical Room post",
   ctx.channelRuntime = {
     inbound: {run: async ({raw, adapter}) => {
       const turn = adapter.resolveTurn(adapter.ingest(raw));
-      const first = await turn.delivery.deliver({text: fallback});
-      const replay = await turn.delivery.deliver({text: fallback});
+      const first = await turn.delivery.deliver({text: fallback, isError: true});
+      const replay = await turn.delivery.deliver({text: fallback, isError: true});
       assert.equal(first.visibleReplySent, false);
       assert.equal(replay.visibleReplySent, false);
     }},
@@ -102,6 +102,54 @@ test("generic OpenClaw operational fallback passes without canonical Room post",
     pass: 1,
     skipped: [["event-error", "gateway_operational_error"]],
     ack: ["event-error"],
+  });
+});
+
+test("model-authored fallback text remains a canonical Room contribution", async () => {
+  const fallback = "⚠️ Something went wrong while processing your request. Please try again, or use /new to start a fresh session.";
+  const calls = {post: 0, pass: 0, skipped: [], ack: []};
+  const event = {
+    id: "event-visible", sourceEventId: "event-visible", respondsToId: "event-visible",
+    roomId: "room-1", epochId: "epoch-1", conversationId: "room-1:epoch:visible",
+    senderId: "human-1", senderName: "Owner", senderKind: "human",
+    text: "quote the fallback", occurredAt: 1, raw: {},
+    cycleAttempt: {cycle: {id: "cycle-1", generation: 3}, attempt: {id: "attempt-1"}},
+  };
+  const client = {
+    initialize: async () => ({sessionId: "session-1"}),
+    assignedTurns: async function* () { yield event; },
+    markTurnReading: async () => {},
+    postAndFinish: async ({text}) => {
+      calls.post += 1;
+      assert.equal(text, fallback);
+      return {eventId: "posted-visible", sentAt: 1};
+    },
+    passDiscussionAttempt: async () => { calls.pass += 1; },
+    recordSkipped: async (eventId, reason) => calls.skipped.push([eventId, reason]),
+    ack: async (eventId) => calls.ack.push(eventId),
+    close: async () => {},
+  };
+  const channel = createRoomChannel({makeClient: () => client});
+  const ctx = context({accountId: "default", stateFile: join(home, "model-authored-fallback.json")});
+  ctx.channelRuntime = {
+    inbound: {run: async ({raw, adapter}) => {
+      const turn = adapter.resolveTurn(adapter.ingest(raw));
+      const result = await turn.delivery.deliver({text: fallback, isError: false});
+      assert.equal(result.visibleReplySent, true);
+      assert.deepEqual(result.messageIds, ["posted-visible"]);
+    }},
+    routing: {resolveAgentRoute: () => ({agentId: "main", accountId: "default", sessionKey: "session", mainSessionKey: "main"})},
+    session: {resolveStorePath: () => "/tmp/session-store", recordInboundSession: async () => {}},
+    reply: {dispatchReplyWithBufferedBlockDispatcher: async () => {}},
+  };
+
+  await channel.plugin.gateway.startAccount(ctx);
+
+  assert.deepEqual(calls, {
+    post: 1,
+    pass: 0,
+    skipped: [],
+    ack: ["event-visible"],
   });
 });
 
