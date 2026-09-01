@@ -70,12 +70,58 @@ function validFrozenPost(intent) {
   if (identity.sourceEpochId && post.observedEpochId !== identity.sourceEpochId) return false;
   if (intent.messagePayloadDialect === "v2" ? post.logicalContributionId !== intent.logicalContributionId : post.logicalContributionId !== undefined) return false;
   if (identity.replyToId ? JSON.stringify(post.respondsTo) !== JSON.stringify([identity.replyToId]) : post.respondsTo !== undefined) return false;
-  if (identity.nextRecipient ? JSON.stringify(post.recipientSelectors) !== JSON.stringify([{kind: "membership", membershipId: identity.nextRecipient}]) : post.recipientSelectors !== undefined) return false;
+  const expectedRecipientSelectors = identity.nextRecipient
+    ? [{kind: "membership", membershipId: identity.nextRecipient}]
+    : identity.recipientSelectors;
+  if (expectedRecipientSelectors?.length
+    ? JSON.stringify(post.recipientSelectors) !== JSON.stringify(expectedRecipientSelectors)
+    : post.recipientSelectors !== undefined) return false;
   if (identity.cycle) {
     if (post.cycleId !== identity.cycle.cycleId || post.attemptId !== identity.cycle.attemptId || post.cycleGeneration !== identity.cycle.generation) return false;
   } else if (post.cycleId !== undefined || post.attemptId !== undefined || post.cycleGeneration !== undefined) return false;
   if (intent.turn?.turnId ? post.turnId !== intent.turn.turnId : post.turnId !== undefined) return false;
-  return post.contributionType === (identity.nextRecipient ? "question" : "claim");
+  return post.contributionType === (expectedRecipientSelectors?.length ? "question" : "claim");
+}
+
+function escapedPattern(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function mentionIndex(body, displayName) {
+  const pattern = new RegExp(
+    `(^|[^\\p{L}\\p{N}_@])@${escapedPattern(displayName)}(?=$|[^\\p{L}\\p{N}_-])`,
+    "iu",
+  );
+  const match = pattern.exec(body);
+  return match ? match.index + match[1].length : -1;
+}
+
+export function resolveStandaloneRecipientSelectors(body, roster, sourceMembershipId) {
+  const activeAgents = (Array.isArray(roster) ? roster : []).filter((member) => (
+    member?.status === "active"
+    && ["participant_agent", "room_master"].includes(member?.role)
+    && String(member?.membershipId ?? "") !== String(sourceMembershipId ?? "")
+    && String(member?.displayName ?? "").trim()
+  ));
+  const byName = new Map();
+  for (const member of activeAgents) {
+    const name = String(member.displayName).trim();
+    const key = name.toLocaleLowerCase("en-US");
+    const candidates = byName.get(key) ?? [];
+    candidates.push({...member, name});
+    byName.set(key, candidates);
+  }
+  const selected = [];
+  for (const candidates of byName.values()) {
+    const index = mentionIndex(String(body ?? ""), candidates[0].name);
+    if (index < 0) continue;
+    if (candidates.length !== 1) {
+      throw new Error(`Room recipient @${candidates[0].name} is ambiguous`);
+    }
+    selected.push({index, membershipId: String(candidates[0].membershipId)});
+  }
+  selected.sort((left, right) => left.index - right.index || left.membershipId.localeCompare(right.membershipId));
+  return selected.map(({membershipId}) => ({kind: "membership", membershipId}));
 }
 
 function validCycleIdentity(cycle) {
@@ -653,7 +699,7 @@ export class OpenClawRoomRuntime {
     if (this.pendingEvent && this.pendingEvent.seq <= authoritative) this.pendingEvent = null;
   }
 
-  async postAndFinish({roomId, text, replyToId, idempotencyKey, signal, sourceEventId, sourceEpochId = "", cycleAttempt = null}) {
+  async postAndFinish({roomId, text, replyToId, idempotencyKey, signal, sourceEventId, sourceEpochId = "", cycleAttempt = null, resolveRecipientMentions = false}) {
     if (roomId !== this.state.roomId) throw new Error("Outbound Room does not match connector membership");
     const body = String(text ?? "").trim();
     if (!body) throw new Error("OpenClaw produced an empty Room response");
@@ -667,6 +713,7 @@ export class OpenClawRoomRuntime {
     const requestedIdentity = {
       roomId, body, replyToId: String(replyToId ?? ""),
       sourceEventId: String(sourceEventId ?? ""), sourceEpochId: exactOptionalEpochId(sourceEpochId, "Room source epoch"), cycle: requestedCycle,
+      resolveRecipientMentions: Boolean(resolveRecipientMentions),
     };
     if (requestedIdentity.sourceEpochId) {
       const current = await this.client.roomState(this.state, signal);
@@ -686,6 +733,7 @@ export class OpenClawRoomRuntime {
         replyToId: intent.identity?.replyToId, sourceEventId: intent.identity?.sourceEventId,
         sourceEpochId: requestedIdentity.sourceEpochId ? (intent.identity?.sourceEpochId ?? "") : "",
         cycle: intent.identity?.cycle ?? null,
+        resolveRecipientMentions: Boolean(intent.identity?.resolveRecipientMentions),
       };
       if (requestedIdentity.sourceEpochId && !intent.identity?.sourceEpochId
           && [intent.identity?.initialEpochId, intent.identity?.postObservedEpochId].includes(requestedIdentity.sourceEpochId)) {
@@ -757,9 +805,13 @@ export class OpenClawRoomRuntime {
       const openExchange = String(policy?.coordinationMode ?? "coordinated") === "open";
       const coordinationMode = cycleAttempt ? "cycle" : (openExchange ? "open" : "coordinated");
       const nextRecipient = cycleAttempt ? nextCycleRecipient(cycleAttempt.cycle, this.state.membershipId) : "";
+      const recipientSelectors = !nextRecipient && intent.identity.resolveRecipientMentions
+        ? resolveStandaloneRecipientSelectors(intent.identity.body, initialState.roster, this.state.membershipId)
+        : [];
       Object.assign(intent.identity, {
         coordinationMode,
         nextRecipient,
+        recipientSelectors,
         topicId,
         initialObservedSeq: Number(initialState.headSeq ?? 0),
         initialEpochId: requestedIdentity.sourceEpochId || String(initialState.activeEpoch?.id ?? ""),
@@ -799,13 +851,15 @@ export class OpenClawRoomRuntime {
         ...(intent.identity.topicId ? {topicId: intent.identity.topicId} : {}),
         ...(intent.identity.postObservedEpochId ? {observedEpochId: intent.identity.postObservedEpochId} : {}),
         ...(intent.identity.replyToId ? {respondsTo: [intent.identity.replyToId]} : {}),
-        ...(intent.identity.nextRecipient ? {recipientSelectors: [{kind: "membership", membershipId: intent.identity.nextRecipient}]} : {}),
+        ...(intent.identity.nextRecipient
+          ? {recipientSelectors: [{kind: "membership", membershipId: intent.identity.nextRecipient}]}
+          : intent.identity.recipientSelectors?.length ? {recipientSelectors: intent.identity.recipientSelectors} : {}),
         ...(intent.identity.cycle ? {
           cycleId: intent.identity.cycle.cycleId,
           attemptId: intent.identity.cycle.attemptId,
           cycleGeneration: intent.identity.cycle.generation,
         } : {}),
-        contributionType: intent.identity.nextRecipient ? "question" : "claim",
+        contributionType: intent.identity.nextRecipient || intent.identity.recipientSelectors?.length ? "question" : "claim",
         body: intent.identity.body,
       };
       intent.deliveryState = "delivery_pending";

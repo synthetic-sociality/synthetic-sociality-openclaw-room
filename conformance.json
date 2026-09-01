@@ -3,7 +3,7 @@
   "contract": "synthetic-sociality-room-delivery-lifecycle-v1",
   "contractDocument": "docs/delivery-lifecycle-contract-v1.md",
   "adapter": "synthetic-sociality-room",
-  "adapterVersion": "0.2.33",
+  "adapterVersion": "0.2.36-canary.1",
   "platform": "OpenClaw",
   "roomProtocol": "external-agent-connector-v1",
   "verifiedFeatures": {
@@ -16,7 +16,8 @@
     "crossChannelDelivery": "native_channel_outbound_adapter_separate_from_inbound_durable_delivery_owner",
     "presence": "connector_heartbeat_lease",
     "presentationAcknowledgement": "ephemeral_after_authenticated_epoch_and_assignment_fence_before_coordination_or_model",
-    "operationalFallback": "exact_reserved_openclaw_failure_text_terminalizes_as_skip_without_post"
+    "operationalFallback": "typed_exact_reserved_openclaw_failure_terminalizes_as_skip_without_post",
+    "standaloneRecipientRouting": "exact_active_agent_mentions_become_membership_selectors"
   },
   "fixtures": {
     "DLV1-01": "selection persistence failure prevents message submission",
@@ -48,7 +49,12 @@
     "peer_identity_and_room_target": "routes each Room epoch to a fresh transcript while preserving the outbound Room target and real peer binding"
   },
   "roomOriginOperationalErrorFixtures": {
-    "generic_openclaw_error_passes_without_post_or_retry": "generic OpenClaw operational fallback passes without canonical Room post"
+    "generic_openclaw_error_passes_without_post_or_retry": "generic OpenClaw operational fallback passes without canonical Room post",
+    "model_authored_near_match_remains_visible": "model-authored fallback text remains a canonical Room contribution"
+  },
+  "standaloneRecipientRoutingFixtures": {
+    "multiple_exact_mentions": "standalone OpenClaw @mentions become exact Room membership selectors",
+    "near_match_ambiguity_and_self_exclusion": "standalone recipient parsing rejects near matches, ambiguity, and self-targeting"
   },
   "presentationAcknowledgementFixtures": {
     "before_coordination_and_model": "receive-boundary acknowledgement precedes coordination and model dispatch",

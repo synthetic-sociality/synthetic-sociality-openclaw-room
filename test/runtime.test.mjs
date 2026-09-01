@@ -3,7 +3,7 @@ import test from "node:test";
 import {mkdtemp, writeFile} from "node:fs/promises";
 import {tmpdir} from "node:os";
 import {join} from "node:path";
-import {canonicalRoomContext, commandInstruction, cyclePhaseInstruction, epochConversationId, eventEpochId, isAssignedEvent, isAssignedMessage, normalizeEvent, OpenClawRoomRuntime, validateActiveEpochPage} from "../src/runtime.js";
+import {canonicalRoomContext, commandInstruction, cyclePhaseInstruction, epochConversationId, eventEpochId, isAssignedEvent, isAssignedMessage, normalizeEvent, OpenClawRoomRuntime, resolveStandaloneRecipientSelectors, validateActiveEpochPage} from "../src/runtime.js";
 import {RoomAPIError} from "../src/room-client.js";
 import {loadState, saveState, validateState} from "../src/state.js";
 
@@ -475,6 +475,67 @@ function deliveryLifecycleRuntime() {
   runtime.persistState = async () => { runtime.snapshots.push(structuredClone(runtime.state)); };
   return runtime;
 }
+
+test("standalone OpenClaw @mentions become exact Room membership selectors", async () => {
+  const runtime = deliveryLifecycleRuntime();
+  const posts = [];
+  const roomState = {
+    headSeq: 5,
+    activeEpoch: {id: "epoch-1"},
+    roster: [
+      {membershipId: "claw-member", displayName: "Claw", role: "participant_agent", status: "active"},
+      {membershipId: "aura-member", displayName: "Aura", role: "participant_agent", status: "active"},
+      {membershipId: "zurie-member", displayName: "Zurie", role: "participant_agent", status: "active"},
+    ],
+  };
+  runtime.state.membershipId = "claw-member";
+  runtime.client = {
+    roomState: async () => roomState,
+    roomPolicy: async () => ({policy: {coordinationMode: "open"}}),
+    postMessage: async (_state, post) => {
+      posts.push(post);
+      return {id: "posted-6", seq: 6, ts: "2026-08-17T00:00:00Z"};
+    },
+  };
+
+  await runtime.postAndFinish({
+    roomId: "room-1",
+    text: "@Aura, reply once; then compare with @Zurie.",
+    idempotencyKey: "standalone-mentioned-recipients",
+    resolveRecipientMentions: true,
+  });
+
+  assert.deepEqual(posts[0].recipientSelectors, [
+    {kind: "membership", membershipId: "aura-member"},
+    {kind: "membership", membershipId: "zurie-member"},
+  ]);
+  assert.equal(posts[0].contributionType, "question");
+});
+
+test("standalone recipient parsing rejects near matches, ambiguity, and self-targeting", () => {
+  const roster = [
+    {membershipId: "claw-member", displayName: "Claw", role: "participant_agent", status: "active"},
+    {membershipId: "aura-1", displayName: "Aura", role: "participant_agent", status: "active"},
+    {membershipId: "aura-2", displayName: "AURA", role: "participant_agent", status: "active"},
+    {membershipId: "super-walz", displayName: "Super-Walz", role: "participant_agent", status: "active"},
+    {membershipId: "removed", displayName: "Zurie", role: "participant_agent", status: "removed"},
+    {membershipId: "owner", displayName: "TJE", role: "human_owner", status: "active"},
+  ];
+
+  assert.deepEqual(
+    resolveStandaloneRecipientSelectors("@Super-Walz: one sentence.", roster, "claw-member"),
+    [{kind: "membership", membershipId: "super-walz"}],
+  );
+  assert.deepEqual(resolveStandaloneRecipientSelectors(
+    "mail x@Super-Walz, near @Super-Walz-extra, self @Claw, removed @Zurie, human @TJE",
+    roster,
+    "claw-member",
+  ), []);
+  assert.throws(
+    () => resolveStandaloneRecipientSelectors("Please ask @Aura.", roster, "claw-member"),
+    /ambiguous/,
+  );
+});
 
 test("posted state requires a complete canonical receipt", () => {
   const state = {
