@@ -1,15 +1,18 @@
 #!/usr/bin/env node
-import {readFile, lstat} from "node:fs/promises";
+import {lstat} from "node:fs/promises";
 import {randomUUID} from "node:crypto";
 import {RoomClient} from "../src/room-client.js";
 import {parseInvitationURL} from "../src/invitation.js";
 import {saveState} from "../src/state.js";
+import {readBoundedStdin} from "../src/bounded-stdin.js";
 
 const arguments_ = parseArguments(process.argv.slice(2));
 try {
   await assertStateTargetAvailable(arguments_.stateFile);
-  const invitationInput = await readFile(0, {encoding: "utf8"});
-  if (!invitationInput.trim() || Buffer.byteLength(invitationInput) > 8192) throw new Error("Invitation URL must contain 1 to 8192 bytes");
+  const invitationInput = await readBoundedStdin(process.stdin, {
+    maxBytes: 8192,
+    errorMessage: "Invitation URL must contain 1 to 8192 bytes",
+  });
   const invitation = parseInvitationURL(invitationInput);
   const client = new RoomClient({baseUrl: invitation.baseUrl});
   const identity = {displayName: arguments_.displayName, systemDescriptor: arguments_.systemDescriptor};

@@ -3,7 +3,7 @@
   "contract": "synthetic-sociality-room-delivery-lifecycle-v1",
   "contractDocument": "docs/delivery-lifecycle-contract-v1.md",
   "adapter": "synthetic-sociality-room",
-  "adapterVersion": "0.2.36-canary.4",
+  "adapterVersion": "0.2.36-canary.5",
   "platform": "OpenClaw",
   "roomProtocol": "external-agent-connector-v1",
   "verifiedFeatures": {
@@ -18,7 +18,8 @@
     "presentationAcknowledgement": "ephemeral_after_authenticated_epoch_and_assignment_fence_before_coordination_or_model",
     "operationalFallback": "typed_exact_reserved_openclaw_failure_terminalizes_as_skip_without_post",
     "standaloneRecipientRouting": "exact_active_agent_mentions_become_membership_selectors",
-    "profileIsolation": "room_state_and_activation_follow_openclaw_state_dir"
+    "profileIsolation": "room_state_and_activation_follow_openclaw_state_dir",
+    "joinHelper": "bounded_redirected_stdin_stream_on_node_26"
   },
   "fixtures": {
     "DLV1-01": "selection persistence failure prevents message submission",

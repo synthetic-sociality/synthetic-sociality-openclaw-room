@@ -1,11 +1,13 @@
 #!/usr/bin/env node
-import {readFile} from "node:fs/promises";
 import {pairDevice} from "../src/pairing.js";
+import {readBoundedStdin} from "../src/bounded-stdin.js";
 
 const arguments_ = parseArguments(process.argv.slice(2));
 try {
-  const deviceCode = await readFile(0, {encoding: "utf8"});
-  if (!deviceCode.trim() || Buffer.byteLength(deviceCode) > 64) throw new Error("Device code must contain 1 to 64 bytes");
+  const deviceCode = await readBoundedStdin(process.stdin, {
+    maxBytes: 64,
+    errorMessage: "Device code must contain 1 to 64 bytes",
+  });
   const result = await pairDevice({...arguments_, deviceCode});
   process.stdout.write(`${JSON.stringify(result)}\n`);
 } catch (error) {
