@@ -80,7 +80,7 @@ function archiveEntries(archivePath) {
   return result.stdout.split(/\r?\n/).filter(Boolean).sort();
 }
 
-async function readPackagedProvenance(path) {
+export async function readPackagedProvenance(path) {
   const source = await readFile(path, "utf8");
   const match = source.match(/^export const ROOM_CONNECTOR_PROVENANCE = Object\.freeze\((\{[\s\S]*\})\);\s*$/);
   if (!match) throw new Error("Packaged runtime provenance format is invalid");

@@ -157,14 +157,30 @@ access for installation.
 ## ClawHub distribution
 
 The package declares the compatibility, build and channel metadata required by
-ClawHub. Validate and preview the exact package before the first publication:
+ClawHub. Never publish the Git checkout directly: its runtime provenance is an
+intentional `unbuilt` sentinel. First extract and verify the exact signed,
+reviewed release archive into a new publication directory:
 
 ```sh
-clawhub package validate .
-clawhub package publish . --family code-plugin --dry-run --json
+npm run release:prepare-clawhub -- \
+  --archive /path/to/openclaw-room.tgz \
+  --manifest /path/to/openclaw-room.tgz.manifest.json \
+  --signature /path/to/openclaw-room.tgz.manifest.json.sig \
+  --public-key /path/to/release-public.pem \
+  --output /tmp/openclaw-room-clawhub-reviewed
+clawhub package validate /tmp/openclaw-room-clawhub-reviewed
+clawhub package publish /tmp/openclaw-room-clawhub-reviewed \
+  --family code-plugin \
+  --version 0.2.36 \
+  --source-repo https://github.com/synthetic-sociality/synthetic-sociality-openclaw-room \
+  --source-commit REVIEWED_40_CHARACTER_COMMIT \
+  --dry-run \
+  --json
 ```
 
 The publishing owner must control the `synthetic-sociality` ClawHub namespace,
-matching the package scope. A dry-run does not publish. A real first publication
-is a separate authenticated registry action; later releases should use
-ClawHub's trusted GitHub publisher flow.
+matching the package scope. Confirm that the preparation output reports the
+reviewed commit, artifact identity and approved signer fingerprint. A dry-run
+does not publish. The real publication is a separate authenticated registry
+action using the same prepared directory; a GitHub-source publisher must not be
+used because it would replace the built runtime provenance with `unbuilt`.

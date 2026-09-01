@@ -1,10 +1,12 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {validateManifest} from "../tools/verify-release.mjs";
+import {validateClawHubIdentity} from "../tools/prepare-clawhub-release.mjs";
 import {assertCleanReleaseWorktree, assertReleaseNodeVersion} from "../tools/release-guards.mjs";
 import {readFile} from "node:fs/promises";
 import {dirname, join} from "node:path";
 import {fileURLToPath} from "node:url";
+import {ROOM_CONNECTOR_PROVENANCE} from "../src/release-provenance.js";
 
 const packageRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -41,9 +43,14 @@ test("rejects unsafe archive names and invalid hashes", () => {
 test("declares the compatibility and install metadata required by ClawHub", async () => {
   const packageJson = JSON.parse(await readFile(join(packageRoot, "package.json"), "utf8"));
   const pluginManifest = JSON.parse(await readFile(join(packageRoot, "openclaw.plugin.json"), "utf8"));
+  const conformance = JSON.parse(await readFile(join(packageRoot, "conformance.json"), "utf8"));
   assert.equal(packageJson.private, undefined);
   assert.equal(packageJson.name, "@synthetic-sociality/openclaw-room");
   assert.equal(packageJson.version, pluginManifest.version);
+  assert.equal(packageJson.version, conformance.adapterVersion);
+  assert.equal(packageJson.version, ROOM_CONNECTOR_PROVENANCE.version);
+  assert.equal(ROOM_CONNECTOR_PROVENANCE.sourceCommit, "unbuilt");
+  assert.equal(ROOM_CONNECTOR_PROVENANCE.artifactIdentity, "unbuilt");
   assert.equal(packageJson.openclaw.compat.pluginApi, ">=2026.7.1-2");
   assert.equal(packageJson.openclaw.compat.minGatewayVersion, ">=2026.7.1-2");
   assert.equal(packageJson.openclaw.build.openclawVersion, "2026.7.1-2");
@@ -52,4 +59,31 @@ test("declares the compatibility and install metadata required by ClawHub", asyn
   assert.equal(packageJson.openclaw.channel.docsPath, "README.md");
   assert.deepEqual(pluginManifest.channels, ["synthetic-sociality-room"]);
   assert.ok(pluginManifest.channelConfigs?.["synthetic-sociality-room"]?.schema);
+});
+
+test("ClawHub publication accepts built reviewed bytes and rejects raw GitHub source provenance", () => {
+  const manifest = {
+    ...valid,
+    package: "@synthetic-sociality/openclaw-room",
+    version: "0.2.36",
+    pluginId: "synthetic-sociality-room",
+    sourceCommit: "d".repeat(40),
+    artifactIdentity: `npm:@synthetic-sociality/openclaw-room@0.2.36#git:${"d".repeat(40)}`,
+  };
+  const packageJson = {name: manifest.package, version: manifest.version};
+  const pluginManifest = {id: manifest.pluginId, version: manifest.version};
+  const conformance = {adapter: manifest.pluginId, adapterVersion: manifest.version};
+  const provenance = {version: manifest.version, sourceCommit: manifest.sourceCommit, artifactIdentity: manifest.artifactIdentity};
+  assert.doesNotThrow(() => validateClawHubIdentity({manifest, packageJson, pluginManifest, conformance, provenance}));
+  assert.throws(
+    () => validateClawHubIdentity({manifest, packageJson, pluginManifest, conformance, provenance: {...provenance, sourceCommit: "unbuilt", artifactIdentity: "unbuilt"}}),
+    /raw source or unbuilt bytes/,
+  );
+});
+
+test("ClawHub operator instructions never publish the unbuilt Git checkout", async () => {
+  const readme = await readFile(join(packageRoot, "README.md"), "utf8");
+  assert.doesNotMatch(readme, /clawhub package (?:validate|publish) \.\s/);
+  assert.match(readme, /release:prepare-clawhub/);
+  assert.match(readme, /openclaw-room-clawhub-reviewed/);
 });
