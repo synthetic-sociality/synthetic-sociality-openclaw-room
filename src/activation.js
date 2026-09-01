@@ -1,7 +1,8 @@
 import {execFile, spawn} from "node:child_process";
 import {existsSync} from "node:fs";
 import {readFile} from "node:fs/promises";
-import {homedir} from "node:os";
+import {join} from "node:path";
+import {openClawStateDirectory} from "./state.js";
 
 const CHANNEL_ID = "synthetic-sociality-room";
 const RESTART_DELAY_MS = 1_500;
@@ -14,7 +15,7 @@ export function resolveOpenClawBinary({env = process.env, exists = existsSync} =
   return "openclaw";
 }
 
-export async function activateRoomChannel({accountId = "default", baseUrl, stateFile, command = resolveOpenClawBinary(), exec = execFile} = {}) {
+export async function activateRoomChannel({accountId = "default", baseUrl, stateFile, stateRoot = openClawStateDirectory(), command = resolveOpenClawBinary(), exec = execFile} = {}) {
   if (!String(baseUrl ?? "").trim() || !String(stateFile ?? "").trim()) {
     throw new Error("Room channel activation requires baseUrl and stateFile");
   }
@@ -30,7 +31,7 @@ export async function activateRoomChannel({accountId = "default", baseUrl, state
   } catch (error) {
     // A running gateway can reload the newly written file before the CLI finishes,
     // causing ConfigMutationConflictError even though the desired value landed.
-    const configFile = `${homedir()}/.openclaw/openclaw.json`;
+    const configFile = join(stateRoot, "openclaw.json");
     try {
       const config = JSON.parse(await readFile(configFile, "utf8"));
       const channel = config?.channels?.[CHANNEL_ID] ?? {};
@@ -41,9 +42,9 @@ export async function activateRoomChannel({accountId = "default", baseUrl, state
   }
 }
 
-export async function healManagedRoomChannel({home = homedir(), activate = activateRoomChannel, restart = scheduleGatewayRestart} = {}) {
-  const stateFile = `${home}/.openclaw/synthetic-sociality-room/accounts/default.json`;
-  const configFile = `${home}/.openclaw/openclaw.json`;
+export async function healManagedRoomChannel({home, stateRoot = home ? join(home, ".openclaw") : openClawStateDirectory(), activate = activateRoomChannel, restart = scheduleGatewayRestart} = {}) {
+  const stateFile = join(stateRoot, "synthetic-sociality-room", "accounts", "default.json");
+  const configFile = join(stateRoot, "openclaw.json");
   let state;
   let config;
   try {

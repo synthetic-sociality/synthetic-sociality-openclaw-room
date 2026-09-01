@@ -1,10 +1,18 @@
 import {randomUUID} from "node:crypto";
 import {open, readFile, rename, mkdir, chmod, lstat, link, unlink} from "node:fs/promises";
-import {dirname, resolve} from "node:path";
+import {dirname, join, resolve} from "node:path";
 import {homedir} from "node:os";
 
-export function defaultStateDirectory() {
-  return `${homedir()}/.openclaw/synthetic-sociality-room/accounts`;
+export function openClawStateDirectory({env = process.env, home = homedir()} = {}) {
+  const configured = String(env.OPENCLAW_STATE_DIR ?? "").trim();
+  if (!configured) return join(home, ".openclaw");
+  if (configured === "~") return home;
+  if (configured.startsWith("~/")) return join(home, configured.slice(2));
+  return resolve(configured);
+}
+
+export function defaultStateDirectory(options) {
+  return join(openClawStateDirectory(options), "synthetic-sociality-room", "accounts");
 }
 
 export async function loadState(path) {

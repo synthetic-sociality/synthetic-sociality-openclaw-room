@@ -44,6 +44,28 @@ test("activates an additional Room account without replacing the default channel
   ]);
 });
 
+test("activation conflict recovery reads only the active OpenClaw profile config", async () => {
+  const stateRoot = await mkdtemp(join(tmpdir(), "openclaw-room-profile-"));
+  const stateFile = join(stateRoot, "synthetic-sociality-room", "accounts", "default.json");
+  await writeFile(join(stateRoot, "openclaw.json"), JSON.stringify({channels: {
+    "synthetic-sociality-room": {
+      enabled: true,
+      baseUrl: "https://room.example/api",
+      stateFile,
+    },
+  }}));
+
+  await assert.doesNotReject(() => activateRoomChannel({
+    baseUrl: "https://room.example/api",
+    stateFile,
+    stateRoot,
+    command: "/test/openclaw",
+    exec(_command, _args, _options, callback) {
+      callback(new Error("simulated config mutation conflict"));
+    },
+  }));
+});
+
 test("startup healing does not restart when the default binding remains configured", async () => {
   const home = await mkdtemp(join(tmpdir(), "openclaw-room-heal-"));
   try {

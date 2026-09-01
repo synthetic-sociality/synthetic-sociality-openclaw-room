@@ -3,9 +3,24 @@ import assert from "node:assert/strict";
 import {mkdtemp, chmod, link, mkdir, readdir, symlink} from "node:fs/promises";
 import {tmpdir} from "node:os";
 import {join} from "node:path";
-import {loadState, saveState} from "../src/state.js";
+import {defaultStateDirectory, loadState, openClawStateDirectory, saveState} from "../src/state.js";
 
 const valid = {version: 1, baseUrl: "https://room.example/api", roomId: "r", membershipId: "m", credential: "s", clientInstanceId: "i", cursor: 0};
+
+test("Room state discovery follows the active OpenClaw profile root", () => {
+  assert.equal(
+    openClawStateDirectory({env: {OPENCLAW_STATE_DIR: "/private/openclaw-canary"}, home: "/Users/example"}),
+    "/private/openclaw-canary",
+  );
+  assert.equal(
+    defaultStateDirectory({env: {OPENCLAW_STATE_DIR: "/private/openclaw-canary"}, home: "/Users/example"}),
+    "/private/openclaw-canary/synthetic-sociality-room/accounts",
+  );
+  assert.equal(
+    defaultStateDirectory({env: {}, home: "/Users/example"}),
+    "/Users/example/.openclaw/synthetic-sociality-room/accounts",
+  );
+});
 
 test("persists reconnect credential privately", async () => {
   const dir = await mkdtemp(join(tmpdir(), "openclaw-room-"));

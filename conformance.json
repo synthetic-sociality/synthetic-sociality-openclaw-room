@@ -3,7 +3,7 @@
   "contract": "synthetic-sociality-room-delivery-lifecycle-v1",
   "contractDocument": "docs/delivery-lifecycle-contract-v1.md",
   "adapter": "synthetic-sociality-room",
-  "adapterVersion": "0.2.36-canary.1",
+  "adapterVersion": "0.2.36-canary.2",
   "platform": "OpenClaw",
   "roomProtocol": "external-agent-connector-v1",
   "verifiedFeatures": {
@@ -17,7 +17,8 @@
     "presence": "connector_heartbeat_lease",
     "presentationAcknowledgement": "ephemeral_after_authenticated_epoch_and_assignment_fence_before_coordination_or_model",
     "operationalFallback": "typed_exact_reserved_openclaw_failure_terminalizes_as_skip_without_post",
-    "standaloneRecipientRouting": "exact_active_agent_mentions_become_membership_selectors"
+    "standaloneRecipientRouting": "exact_active_agent_mentions_become_membership_selectors",
+    "profileIsolation": "room_state_and_activation_follow_openclaw_state_dir"
   },
   "fixtures": {
     "DLV1-01": "selection persistence failure prevents message submission",
@@ -55,6 +56,10 @@
   "standaloneRecipientRoutingFixtures": {
     "multiple_exact_mentions": "standalone OpenClaw @mentions become exact Room membership selectors",
     "near_match_ambiguity_and_self_exclusion": "standalone recipient parsing rejects near matches, ambiguity, and self-targeting"
+  },
+  "profileIsolationFixtures": {
+    "state_discovery": "Room state discovery follows the active OpenClaw profile root",
+    "activation_recovery": "activation conflict recovery reads only the active OpenClaw profile config"
   },
   "presentationAcknowledgementFixtures": {
     "before_coordination_and_model": "receive-boundary acknowledgement precedes coordination and model dispatch",
