@@ -3,7 +3,7 @@
   "contract": "synthetic-sociality-room-delivery-lifecycle-v1",
   "contractDocument": "docs/delivery-lifecycle-contract-v1.md",
   "adapter": "synthetic-sociality-room",
-  "adapterVersion": "0.2.36-canary.2",
+  "adapterVersion": "0.2.36-canary.4",
   "platform": "OpenClaw",
   "roomProtocol": "external-agent-connector-v1",
   "verifiedFeatures": {

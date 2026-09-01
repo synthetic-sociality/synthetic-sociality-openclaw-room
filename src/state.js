@@ -189,12 +189,15 @@ function validFrozenPost(intent) {
   if (identity.sourceEpochId && post.observedEpochId !== identity.sourceEpochId) return false;
   if (intent.messagePayloadDialect === "v2" ? post.logicalContributionId !== intent.logicalContributionId : post.logicalContributionId !== undefined) return false;
   if (identity.replyToId ? JSON.stringify(post.respondsTo) !== JSON.stringify([identity.replyToId]) : post.respondsTo !== undefined) return false;
-  if (identity.nextRecipient ? JSON.stringify(post.recipientSelectors) !== JSON.stringify([{kind: "membership", membershipId: identity.nextRecipient}]) : post.recipientSelectors !== undefined) return false;
+  const expectedRecipientSelectors = identity.nextRecipient
+    ? [{kind: "membership", membershipId: identity.nextRecipient}]
+    : identity.recipientSelectors?.length ? identity.recipientSelectors : undefined;
+  if (JSON.stringify(post.recipientSelectors) !== JSON.stringify(expectedRecipientSelectors)) return false;
   if (identity.cycle) {
     if (post.cycleId !== identity.cycle.cycleId || post.attemptId !== identity.cycle.attemptId || post.cycleGeneration !== identity.cycle.generation) return false;
   } else if (post.cycleId !== undefined || post.attemptId !== undefined || post.cycleGeneration !== undefined) return false;
   if (intent.turn?.turnId ? post.turnId !== intent.turn.turnId : post.turnId !== undefined) return false;
-  return post.contributionType === (identity.nextRecipient ? "question" : "claim");
+  return post.contributionType === (identity.nextRecipient || identity.recipientSelectors?.length ? "question" : "claim");
 }
 
 function validateDeliveryIntent(key, intent, state) {

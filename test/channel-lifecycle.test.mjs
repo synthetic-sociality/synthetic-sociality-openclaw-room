@@ -19,7 +19,7 @@ registerHooks({
 
 const home = await mkdtemp(join(tmpdir(), "openclaw-room-channel-home-"));
 process.env.HOME = home;
-const {createRoomChannel} = await import("../src/channel.js");
+const {createRoomChannel, isOpenClawOperationalFallback} = await import("../src/channel.js");
 const ID = "synthetic-sociality-room";
 
 function config(defaultState, accounts) {
@@ -58,7 +58,7 @@ function context(account, controller = new AbortController()) {
 }
 
 test("generic OpenClaw operational fallback passes without canonical Room post", async () => {
-  const fallback = "⚠️ Something went wrong while processing your request. Please try again, or use /new to start a fresh session.";
+  const fallback = "⚠️ Auto-compaction could not recover this turn. I kept this conversation mapped to the current session. Please try again, use /compact, or use /new to start a fresh session.\n\nTo prevent this, increase your compaction buffer by setting `agents.defaults.compaction.reserveTokensFloor` to 20000 or higher in your config.";
   const calls = {post: 0, pass: 0, skipped: [], ack: []};
   const event = {
     id: "event-error", sourceEventId: "event-error", respondsToId: "event-error",
@@ -103,6 +103,13 @@ test("generic OpenClaw operational fallback passes without canonical Room post",
     skipped: [["event-error", "gateway_operational_error"]],
     ack: ["event-error"],
   });
+});
+
+test("operational fallback classification is exact and requires trusted error metadata", () => {
+  const generic = "⚠️ Something went wrong while processing your request. Please try again, or use /new to start a fresh session.";
+  assert.equal(isOpenClawOperationalFallback({text: generic, isError: true}), true);
+  assert.equal(isOpenClawOperationalFallback({text: generic, isError: false}), false);
+  assert.equal(isOpenClawOperationalFallback({text: `${generic} `, isError: true}), false);
 });
 
 test("model-authored fallback text remains a canonical Room contribution", async () => {

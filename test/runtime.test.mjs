@@ -510,6 +510,7 @@ test("standalone OpenClaw @mentions become exact Room membership selectors", asy
     {kind: "membership", membershipId: "zurie-member"},
   ]);
   assert.equal(posts[0].contributionType, "question");
+  assert.doesNotThrow(() => validateState(runtime.state));
 });
 
 test("standalone recipient parsing rejects near matches, ambiguity, and self-targeting", () => {

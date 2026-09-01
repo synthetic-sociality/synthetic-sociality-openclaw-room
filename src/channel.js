@@ -22,6 +22,15 @@ import {
 
 const ID = "synthetic-sociality-room";
 const GENERIC_OPENCLAW_OPERATIONAL_FALLBACK = "⚠️ Something went wrong while processing your request. Please try again, or use /new to start a fresh session.";
+const COMPACTION_OPENCLAW_OPERATIONAL_FALLBACK = "⚠️ Auto-compaction could not recover this turn. I kept this conversation mapped to the current session. Please try again, use /compact, or use /new to start a fresh session.\n\nTo prevent this, increase your compaction buffer by setting `agents.defaults.compaction.reserveTokensFloor` to 20000 or higher in your config.";
+const OPENCLAW_OPERATIONAL_FALLBACKS = new Set([
+  GENERIC_OPENCLAW_OPERATIONAL_FALLBACK,
+  COMPACTION_OPENCLAW_OPERATIONAL_FALLBACK,
+]);
+
+export function isOpenClawOperationalFallback(payload) {
+  return payload?.isError === true && OPENCLAW_OPERATIONAL_FALLBACKS.has(payload.text);
+}
 
 const receipt = (eventId, sentAt) => ({
   primaryPlatformMessageId: eventId,
@@ -221,10 +230,7 @@ export function createRoomChannel({makeClient}) {
                     delivery: {
                       durable: {to: event.roomId, replyToId: event.respondsToId},
                       deliver: async (payload) => {
-                        if (
-                          payload?.isError === true
-                          && payload.text === GENERIC_OPENCLAW_OPERATIONAL_FALLBACK
-                        ) {
+                        if (isOpenClawOperationalFallback(payload)) {
                           operationalFallbackSuppressed = true;
                           ctx.log?.error?.(`[${ctx.accountId}] Suppressed OpenClaw operational fallback for Room source ${event.sourceEventId}`);
                           return {visibleReplySent: false};
