@@ -1406,3 +1406,85 @@ test("epoch transition during context loading fails closed before model dispatch
     {id: "source-12", seq: 12}, {id: "epoch-current", startsAtSeq: 10},
   ), /advanced while loading model context/);
 });
+
+test("shared context resolves the exact attached document version as untrusted evidence", async () => {
+  const runtime = deliveryLifecycleRuntime();
+  const source = {
+    id: "human-10", seq: 10, type: "message.posted", actorRole: "human_owner",
+    payload: {body: "Read this", attachments: [{
+      artifactId: "artifact-1", versionId: "version-1", name: "开幕式日程.docx",
+      mediaType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document", sha256: "a".repeat(64),
+    }]},
+  };
+  const ready = {
+    id: "ready-12", seq: 12, type: "discussion.cycle_attempt_ready",
+    payload: {sourceEventId: "human-10"},
+  };
+  const calls = [];
+  runtime.client = {
+    roomState: async () => ({title: "OpenClaw", headSeq: 12, activeEpoch: {id: "epoch-1", startsAtSeq: 1}}),
+    roomPolicy: async () => ({policy: {coordinationMode: "open"}}),
+    readEvents: async () => ({activeEpochId: "epoch-1", activeEpochStartsAtSeq: 1, events: [source, ready]}),
+    listArtifacts: async () => ({items: []}),
+    getArtifact: async (_session, artifactId) => {
+      calls.push(artifactId);
+      return {
+        currentVersion: {versionId: "version-2", extractionStatus: "ready", extractedText: "wrong"},
+        versions: [
+          {versionId: "version-2", extractionStatus: "ready", extractedText: "wrong"},
+          {versionId: "version-1", extractionStatus: "ready", extractedText: "09:00 开幕式\n09:30 Keynote"},
+        ],
+      };
+    },
+  };
+  const rendered = await runtime.sharedRoomContext(ready, {id: "epoch-1", startsAtSeq: 1});
+  assert.deepEqual(calls, ["artifact-1"]);
+  assert.match(rendered, /untrusted uploaded content/);
+  assert.match(rendered, /09:00 开幕式/);
+  assert.doesNotMatch(rendered, /wrong/);
+});
+
+test("a later message receives the authorized Room document library without reattachment", async () => {
+  const runtime = deliveryLifecycleRuntime();
+  runtime.client = {
+    roomState: async () => ({title: "OpenClaw", headSeq: 20, activeEpoch: {id: "epoch-1", startsAtSeq: 1}}),
+    roomPolicy: async () => ({policy: {coordinationMode: "open"}}),
+    readEvents: async () => ({activeEpochId: "epoch-1", activeEpochStartsAtSeq: 1, events: []}),
+    listArtifacts: async () => ({items: [{
+      artifactId: "artifact-1", visibility: "room_shared", title: "Agenda",
+      currentVersion: {versionId: "version-1", name: "agenda.docx", extractionStatus: "ready", extractedText: "Collective agenda text"},
+    }]}),
+    getArtifact: async () => { throw new Error("ready library item must not trigger a second fetch"); },
+  };
+  const rendered = await runtime.sharedRoomContext(
+    {id: "later-20", seq: 20, type: "message.posted", payload: {body: "Read the document"}},
+    {id: "epoch-1", startsAtSeq: 1},
+  );
+  assert.match(rendered, /agenda\.docx/);
+  assert.match(rendered, /Collective agenda text/);
+});
+
+test("a pending library version uses the supported exact-read text backfill", async () => {
+  const runtime = deliveryLifecycleRuntime();
+  let exactReads = 0;
+  runtime.client = {
+    roomState: async () => ({title: "OpenClaw", headSeq: 21, activeEpoch: {id: "epoch-1", startsAtSeq: 1}}),
+    roomPolicy: async () => ({policy: {coordinationMode: "open"}}),
+    readEvents: async () => ({activeEpochId: "epoch-1", activeEpochStartsAtSeq: 1, events: []}),
+    listArtifacts: async () => ({items: [{
+      artifactId: "artifact-1", visibility: "room_shared", title: "Agenda",
+      currentVersion: {versionId: "version-1", name: "agenda.docx", extractionStatus: "pending", extractedText: ""},
+    }]}),
+    getArtifact: async () => {
+      exactReads += 1;
+      return {currentVersion: {versionId: "version-1", name: "agenda.docx", extractionStatus: "ready", extractedText: "Backfilled agenda text"}};
+    },
+  };
+  const rendered = await runtime.sharedRoomContext(
+    {id: "later-21", seq: 21, type: "message.posted", payload: {body: "Read the document"}},
+    {id: "epoch-1", startsAtSeq: 1},
+  );
+  assert.equal(exactReads, 1);
+  assert.match(rendered, /Extraction status: ready/);
+  assert.match(rendered, /Backfilled agenda text/);
+});

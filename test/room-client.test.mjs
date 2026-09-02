@@ -124,3 +124,18 @@ test("uses canonical state and long-poll query names", async () => {
   assert.equal(urls[0], "https://room.example/api/rooms/room-1/state");
   assert.equal(urls[1], "https://room.example/api/rooms/room-1/events?after=2&limit=100&waitSeconds=20");
 });
+
+test("reads artifact derived text through the membership-authorized route", async () => {
+  let captured;
+  const client = new RoomClient({baseUrl: "https://room.example/api", fetchImpl: async (url, init) => {
+    captured = {url, init};
+    return new Response(JSON.stringify({artifactId: "artifact/1"}), {status: 200});
+  }});
+  await client.getArtifact({roomId: "room one", credential: "room-secret"}, "artifact/1");
+  assert.equal(captured.url, "https://room.example/api/rooms/room%20one/artifacts/artifact%2F1");
+  assert.equal(captured.init.headers.Authorization, "Bearer room-secret");
+  assert.equal(captured.init.method, "GET");
+  await client.listArtifacts({roomId: "room one", credential: "room-secret"});
+  assert.equal(captured.url, "https://room.example/api/rooms/room%20one/artifacts");
+  assert.equal(captured.init.headers.Authorization, "Bearer room-secret");
+});

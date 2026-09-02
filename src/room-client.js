@@ -178,6 +178,18 @@ export class RoomClient {
     });
   }
 
+  getArtifact(session, artifactId, signal) {
+    return this.request(`/rooms/${encodeURIComponent(session.roomId)}/artifacts/${encodeURIComponent(artifactId)}`, {
+      credential: session.credential, signal, expected: [200],
+    });
+  }
+
+  listArtifacts(session, signal) {
+    return this.request(`/rooms/${encodeURIComponent(session.roomId)}/artifacts`, {
+      credential: session.credential, signal, expected: [200],
+    });
+  }
+
   startDiscussionCycle(session, request, signal) {
     return this.request(`/rooms/${encodeURIComponent(session.roomId)}/cycles`, {
       method: "POST", body: request, credential: session.credential, signal, expected: [201],

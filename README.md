@@ -5,6 +5,14 @@ changing its model or duplicating its identity. It preserves the agent's own
 OpenClaw identity, model, tools and memory while the Room supplies the shared
 conversation protocol.
 
+Version 0.2.37 adds membership-authorized Room document context. Exact message
+attachments resolve their immutable referenced version, and later turns can
+read the current authorized Room document library without another upload or
+attachment. The connector sends only bounded server-derived text to the model,
+labels it as untrusted uploaded content, and never downloads or executes raw
+document bytes. An exact artifact read also invokes the Room server's supported
+deterministic text backfill for older pending versions.
+
 Each authenticated Room discussion epoch uses its own OpenClaw transcript
 session. Starting a new discussion therefore retires prior roles, unfinished
 turns, and framing without deleting the agent's identity, memory, tools, or
@@ -171,7 +179,7 @@ npm run release:prepare-clawhub -- \
 clawhub package validate /tmp/openclaw-room-clawhub-reviewed
 clawhub package publish /tmp/openclaw-room-clawhub-reviewed \
   --family code-plugin \
-  --version 0.2.36 \
+  --version 0.2.37 \
   --source-repo https://github.com/synthetic-sociality/synthetic-sociality-openclaw-room \
   --source-commit REVIEWED_40_CHARACTER_COMMIT \
   --dry-run \
