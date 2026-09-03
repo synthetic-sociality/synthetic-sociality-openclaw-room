@@ -85,10 +85,40 @@ Probe output on 9ce50e4 (fixture bytes, page `activeEpochId dqb8eamems9yi2e`,
 ```
 
 The last line matters: once the boundary check no longer throws, 134 falls
-through `isAssignedEvent()` (`src/runtime.js:1285`) to `false`, so the existing
-`not_assigned_or_technical` → `recordTerminalEvidence(ignored)` → `ackEvent`
-path handles it with no model, post, claim or activity call. The fix is a
-routing-predicate change, not a new processing path.
+through `isAssignedEvent()` (`src/runtime.js:1285`) to `false`. The fix adds
+one explicit routing branch for lifecycle-only boundary terminals (section
+5.1) that records its own evidence reason before the existing
+`not_assigned_or_technical` branch; it reuses the existing
+`recordTerminalEvidence(ignored)` → `ackEvent` mechanics and adds no
+processing path with side effects.
+
+### 2.1 Exact baseline `assignedTurns()` trace (cursor 131, fixtures 132–134)
+
+Executed on unmodified 9ce50e4 with a throwaway driver (deleted, not
+committed): full `version: 1` state in a temp state file, membership
+`nnrafww8dv4g7a6`, `cursor 131`, page `{activeEpochId "dqb8eamems9yi2e",
+activeEpochStartsAtSeq 133, events [132, 133, 134]}`, `maintainPresence` and
+`markContextAcknowledged` stubbed as counters, every client method except
+`readEvents`/`acknowledge` stubbed as a counter:
+
+```
+acks               [132, 133]
+evidence (in order) 132 superseded / historical_epoch (sourceEpochId qjw1tu1jfnm1wsp)
+                    133 ignored    / not_assigned_or_technical
+error              "Room event epoch evidence contradicts the authoritative active epoch boundary"  (at 134, from eventEpochId)
+state.cursor       133
+state.terminalEvidence {}          (ledger drained by the 133 ack)
+pendingEvent       null
+call counts        {}              (markContextAcknowledged, roomPolicy, startDiscussionCycle,
+                                    claimDiscussionAttempt, postMessage, publishActivity,
+                                    acknowledgePeerContribution: all 0)
+deliveryIntents    {}
+```
+
+Each event is acknowledged individually because `ackEvent` runs per event and
+the contiguous frontier advances by exactly one each time. This trace is the
+RED oracle for 6.1 and reproduces the captured membership state
+(`acknowledged_seq 133`, `delivered_seq 134`).
 
 ## 3. Lifecycle-only terminal contract (normative)
 
@@ -186,39 +216,93 @@ above the new `startsAtSeq`. That is exactly 132 → 133 → 134.
 > produced except (a) the pre-existing `human_interrupted` post-commit race and
 > (b) the reconciler backstop in 4.4.
 
-### 4.3 Mechanism
+### 4.3 Mechanism — one atomic chain append
 
-Add to `applicationcycles` (`server/application/cycles/cycles.go`):
+Ground truth that constrains the design (`server/infrastructure/pocketbase/eventstore/store.go:85-216`):
+`Store.Append` takes the room mutex, opens **one** `RunInTransaction`,
+allocates exactly one sequence via `UPDATE rooms SET head_seq = head_seq + 1
+… RETURNING head_seq`, then calls `BuildPayloadInTx(tx, seq)`, seals, inserts,
+and runs the projection. A nested `Append` from inside `BuildPayloadInTx`
+would allocate `seq + 1` for the fence, i.e. **above** `startsAtSeq` — the
+exact defect shape. Therefore the fence cannot be produced inside the
+`discussion.started` append; the eventstore must gain a batch primitive.
+
+**New eventstore primitive** (`eventstore/store.go`):
 
 ```
-ReasonEpochSuperseded = "epoch_superseded"
-func Supersede(c Cycle) Cycle   // like Interrupt: State=interrupted, StopReason=epoch_superseded, Generation++ if not terminal
+// AppendChain appends inputs[0..n-1] as consecutive sequences S, S+1, …
+// under one room lock and one database transaction. Sequence allocation,
+// predecessor hash, sealing, insert, projection and idempotency-key
+// uniqueness are evaluated per element in order; any error rolls back every
+// element. Observers are notified once per element, in order, only after the
+// whole transaction commits (same OnComplete rule as Append).
+func (s *Store) AppendChain(ctx context.Context, inputs []AppendInput, apply []Projection) ([]domain.Event, error)
 ```
 
-`commandservice.Execute` for `StartDiscussion`, before appending
-`discussion.started`:
+`Append` becomes `AppendChain` with one element (no behavioural change; the
+existing eventstore test suite is the regression fence). `BuildPayloadInTx`
+for element `i` receives its own allocated sequence, so
+`startDiscussion.build(tx, S+1)` writes `starts_at_seq = S+1` exactly as
+today.
 
-1. Under the room lock, `cycleservice.FenceActiveForEpochSupersession(ctx, roomID)`:
-   `findActive` → `Supersede` → `saveCycleRecord` (`active = 0`) → cancel any
-   running attempt (`state cancelled`, `reason epoch_superseded`) → append
-   `discussion.cycle_terminal` with `EpochID = cycle.EpochID`,
-   `actorId room_coordinator`, `RoleSystem`, payload
-   `{cycleId, epochId, state: "interrupted", reason: "epoch_superseded",
-   generation, acceptedTurns, acceptedBytes, summaryHandoff}`,
-   `IdempotencyKey "cycle-epoch-fence-<cycleId>-<generation>"`,
-   `IdempotencyHash digest(cycleId + "\x00epoch_superseded\x00" + generation)`.
-2. Then append `discussion.started` as today.
+**Command path** (`commandservice.Execute`, `service.go:196-203`,
+`StartDiscussion` case): the command service gains a `cycles` fence
+dependency (variadic constructor option, same pattern as `leases`,
+`service.go:30-41`). Execute builds the chain:
 
-Ordering guarantee: the fence terminal receives sequence S−k (k ≥ 1) **below**
-the new epoch's `startsAtSeq`, so every connector classifies it as historical
-(case H) and no allowlist is needed for the primary path. A4 exists only for
-the backstop below.
+1. Read-only preflight under the existing command idempotency lock:
+   `cycleservice.FindActiveCycle(roomID)` → `(cycle, found)`.
+2. If `found`: element 0 is the fence terminal
+   `AppendInput{RoomID, EpochID: cycle.EpochID, Type: cycle_terminal,
+   ActorID "room_coordinator", ActorRole RoleSystem, Payload:
+   {cycleId, epochId, state "interrupted", reason "epoch_superseded",
+   generation, acceptedTurns, acceptedBytes, summaryHandoff},
+   Refs: contributionIDs(cycle), IdempotencyKey
+   "cycle-epoch-fence-<cycleId>-<generation>", IdempotencyHash
+   digest(cycleId + "\x00interrupted\x00epoch_superseded")}` with projection
+   `cycleservice.SupersedeProjection(cycle)`: re-`findActive` **inside the
+   transaction**, assert same cycle id and generation (else
+   `ErrConflict` → rollback), `applicationcycles.Supersede` →
+   `saveCycleRecord` (`active = 0`, `state interrupted`, `stop_reason
+   epoch_superseded`, `terminal_seq = event.Seq`, `summary_handoff`), cancel
+   the active attempt (`state cancelled`, `reason epoch_superseded`).
+3. Element 1 (or 0 when no active cycle) is the unchanged `discussion.started`
+   input with the unchanged `startDiscussion` build + projection.
+4. `s.events.AppendChain(ctx, inputs, projections)`. The command's
+   `findByKey` replay lookup keys on the **started** event's idempotency key
+   exactly as today (`service.go:98`, `:225`); `acceptableReplayType` is
+   unchanged.
 
-Replay/idempotency: a crash between step 1 and step 2 leaves a fenced cycle and
-no new epoch; the retried command finds no active cycle (`ErrNotFound` →
-no-op) and appends `discussion.started`. A retried step 1 hits the idempotency
-key and returns the existing terminal. `discussion.started` idempotency is
-unchanged. Append-only history is preserved: no event is edited or deleted.
+Ordering guarantee is structural, not timing-based: the fence is element 0,
+so `fence.Seq = S` and `started.Seq = startsAtSeq = S+1`. Every connector
+classifies the fence as historical (case H). A4 in the connector table exists
+only for the reconciler backstop (4.4) and for legacy orphans.
+
+**Observer timing:** neither element is published until the transaction
+commits; then observers receive fence then started, in sequence order. The
+SSE stream and long-poll therefore never expose a fenced cycle without its
+new epoch or vice versa.
+
+**Exact-retry behaviour:** a retry of the same `start_discussion` command
+(same key + hash) after commit hits the `findByKey` replay at
+`service.go:98` and returns the original `discussion.started`; no second
+fence is attempted. A retry after a rolled-back transaction finds no replay,
+re-runs the preflight, still finds the active cycle (rollback restored it),
+and builds the same two-element chain. A concurrent process that won the
+uniqueness race on either element's `(room, idempotency_key)` causes the
+whole chain to roll back; the existing post-append `findByKey` convergence
+(`service.go:224-231`) returns the winner's started event. There is no
+reachable state with a fence and no started event, or a started event and
+an un-fenced foreign-epoch cycle, except the legacy orphans handled in 4.4.
+
+`cycleservice` additions: `ReasonEpochSuperseded = "epoch_superseded"` and
+`Supersede(c Cycle) Cycle` in `server/application/cycles/cycles.go`
+(identical shape to `Interrupt`, `cycles.go:404`); `FindActiveCycle` and
+`SupersedeProjection` exported from
+`infrastructure/pocketbase/cycleservice` alongside
+`InterruptActiveForHumanMessage` (`service.go:994`). `appendTerminal`
+(`service.go:797`) is not used for the fence; the projection body is shared
+via a small helper so the `discussion_cycles` write stays identical.
 
 ### 4.4 Reconciler backstop
 
@@ -233,14 +317,18 @@ boundary terminal, and it emits A4, which both connectors accept.
 
 | Test | Assertion |
 |---|---|
-| `TestStartDiscussionFencesActiveCycle` | start cycle in epoch E1; execute `start_discussion`; assert events in order `[…, cycle_terminal(interrupted/epoch_superseded, epochId E1), discussion.started(E2)]`; assert terminal.seq < started.payload.epoch.startsAtSeq; assert `discussion_cycles` row `active=0, state=interrupted, terminal_reason=epoch_superseded`; running attempt `state=cancelled`. |
-| `TestStartDiscussionFenceIsIdempotent` | inject failure after fence append; retry command; assert exactly one fence terminal, one `discussion.started`, same idempotency hash. |
+| `TestStartDiscussionFencesActiveCycle` | start cycle in epoch E1; execute `start_discussion`; assert events in order `[…, cycle_terminal(interrupted/epoch_superseded, epochId E1) @ S, discussion.started(E2) @ S+1]`; assert `started.payload.epoch.startsAtSeq == S+1 == terminal.seq + 1`; assert `discussion_cycles` row `active=0, state=interrupted, stop_reason=epoch_superseded, terminal_seq=S`; running attempt `state=cancelled, reason=epoch_superseded`; `rooms.head_seq == S+1`. |
+| `TestAppendChainIsAllOrNothing` (eventstore) | two-element chain whose second element's projection returns an error; assert `head_seq` unchanged, zero rows inserted for either key, zero observer notifications; then a chain whose **first** element fails (`ValidateHead`) → same assertions. |
+| `TestAppendChainObserverOrderAfterCommit` (eventstore) | recording observer; assert it receives exactly `[fence, started]` in that order and only after `RunInTransaction` returns. |
+| `TestStartDiscussionRetryAfterRollbackProducesSingleChain` | inject a failure in the started-element projection on the first call; retry with identical key+hash; assert exactly one fence terminal and one `discussion.started` in the store, fence.seq + 1 == started.seq, same idempotency hash; assert no fence exists after the failed first call. |
+| `TestStartDiscussionExactReplayEmitsNoSecondFence` | execute twice with identical key+hash; assert the second call returns the original started event and the event count is unchanged. |
+| `TestStartDiscussionFenceConflictsOnGenerationDrift` | mutate the active cycle generation between preflight and transaction (test hook); assert `ErrConflict` and no rows inserted. |
 | `TestReconcilerNeverTimesOutForeignEpochCycle` | seed DB with active cycle in E1 and active epoch E2 (pre-fix state); advance clock past deadline; run `ReconcileRoom`; assert emitted terminal is `(interrupted, epoch_superseded)`, **not** `(timed_out, cycle_deadline_reached)`. |
 | `TestClaimOnForeignEpochCycleIsSuperseded` | claim attempt on E1 cycle while E2 active → `ErrSuperseded`/`ErrCycleTerminal`, HTTP `cycle_superseded`. |
 | `TestFixtureCanonicalBytesRoundTrip` (domain) | for each fixture: strip LF, assert stored hash, unmarshal into `domain.Event`, `CanonicalBytes` → sha256 equals stored hash. |
-| Negative | `TestStartDiscussionWithoutActiveCycleEmitsNoFence` — event list contains no `cycle_terminal`. |
+| Negative | `TestStartDiscussionWithoutActiveCycleEmitsNoFence` — single-element chain; event list contains no `cycle_terminal`; `startsAtSeq == started.seq`. |
 
-Evidence receipt: `go test ./server/... -run 'Fence|ForeignEpoch|FixtureCanonical'`
+Evidence receipt: `go test ./server/... -run 'Fence|ForeignEpoch|FixtureCanonical|AppendChain'`
 full output + `go vet ./...` exit code, committed under
 `docs/evidence/` in the server build card.
 
@@ -248,23 +336,64 @@ full output + `go vet ./...` exit code, committed under
 
 ### 5.1 OpenClaw Room (`src/runtime.js`)
 
-Change surface: `eventEpochId()` only (`src/runtime.js:1362-1383`), plus a
-named exported predicate:
+Two exported helpers, one routing branch. Names are chosen so the scope of
+each check is unambiguous:
 
 ```
-export function isPriorEpochLifecycleTerminal(event)  // A1–A4 incl. role + cycleId + consistent epoch evidence
+// Structure only. True iff event is discussion.cycle_terminal with nonempty
+// payload.cycleId, internally consistent epoch evidence (payload.epochId,
+// epoch.id, epoch.topic.epochId, topic.epochId, summaryHandoff.epochId all
+// equal where present), and (state, reason, actorRole) in A1–A4.
+// Does NOT look at the page or at seq; it never decides boundary relation.
+export function isLifecycleOnlyCycleTerminal(event)
+
+// Boundary relation only. True iff seq >= pageActiveEpochStartsAtSeq and the
+// event's (consistent) payload epoch is nonempty and differs from
+// pageActiveEpochId. Throws the existing "contradictory" error on R5.
+export function isBoundaryEvent(event, pageActiveEpochId, pageActiveEpochStartsAtSeq)
 ```
 
-`eventEpochId` replaces the inline `interruptedCycleCleanup` with that
-predicate. Nothing else in `assignedTurns()` changes: accepted terminals reach
-`isAssignedEvent → false → recordTerminalEvidence("ignored",
-{reason: "prior_epoch_lifecycle"}) → ackEvent`. The reason string is new so
-evidence is distinguishable from `not_assigned_or_technical`; `validTerminalEvidence`
-must accept it (verify `src/state.js`).
+`eventEpochId()` (`src/runtime.js:1362-1383`) replaces its inline
+`interruptedCycleCleanup` with
+`isLifecycleOnlyCycleTerminal(event)` and otherwise keeps its contract
+(throws on boundary contradiction for everything not lifecycle-only, returns
+the payload epoch for accepted boundary terminals). `eventEpochId` remains the
+fail-closed check; it is called at `src/runtime.js:361` before any routing,
+so R1–R8 still throw before evidence or ack.
 
-Acknowledgement timing: unchanged — evidence persisted to the state file
-first, then `POST /rooms/{id}/acknowledgements` with the contiguous frontier
-(`ackEvent`, `src/runtime.js:689-710`). No activity frame, no peer ack.
+`assignedTurns()` routing change — insert one branch immediately **before**
+the `!isAssignedEvent` branch (`src/runtime.js:384-388`) and after the
+`recoverPendingDelivery` branch (`:379-383`):
+
+```
+if (!historical
+    && isLifecycleOnlyCycleTerminal(event)
+    && isBoundaryEvent(event, pageActiveEpochId, pageEpoch.startsAtSeq)) {
+  await this.recordTerminalEvidence(event, "ignored", {reason: "prior_epoch_lifecycle"});
+  await this.ackEvent(event);
+  continue;
+}
+```
+
+Placement rationale: the branches above it (`recoverPostedEvidence`,
+`historical`, `existingTerminalEvidence`, `recoverPendingDelivery`) are
+state-recovery paths that must keep precedence; a lifecycle terminal never
+has a delivery intent, so in practice they all fall through. Placing it
+before `!isAssignedEvent` is what makes the recorded reason
+`prior_epoch_lifecycle` instead of `not_assigned_or_technical`; nothing
+below the new branch (`markContextAcknowledged`, peer ack,
+`prepareCycleAttempt`, `sharedRoomContext`, `yield`) is reachable for an
+accepted boundary terminal. The `!isAssignedEvent` branch itself is
+unchanged.
+
+`recordTerminalEvidence` persists to the state file (`persistState`,
+`src/runtime.js:546`) before `ackEvent` runs; `validTerminalEvidence`
+(`src/runtime.js:245-255`) accepts any nonempty `reason` for status
+`ignored`, so no state-schema change is needed (verified at 9ce50e4).
+
+Acknowledgement timing: unchanged — evidence persisted first, then
+`POST /rooms/{id}/acknowledgements` with the contiguous frontier (`ackEvent`,
+`src/runtime.js:689-710`). No activity frame, no peer ack.
 
 ### 5.2 Hermes Room (`adapter.py`, release/1.0.51 baseline)
 
@@ -285,7 +414,7 @@ payload epoch evidence exactly as OpenClaw does (`epochId`, `epoch.id`,
 terminals; contradictory → `ProtocolError(code="epoch_evidence_contradictory",
 retryable=False)` without ack). If evidence ≠ `active_epoch_id`:
 
-- `_is_prior_epoch_lifecycle_terminal(event)` (same A1–A4 table) →
+- `_is_lifecycle_only_cycle_terminal(event)` (same A1–A4 table) →
   `_complete_event(binding, seq, terminal_status="ignored",
   source_id=event_id, reason="prior_epoch_lifecycle")`; return.
 - otherwise raise `ProtocolError(code="epoch_boundary_contradiction",
@@ -312,8 +441,9 @@ the stored hash with `assert.equal(sha, STORED[seq])`.
 
 | Test | RED on 9ce50e4 | GREEN assertions |
 |---|---|---|
-| `fixture 132-134: prior-epoch timed_out terminal is acknowledged as lifecycle-only` | throws `/contradicts/` from `eventEpochId`, mock `acknowledge` never called | drive `assignedTurns()` with a fake client serving page `{events:[132,133,134], activeEpochId: "dqb8eamems9yi2e", activeEpochStartsAtSeq: 133}`, state cursor 131, membership `nnrafww8dv4g7a6`. Assert: generator yields nothing; `acknowledge` called with `133` then `134` (or once with 134 after contiguous ledger); `state.cursor === 134`; `state.terminalEvidence` emptied; evidence for 134 before ack was `{status:"ignored", reason:"prior_epoch_lifecycle"}`; `roomPolicy`, `startDiscussionCycle`, `claimDiscussionAttempt`, `postMessage`, `acknowledgePeerContribution`, `publishActivity` call counts all `0`; `Object.keys(state.deliveryIntents).length === 0`; `pendingEvent === null`. |
-| `isPriorEpochLifecycleTerminal accepts exactly A1–A4` | function absent | table-driven over 3.2 rows A1–A4 → `true`; R1–R6 → `false`; role mismatches → `false`. |
+| `fixture 132-134: prior-epoch timed_out terminal is acknowledged as lifecycle-only` | Driver exactly as 2.1 (full `version: 1` state in a temp state file, cursor 131, membership `nnrafww8dv4g7a6`, page `{events:[132,133,134], activeEpochId:"dqb8eamems9yi2e", activeEpochStartsAtSeq:133}`, all client methods except `readEvents`/`acknowledge` and `markContextAcknowledged` as counters). RED assertions (`assert.rejects(iterator.next(), /contradicts the authoritative active epoch boundary/)`): `acks` deep-equals `[132, 133]`; evidence trace deep-equals `[[132,"superseded","historical_epoch"],[133,"ignored","not_assigned_or_technical"]]`; `state.cursor === 133`; `terminalEvidence["134"] === undefined`; all counters 0. | Same driver; `iterator.next()` resolves with the abort/`done` outcome instead of rejecting. Assert `acks` deep-equals `[132, 133, 134]` (one ack per event, contiguous frontier advances by one each time); evidence trace deep-equals `[[132,"superseded","historical_epoch"],[133,"ignored","not_assigned_or_technical"],[134,"ignored","prior_epoch_lifecycle"]]`; `state.cursor === 134`; `deepEqual(state.terminalEvidence, {})`; `pendingEvent === null`; `markContextAcknowledged`, `roomPolicy`, `startDiscussionCycle`, `claimDiscussionAttempt`, `postMessage`, `acknowledgePeerContribution`, `publishActivity` counters all `0`; `deepEqual(state.deliveryIntents, {})`; generator yielded nothing. The evidence for 132 and 133 is byte-identical between RED and GREEN — the fix changes only what happens at 134. |
+| `isLifecycleOnlyCycleTerminal accepts exactly A1–A4` | function absent (import fails) | table-driven over 3.2 rows A1–A4 → `true`; R1–R4, R6 → `false`; R5 → `false` or throw (document which); role mismatches → `false`; non-terminal types → `false`. Pure function: no page argument. |
+| `isBoundaryEvent classifies by seq and epoch only` | function absent | seq < startsAt → `false` regardless of epoch; seq ≥ startsAt & epoch == active → `false`; seq ≥ startsAt & epoch ≠ active → `true`; contradictory evidence → throws `/contradictory/`. Never inspects `type`/`state`/`reason`. |
 | `eventEpochId rejects R1–R8 at the boundary` | partially passes (existing test) | extend existing `accepts only interrupted-cycle cleanup…` test with `completed`, `failed`, `timed_out/human_interrupted`, `cycle_attempt_ready`, `message.posted`, `discussion.started`, missing `cycleId`, `summaryHandoff.epochId` contradicting `epochId` → `/contradicts|contradictory/`. |
 | `rejected boundary event leaves cursor and ledger untouched` | n/a | feed old-epoch `message.posted` at seq 134 → `assert.rejects(/contradicts/)`; `acknowledge` count 0; `state.cursor === 133`; `terminalEvidence["134"] === undefined`. |
 | `run 134 twice: idempotent evidence, single ack` | n/a | second delivery of 134 after ack: `event.seq <= cursor` short-circuit; ack count unchanged. |
@@ -337,7 +467,7 @@ Same fixture files, same hash assertion (`hashlib.sha256`). Cases:
   dispatch even when policy says `on_cycle_complete` + self is coordinator.
 - `test_prior_epoch_attempt_ready_fails_closed`: no `_claim_discussion_attempt`.
 - `test_contradictory_epoch_evidence_fails_closed`.
-- Table test for A1–A4 / R1–R6 on `_is_prior_epoch_lifecycle_terminal`.
+- Table test for A1–A4 / R1–R6 on `_is_lifecycle_only_cycle_terminal` (structure only, mirrors `isLifecycleOnlyCycleTerminal`).
 
 RED expectation on f6db960: the first test **passes by accident**
 (ineligible_event_type path) — record this explicitly; the fail-closed tests
@@ -478,13 +608,18 @@ before the restart gate opens.
   `reason` for non-`posted` statuses, so `prior_epoch_lifecycle` needs no
   schema change.
 - `commandservice.Service` (`service.go:30-41`) holds only `events` and an
-  optional `leases`; the plan must add a `cycles` fence dependency (variadic
-  constructor argument, same pattern as `leases`) or expose a package-level
-  helper in `cycleservice` analogous to `InterruptActiveForHumanMessage`
-  (`service.go:994`) that runs inside the append transaction. Recommended:
-  helper inside the `discussion.started` append transaction via
-  `BuildPayloadInTx`, so fence terminal and started event are sequenced
-  atomically with the fence strictly below `startsAtSeq`.
+  optional `leases`. Decided (4.3): add a `cycles` fence dependency as a
+  variadic constructor option and a new `eventstore.AppendChain`
+  primitive; `Append` delegates to a one-element chain. `BuildPayloadInTx`
+  is **not** a valid host for the fence — it runs after the started event's
+  sequence is already allocated (`store.go:96-110`), so a nested append
+  would land above `startsAtSeq`.
+- `Store.locks` is per room and `commandservice.locks` is per
+  `(room, idempotencyKey)`; `AppendChain` takes only the room lock, so the
+  existing lock order (command key lock → room lock) is unchanged.
+- OpenClaw helper split (5.1): `isLifecycleOnlyCycleTerminal` (structure,
+  no page) and `isBoundaryEvent` (seq/epoch relation, no type/state). The
+  routing branch composes both; `eventEpochId` composes only the first.
 - Decide in the plan: Hermes `epoch_boundary_contradiction` as
   `retryable=False` stall (recommended, matches OpenClaw) vs inbox
   quarantine.
