@@ -1,7 +1,9 @@
 # Prior-epoch lifecycle contract and Zurie recovery — specification
 
 Stage 2 (Design) artifact for `INTENT-ZURIE-EPOCH-01` (Kanban `t_cece76a3`),
-produced by spec-card `t_a6f59884`. Status: **review-required, TJE**.
+produced by spec-card `t_a6f59884`, revised by `t_54739cdb`
+(SPEC-REVISION-ZURIE-EPOCH-01: fence discovery moved inside the append
+transaction; R5 contract made exact). Status: **review-required, TJE**.
 No implementation, release, deployment, database, cursor, session, connector
 state, Room message, upload, invitation or service restart is authorized by
 this document.
@@ -227,58 +229,117 @@ would allocate `seq + 1` for the fence, i.e. **above** `startsAtSeq` — the
 exact defect shape. Therefore the fence cannot be produced inside the
 `discussion.started` append; the eventstore must gain a batch primitive.
 
+There is also no valid *external* preflight: any active-cycle lookup executed
+outside the append transaction (under only the command idempotency lock) has
+a no-active-cycle race — a cycle can become active between the lookup and
+the one-link start chain's commit, and the started event would then be
+committed un-fenced. Fence discovery therefore has to be evaluated **inside**
+the same transaction that appends the chain, under the event store's room
+lock. That is the design below.
+
 **New eventstore primitive** (`eventstore/store.go`):
 
 ```
-// AppendChain appends inputs[0..n-1] as consecutive sequences S, S+1, …
-// under one room lock and one database transaction. Sequence allocation,
-// predecessor hash, sealing, insert, projection and idempotency-key
-// uniqueness are evaluated per element in order; any error rolls back every
-// element. Observers are notified once per element, in order, only after the
-// whole transaction commits (same OnComplete rule as Append).
-func (s *Store) AppendChain(ctx context.Context, inputs []AppendInput, apply []Projection) ([]domain.Event, error)
+// ChainLink is one element of a chain: its AppendInput plus the projection
+// that runs after the link's canonical row is inserted (nil = none).
+type ChainLink struct {
+	Input      AppendInput
+	Projection Projection
+}
+
+// ChainPlanner runs inside the chain's RunInTransaction, after the room
+// lock is held and before any sequence is allocated. It observes projection
+// state through tx (never through s.app) and returns the links to append,
+// in order. It must not open a nested transaction, acquire any other
+// service mutex, or call Append/AppendChain.
+type ChainPlanner func(tx core.App) ([]ChainLink, error)
+
+// AppendChain takes the room lock for roomID, opens one RunInTransaction,
+// invokes plan(tx), then appends the returned links as consecutive
+// sequences S, S+1, … Per link, in order: ValidateCredentialProof,
+// allocateSequence, ValidateHead, predecessorHash, BuildPayloadInTx(tx,
+// seq) / BuildPayload(seq), Seal, insert (idempotency-key uniqueness is the
+// existing (room, idempotency_key) index), then the link's Projection. Any
+// error from the planner or from any link rolls back every link and leaves
+// rooms.head_seq unchanged. Observers are notified once per link, in
+// sequence order, only after the whole transaction commits (same OnComplete
+// rule as Append). An empty plan returns (nil, nil) and appends nothing.
+func (s *Store) AppendChain(ctx context.Context, roomID string, plan ChainPlanner) ([]domain.Event, error)
 ```
 
-`Append` becomes `AppendChain` with one element (no behavioural change; the
-existing eventstore test suite is the regression fence). `BuildPayloadInTx`
-for element `i` receives its own allocated sequence, so
-`startDiscussion.build(tx, S+1)` writes `starts_at_seq = S+1` exactly as
-today.
+`Append(ctx, input, apply)` becomes `AppendChain(ctx, input.RoomID, func(tx)
+{ return []ChainLink{{input, apply}}, nil })` (no behavioural change; the
+existing eventstore test suite is the regression fence). The in-chain
+`previousHash` of link `i > 0` is `links[i-1].Hash` (already inserted in the
+same transaction, so the existing `predecessorHash(tx, room, seq)` read
+returns it; the implementation may pass it directly). `BuildPayloadInTx` for
+link `i` receives its own allocated sequence, so `startDiscussion.build(tx,
+S+1)` writes `starts_at_seq = S+1` exactly as today.
+
+**Lock discipline (normative):** `AppendChain` holds `Store.locks[roomID]`
+for the whole transaction. The planner and every projection run under that
+lock and must use only lock-free `cycleservice` helpers that take `tx` as
+their app (the same family as `InterruptActiveForHumanMessage(tx, …)`,
+`service.go:994`, and `findActive(app, roomID)`, `service.go:1136`). Nothing
+inside `AppendChain` may call `cycleservice.Service.roomLock(roomID)`
+(`service.go:1388`) or any `Service` method that takes it; the two mutexes
+are independent and acquiring the cycleservice mutex from inside the
+eventstore would introduce a lock-order inversion against the reconciler
+(which holds the cycleservice mutex and then calls `events.Append`).
 
 **Command path** (`commandservice.Execute`, `service.go:196-203`,
-`StartDiscussion` case): the command service gains a `cycles` fence
-dependency (variadic constructor option, same pattern as `leases`,
-`service.go:30-41`). Execute builds the chain:
+`StartDiscussion` case): `commandservice` needs no new dependency — the
+fence helper is a lock-free package function, imported like
+`InterruptActiveForHumanMessage`. Execute calls
 
-1. Read-only preflight under the existing command idempotency lock:
-   `cycleservice.FindActiveCycle(roomID)` → `(cycle, found)`.
-2. If `found`: element 0 is the fence terminal
-   `AppendInput{RoomID, EpochID: cycle.EpochID, Type: cycle_terminal,
-   ActorID "room_coordinator", ActorRole RoleSystem, Payload:
-   {cycleId, epochId, state "interrupted", reason "epoch_superseded",
-   generation, acceptedTurns, acceptedBytes, summaryHandoff},
-   Refs: contributionIDs(cycle), IdempotencyKey
-   "cycle-epoch-fence-<cycleId>-<generation>", IdempotencyHash
-   digest(cycleId + "\x00interrupted\x00epoch_superseded")}` with projection
-   `cycleservice.SupersedeProjection(cycle)`: re-`findActive` **inside the
-   transaction**, assert same cycle id and generation (else
-   `ErrConflict` → rollback), `applicationcycles.Supersede` →
-   `saveCycleRecord` (`active = 0`, `state interrupted`, `stop_reason
-   epoch_superseded`, `terminal_seq = event.Seq`, `summary_handoff`), cancel
-   the active attempt (`state cancelled`, `reason epoch_superseded`).
-3. Element 1 (or 0 when no active cycle) is the unchanged `discussion.started`
-   input with the unchanged `startDiscussion` build + projection.
-4. `s.events.AppendChain(ctx, inputs, projections)`. The command's
-   `findByKey` replay lookup keys on the **started** event's idempotency key
-   exactly as today (`service.go:98`, `:225`); `acceptableReplayType` is
-   unchanged.
+```
+events, err := s.events.AppendChain(ctx, request.RoomID, func(tx core.App) ([]eventstore.ChainLink, error) {
+	links := make([]eventstore.ChainLink, 0, 2)
+	fence, found, err := cycleservice.PlanEpochFence(tx, request.RoomID, s.now().UTC())
+	if err != nil { return nil, err }
+	if found { links = append(links, fence) }
+	return append(links, eventstore.ChainLink{Input: startedInput, Projection: startedProjection}), nil
+})
+```
 
-Ordering guarantee is structural, not timing-based: the fence is element 0,
-so `fence.Seq = S` and `started.Seq = startsAtSeq = S+1`. Every connector
-classifies the fence as historical (case H). A4 in the connector table exists
-only for the reconciler backstop (4.4) and for legacy orphans.
+where `startedInput`/`startedProjection` are the unchanged
+`discussion.started` input with the unchanged `startDiscussion` build +
+projection, and
 
-**Observer timing:** neither element is published until the transaction
+```
+// PlanEpochFence is lock-free. It reads the active discussion_cycles row of
+// roomID through tx. (Cycle{}, false, nil) when none is active. Otherwise it
+// returns the fence link for that cycle:
+//   Input: AppendInput{RoomID, EpochID: cycle.EpochID, Type: cycle_terminal,
+//     EventVersion 1, ActorID "room_coordinator", ActorRole RoleSystem,
+//     Payload {cycleId, epochId, state "interrupted", reason
+//     "epoch_superseded", generation, acceptedTurns, acceptedBytes,
+//     summaryHandoff}, Refs: contributionIDs(cycle),
+//     IdempotencyKey "cycle-epoch-fence-<cycleId>-<generation>",
+//     IdempotencyHash digest(cycleId + "\x00interrupted\x00epoch_superseded\x00" + generation)}
+//   Projection: func(tx, event) — re-read the row by cycle id through tx,
+//     assert still active with the same generation (else
+//     applicationcycles.ErrConflict, which rolls the chain back),
+//     applicationcycles.Supersede → saveCycleRecord (active = 0, state
+//     interrupted, stop_reason epoch_superseded, terminal_seq = event.Seq,
+//     summary_handoff), cancel the running attempt (state cancelled, reason
+//     epoch_superseded).
+func PlanEpochFence(tx core.App, roomID string, now time.Time) (eventstore.ChainLink, bool, error)
+```
+
+The command's `findByKey` replay lookup keys on the **started** event's
+idempotency key exactly as today (`service.go:98`, `:225`);
+`acceptableReplayType` is unchanged. `Execute` returns `events[len(events)-1]`
+(the started event) as its result.
+
+Ordering guarantee is structural, not timing-based: the fence is link 0, so
+`fence.Seq = S` and `started.Seq = startsAtSeq = S+1`, and both the
+discovery read and the two inserts happen under one room lock in one
+transaction, so no cycle can become active between them. Every connector
+classifies the fence as historical (case H). A4 in the connector table
+exists only for the reconciler backstop (4.4) and for legacy orphans.
+
+**Observer timing:** neither link is published until the transaction
 commits; then observers receive fence then started, in sequence order. The
 SSE stream and long-poll therefore never expose a fenced cycle without its
 new epoch or vice versa.
@@ -286,23 +347,27 @@ new epoch or vice versa.
 **Exact-retry behaviour:** a retry of the same `start_discussion` command
 (same key + hash) after commit hits the `findByKey` replay at
 `service.go:98` and returns the original `discussion.started`; no second
-fence is attempted. A retry after a rolled-back transaction finds no replay,
-re-runs the preflight, still finds the active cycle (rollback restored it),
-and builds the same two-element chain. A concurrent process that won the
-uniqueness race on either element's `(room, idempotency_key)` causes the
-whole chain to roll back; the existing post-append `findByKey` convergence
-(`service.go:224-231`) returns the winner's started event. There is no
+chain is planned. A retry after a rolled-back transaction finds no replay,
+re-runs the planner inside a new transaction, still finds the active cycle
+(rollback restored it), and builds the same two-link chain. A concurrent
+writer that won the uniqueness race on either link's `(room,
+idempotency_key)`, or a concurrent transaction that changed the cycle row so
+the fence projection's re-read fails, causes the whole chain to roll back
+(`ErrConflict` / unique-constraint error); the existing post-append
+`findByKey` convergence (`service.go:224-231`) returns the winner's started
+event, otherwise the error propagates and the caller retries. There is no
 reachable state with a fence and no started event, or a started event and
 an un-fenced foreign-epoch cycle, except the legacy orphans handled in 4.4.
 
 `cycleservice` additions: `ReasonEpochSuperseded = "epoch_superseded"` and
 `Supersede(c Cycle) Cycle` in `server/application/cycles/cycles.go`
-(identical shape to `Interrupt`, `cycles.go:404`); `FindActiveCycle` and
-`SupersedeProjection` exported from
-`infrastructure/pocketbase/cycleservice` alongside
-`InterruptActiveForHumanMessage` (`service.go:994`). `appendTerminal`
-(`service.go:797`) is not used for the fence; the projection body is shared
-via a small helper so the `discussion_cycles` write stays identical.
+(identical shape to `Interrupt`, `cycles.go:404`); `PlanEpochFence` exported
+from `infrastructure/pocketbase/cycleservice` alongside
+`InterruptActiveForHumanMessage` (`service.go:994`), built on the existing
+lock-free `findActive`/`decodeCycle`/`saveCycleRecord`/`activeAttempt`
+helpers. `appendTerminal` (`service.go:797`) is not used for the fence; the
+`discussion_cycles` write is shared via a small helper so it stays identical
+to the reconciler's.
 
 ### 4.4 Reconciler backstop
 
@@ -318,15 +383,19 @@ boundary terminal, and it emits A4, which both connectors accept.
 | Test | Assertion |
 |---|---|
 | `TestStartDiscussionFencesActiveCycle` | start cycle in epoch E1; execute `start_discussion`; assert events in order `[…, cycle_terminal(interrupted/epoch_superseded, epochId E1) @ S, discussion.started(E2) @ S+1]`; assert `started.payload.epoch.startsAtSeq == S+1 == terminal.seq + 1`; assert `discussion_cycles` row `active=0, state=interrupted, stop_reason=epoch_superseded, terminal_seq=S`; running attempt `state=cancelled, reason=epoch_superseded`; `rooms.head_seq == S+1`. |
-| `TestAppendChainIsAllOrNothing` (eventstore) | two-element chain whose second element's projection returns an error; assert `head_seq` unchanged, zero rows inserted for either key, zero observer notifications; then a chain whose **first** element fails (`ValidateHead`) → same assertions. |
+| `TestAppendChainIsAllOrNothing` (eventstore) | two-link chain whose second link's projection returns an error; assert `head_seq` unchanged, zero rows inserted for either key, zero observer notifications; then a chain whose **first** link fails (`ValidateHead`) → same assertions. |
 | `TestAppendChainObserverOrderAfterCommit` (eventstore) | recording observer; assert it receives exactly `[fence, started]` in that order and only after `RunInTransaction` returns. |
-| `TestStartDiscussionRetryAfterRollbackProducesSingleChain` | inject a failure in the started-element projection on the first call; retry with identical key+hash; assert exactly one fence terminal and one `discussion.started` in the store, fence.seq + 1 == started.seq, same idempotency hash; assert no fence exists after the failed first call. |
+| `TestAppendChainPreviousHashLinkage` (eventstore) | two-link chain; assert `links[1].PrevHash == links[0].Hash`, `links[0].PrevHash == hash of the pre-existing head`, and `links[1].Seq == links[0].Seq + 1 == head_seq`. |
+| `TestAppendChainPlannerErrorAppendsNothing` (eventstore) | planner returns an error; assert `head_seq` unchanged, zero rows, zero notifications, no lock leaked (a subsequent `Append` on the room succeeds). |
+| `TestStartDiscussionRetryAfterRollbackProducesSingleChain` | inject a failure in the started-link projection on the first call; retry with identical key+hash; assert exactly one fence terminal and one `discussion.started` in the store, fence.seq + 1 == started.seq, same idempotency hash; assert no fence exists after the failed first call. |
 | `TestStartDiscussionExactReplayEmitsNoSecondFence` | execute twice with identical key+hash; assert the second call returns the original started event and the event count is unchanged. |
-| `TestStartDiscussionFenceConflictsOnGenerationDrift` | mutate the active cycle generation between preflight and transaction (test hook); assert `ErrConflict` and no rows inserted. |
+| `TestStartDiscussionFenceConflictsOnGenerationDrift` | test hook between the planner's read and the fence projection's re-read mutates the cycle generation through a separate connection; assert `ErrConflict`, no rows inserted, `head_seq` unchanged. |
+| `TestStartDiscussionFencesCycleActivatedAfterCommandLockButBeforeChain` (the formerly missing no-active-cycle race) | room with **no** active cycle; a test hook placed after `commandservice` takes its `(room, key)` lock and before `AppendChain` acquires the room lock runs `cycleservice.Start` (a real cycle in epoch E1 becomes active through its own `events.Append`); then let the chain proceed. Assert the committed chain is `[cycle_terminal(interrupted/epoch_superseded, E1) @ S, discussion.started(E2) @ S+1]`, i.e. the fence was discovered inside the transaction, **not** a lone un-fenced `discussion.started` beside an `active = 1` E1 row. The same test compiled against the removed external-preflight design would produce exactly that un-fenced commit — that assertion is the RED oracle for this correction. |
+| `TestStartDiscussionConcurrentWriterForcesRetryNotUnfencedStart` | two goroutines: G1 executes `start_discussion`; a hook inside G1's planner (after the fence was found, before insert) blocks until G2 has committed a competing write on the same room that changes the fence's cycle row (e.g. `cycleservice` human interruption of that cycle, or its own `start_discussion` with a different key). Assert G1's first attempt returns `ErrConflict`/unique-constraint error with **zero** rows from G1 committed (`head_seq` equals G2's head, no `discussion.started` from G1's key); then G1 retries with the same key+hash and either converges via `findByKey` on G2's started event (same-command case) or commits a fresh chain whose fence, if any, references the now-active cycle. In no interleaving does a `discussion.started` commit while a foreign-epoch `discussion_cycles` row remains `active = 1`. |
 | `TestReconcilerNeverTimesOutForeignEpochCycle` | seed DB with active cycle in E1 and active epoch E2 (pre-fix state); advance clock past deadline; run `ReconcileRoom`; assert emitted terminal is `(interrupted, epoch_superseded)`, **not** `(timed_out, cycle_deadline_reached)`. |
 | `TestClaimOnForeignEpochCycleIsSuperseded` | claim attempt on E1 cycle while E2 active → `ErrSuperseded`/`ErrCycleTerminal`, HTTP `cycle_superseded`. |
 | `TestFixtureCanonicalBytesRoundTrip` (domain) | for each fixture: strip LF, assert stored hash, unmarshal into `domain.Event`, `CanonicalBytes` → sha256 equals stored hash. |
-| Negative | `TestStartDiscussionWithoutActiveCycleEmitsNoFence` — single-element chain; event list contains no `cycle_terminal`; `startsAtSeq == started.seq`. |
+| Negative | `TestStartDiscussionWithoutActiveCycleEmitsNoFence` — single-link chain; event list contains no `cycle_terminal`; `startsAtSeq == started.seq`. |
 
 Evidence receipt: `go test ./server/... -run 'Fence|ForeignEpoch|FixtureCanonical|AppendChain'`
 full output + `go vet ./...` exit code, committed under
@@ -336,30 +405,45 @@ full output + `go vet ./...` exit code, committed under
 
 ### 5.1 OpenClaw Room (`src/runtime.js`)
 
-Two exported helpers, one routing branch. Names are chosen so the scope of
+Three exported helpers, one routing branch. Names are chosen so the scope of
 each check is unambiguous:
 
 ```
-// Structure only. True iff event is discussion.cycle_terminal with nonempty
-// payload.cycleId, internally consistent epoch evidence (payload.epochId,
-// epoch.id, epoch.topic.epochId, topic.epochId, summaryHandoff.epochId all
-// equal where present), and (state, reason, actorRole) in A1–A4.
+// Shared epoch-evidence extractor. Extracted verbatim from the first half of
+// today's eventEpochId (src/runtime.js:1363-1371) and extended by one
+// source. Collects payload.epochId, payload.epoch.id,
+// payload.epoch.topic.epochId, payload.topic.epochId and — only when
+// event.type === "discussion.cycle_terminal" — payload.summaryHandoff.epochId;
+// each present value is validated with exactEpochId. Returns the single
+// distinct value ("" when none present). Throws the existing
+// Error("Room event contains contradictory epoch evidence") when more than
+// one distinct value is present (R5). Every caller below goes through this
+// function; there is no second extractor.
+export function epochEvidence(event)
+
+// Structure only. Calls epochEvidence(event) first — so R5 throws out of
+// this function; it never returns false for R5. Then true iff event is
+// discussion.cycle_terminal with nonempty payload.cycleId and
+// (state, reason, actorRole) in A1–A4; false otherwise.
 // Does NOT look at the page or at seq; it never decides boundary relation.
 export function isLifecycleOnlyCycleTerminal(event)
 
-// Boundary relation only. True iff seq >= pageActiveEpochStartsAtSeq and the
-// event's (consistent) payload epoch is nonempty and differs from
-// pageActiveEpochId. Throws the existing "contradictory" error on R5.
+// Boundary relation only. Calls epochEvidence(event) (R5 throws). True iff
+// seq >= pageActiveEpochStartsAtSeq and the evidence is nonempty and differs
+// from pageActiveEpochId.
 export function isBoundaryEvent(event, pageActiveEpochId, pageActiveEpochStartsAtSeq)
 ```
 
-`eventEpochId()` (`src/runtime.js:1362-1383`) replaces its inline
-`interruptedCycleCleanup` with
-`isLifecycleOnlyCycleTerminal(event)` and otherwise keeps its contract
-(throws on boundary contradiction for everything not lifecycle-only, returns
-the payload epoch for accepted boundary terminals). `eventEpochId` remains the
-fail-closed check; it is called at `src/runtime.js:361` before any routing,
-so R1–R8 still throw before evidence or ack.
+`eventEpochId()` (`src/runtime.js:1362-1383`) replaces its inline evidence
+collection with `epochEvidence(event)` and its inline
+`interruptedCycleCleanup` with `isLifecycleOnlyCycleTerminal(event)`, and
+otherwise keeps its contract (throws on boundary contradiction for
+everything not lifecycle-only, returns the payload epoch for accepted
+boundary terminals). Because `eventEpochId` is called at
+`src/runtime.js:361` before any routing, R1–R8 still throw before evidence
+or ack, and R5 now throws the named contradiction error from the shared
+extractor for terminals whose `summaryHandoff.epochId` disagrees with the
+envelope evidence (today that field is not inspected).
 
 `assignedTurns()` routing change — insert one branch immediately **before**
 the `!isAssignedEvent` branch (`src/runtime.js:384-388`) and after the
@@ -387,13 +471,12 @@ accepted boundary terminal. The `!isAssignedEvent` branch itself is
 unchanged.
 
 `recordTerminalEvidence` persists to the state file (`persistState`,
-`src/runtime.js:546`) before `ackEvent` runs; `validTerminalEvidence`
-(`src/runtime.js:245-255`) accepts any nonempty `reason` for status
-`ignored`, so no state-schema change is needed (verified at 9ce50e4).
-
-Acknowledgement timing: unchanged — evidence persisted first, then
+`src/runtime.js:546`) before `ackEvent` issues
 `POST /rooms/{id}/acknowledgements` with the contiguous frontier (`ackEvent`,
-`src/runtime.js:689-710`). No activity frame, no peer ack.
+`src/runtime.js:689-710`); that ordering is unchanged. `validTerminalEvidence`
+(`src/runtime.js:245-255`) accepts any nonempty `reason` for status
+`ignored`, so no state-schema change is needed (verified at 9ce50e4). No
+activity frame, no peer ack.
 
 ### 5.2 Hermes Room (`adapter.py`, release/1.0.51 baseline)
 
@@ -442,9 +525,11 @@ the stored hash with `assert.equal(sha, STORED[seq])`.
 | Test | RED on 9ce50e4 | GREEN assertions |
 |---|---|---|
 | `fixture 132-134: prior-epoch timed_out terminal is acknowledged as lifecycle-only` | Driver exactly as 2.1 (full `version: 1` state in a temp state file, cursor 131, membership `nnrafww8dv4g7a6`, page `{events:[132,133,134], activeEpochId:"dqb8eamems9yi2e", activeEpochStartsAtSeq:133}`, all client methods except `readEvents`/`acknowledge` and `markContextAcknowledged` as counters). RED assertions (`assert.rejects(iterator.next(), /contradicts the authoritative active epoch boundary/)`): `acks` deep-equals `[132, 133]`; evidence trace deep-equals `[[132,"superseded","historical_epoch"],[133,"ignored","not_assigned_or_technical"]]`; `state.cursor === 133`; `terminalEvidence["134"] === undefined`; all counters 0. | Same driver; `iterator.next()` resolves with the abort/`done` outcome instead of rejecting. Assert `acks` deep-equals `[132, 133, 134]` (one ack per event, contiguous frontier advances by one each time); evidence trace deep-equals `[[132,"superseded","historical_epoch"],[133,"ignored","not_assigned_or_technical"],[134,"ignored","prior_epoch_lifecycle"]]`; `state.cursor === 134`; `deepEqual(state.terminalEvidence, {})`; `pendingEvent === null`; `markContextAcknowledged`, `roomPolicy`, `startDiscussionCycle`, `claimDiscussionAttempt`, `postMessage`, `acknowledgePeerContribution`, `publishActivity` counters all `0`; `deepEqual(state.deliveryIntents, {})`; generator yielded nothing. The evidence for 132 and 133 is byte-identical between RED and GREEN — the fix changes only what happens at 134. |
-| `isLifecycleOnlyCycleTerminal accepts exactly A1–A4` | function absent (import fails) | table-driven over 3.2 rows A1–A4 → `true`; R1–R4, R6 → `false`; R5 → `false` or throw (document which); role mismatches → `false`; non-terminal types → `false`. Pure function: no page argument. |
-| `isBoundaryEvent classifies by seq and epoch only` | function absent | seq < startsAt → `false` regardless of epoch; seq ≥ startsAt & epoch == active → `false`; seq ≥ startsAt & epoch ≠ active → `true`; contradictory evidence → throws `/contradictory/`. Never inspects `type`/`state`/`reason`. |
-| `eventEpochId rejects R1–R8 at the boundary` | partially passes (existing test) | extend existing `accepts only interrupted-cycle cleanup…` test with `completed`, `failed`, `timed_out/human_interrupted`, `cycle_attempt_ready`, `message.posted`, `discussion.started`, missing `cycleId`, `summaryHandoff.epochId` contradicting `epochId` → `/contradicts|contradictory/`. |
+| `isLifecycleOnlyCycleTerminal accepts exactly A1–A4` | function absent (import fails) | table-driven over 3.2 rows A1–A4 → `true`; R1–R4, R6 → `false`; role mismatches → `false`; non-terminal types → `false`. R5 (a `cycle_terminal` whose `summaryHandoff.epochId` differs from `payload.epochId`, and one whose `epoch.id` differs from `payload.epochId`): `assert.throws(() => isLifecycleOnlyCycleTerminal(event), {message: "Room event contains contradictory epoch evidence"})` — it must throw, never return `false`. Pure function: no page argument. |
+| `epochEvidence is the single extractor` | function absent | returns `""` for no evidence; returns the value for each of the five sources alone (`summaryHandoff.epochId` only counted when `type === "discussion.cycle_terminal"`; for a `message.posted` carrying a stray `summaryHandoff.epochId` it is ignored); throws `{message: "Room event contains contradictory epoch evidence"}` for any two distinct values; `eventEpochId(fixture134, "dqb8eamems9yi2e", 133)` and `epochEvidence(fixture134)` both return `qjw1tu1jfnm1wsp`. |
+| `isBoundaryEvent classifies by seq and epoch only` | function absent | seq < startsAt → `false` regardless of epoch; seq ≥ startsAt & epoch == active → `false`; seq ≥ startsAt & epoch ≠ active → `true`; R5 → `assert.throws(…, {message: "Room event contains contradictory epoch evidence"})`. Never inspects `type`/`state`/`reason`. |
+| `eventEpochId rejects R1–R8 at the boundary` | partially passes (existing test) | extend existing `accepts only interrupted-cycle cleanup…` test with `completed`, `failed`, `timed_out/human_interrupted`, `cycle_attempt_ready`, `message.posted`, `discussion.started`, missing `cycleId` → `/contradicts the authoritative active epoch boundary/`; `summaryHandoff.epochId` contradicting `epochId` → `{message: "Room event contains contradictory epoch evidence"}` (RED today: 9ce50e4 ignores `summaryHandoff`). |
+| `R5 terminal in the page loop throws before evidence and ack` | RED: 9ce50e4 ignores `summaryHandoff`, so `eventEpochId` sees only `qjw1tu1jfnm1wsp` and rejects with the boundary error `/contradicts the authoritative active epoch boundary/`, not the contradiction error; the exact-message `assert.rejects` fails | driver as 2.1, but 134 replaced by a copy whose `summaryHandoff.epochId` is `dqb8eamems9yi2e` while `payload.epochId` stays `qjw1tu1jfnm1wsp`: `assert.rejects(iterator.next(), {message: "Room event contains contradictory epoch evidence"})`; `acks` deep-equals `[132, 133]`; `terminalEvidence["134"] === undefined`; `state.cursor === 133`; all counters 0. |
 | `rejected boundary event leaves cursor and ledger untouched` | n/a | feed old-epoch `message.posted` at seq 134 → `assert.rejects(/contradicts/)`; `acknowledge` count 0; `state.cursor === 133`; `terminalEvidence["134"] === undefined`. |
 | `run 134 twice: idempotent evidence, single ack` | n/a | second delivery of 134 after ack: `event.seq <= cursor` short-circuit; ack count unchanged. |
 
@@ -608,18 +693,27 @@ before the restart gate opens.
   `reason` for non-`posted` statuses, so `prior_epoch_lifecycle` needs no
   schema change.
 - `commandservice.Service` (`service.go:30-41`) holds only `events` and an
-  optional `leases`. Decided (4.3): add a `cycles` fence dependency as a
-  variadic constructor option and a new `eventstore.AppendChain`
-  primitive; `Append` delegates to a one-element chain. `BuildPayloadInTx`
-  is **not** a valid host for the fence — it runs after the started event's
-  sequence is already allocated (`store.go:96-110`), so a nested append
-  would land above `startsAtSeq`.
+  optional `leases`. Decided (4.3): no new dependency; the fence is planned
+  by the lock-free package function `cycleservice.PlanEpochFence(tx, …)`
+  inside the `ChainPlanner` callback of the new
+  `eventstore.AppendChain(ctx, roomID, plan)` primitive; `Append` delegates
+  to a one-link chain. `BuildPayloadInTx` is **not** a valid host for the
+  fence — it runs after the started event's sequence is already allocated
+  (`store.go:96-110`), so a nested append would land above `startsAtSeq`.
+  An out-of-transaction active-cycle lookup is **not** a valid preflight
+  either — it races with a cycle activating before the chain commits (4.3,
+  test `TestStartDiscussionFencesCycleActivatedAfterCommandLockButBeforeChain`).
 - `Store.locks` is per room and `commandservice.locks` is per
-  `(room, idempotencyKey)`; `AppendChain` takes only the room lock, so the
-  existing lock order (command key lock → room lock) is unchanged.
-- OpenClaw helper split (5.1): `isLifecycleOnlyCycleTerminal` (structure,
-  no page) and `isBoundaryEvent` (seq/epoch relation, no type/state). The
-  routing branch composes both; `eventEpochId` composes only the first.
+  `(room, idempotencyKey)`; `AppendChain` takes only the room lock and its
+  planner/projections never take `cycleservice.Service.locks`, so the
+  existing lock order (command key lock → room lock) is unchanged and no
+  eventstore → cycleservice mutex edge is introduced.
+- OpenClaw helper split (5.1): `epochEvidence` (single extractor, throws the
+  named contradiction error on R5), `isLifecycleOnlyCycleTerminal`
+  (structure, no page) and `isBoundaryEvent` (seq/epoch relation, no
+  type/state). The routing branch composes the last two; `eventEpochId`
+  composes `epochEvidence` and `isLifecycleOnlyCycleTerminal`. R5 always
+  throws; no helper returns `false` for contradictory evidence.
 - Decide in the plan: Hermes `epoch_boundary_contradiction` as
   `retryable=False` stall (recommended, matches OpenClaw) vs inbox
   quarantine.
