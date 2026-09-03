@@ -3,7 +3,7 @@
   "contract": "synthetic-sociality-room-delivery-lifecycle-v1",
   "contractDocument": "docs/delivery-lifecycle-contract-v1.md",
   "adapter": "synthetic-sociality-room",
-  "adapterVersion": "0.2.37",
+  "adapterVersion": "0.2.38",
   "platform": "OpenClaw",
   "roomProtocol": "external-agent-connector-v1",
   "verifiedFeatures": {
@@ -51,6 +51,12 @@
     "inflight_epoch_advance": "model output is suppressed when the source epoch advances before posting",
     "peer_identity_and_room_target": "routes each Room epoch to a fresh transcript while preserving the outbound Room target and real peer binding"
   },
+  "priorEpochLifecycleTerminals": [
+    {"state": "interrupted", "reason": "human_interrupted", "actorRoles": ["human_owner", "agent_owner"]},
+    {"state": "timed_out", "reason": "cycle_deadline_reached", "actorRoles": ["system"]},
+    {"state": "interrupted", "reason": "coordination_mode_changed", "actorRoles": ["system"]},
+    {"state": "interrupted", "reason": "epoch_superseded", "actorRoles": ["system"]}
+  ],
   "roomOriginOperationalErrorFixtures": {
     "generic_openclaw_error_passes_without_post_or_retry": "generic OpenClaw operational fallback passes without canonical Room post",
     "model_authored_near_match_remains_visible": "model-authored fallback text remains a canonical Room contribution"

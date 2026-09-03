@@ -1,11 +1,26 @@
 import assert from "node:assert/strict";
+import {createHash} from "node:crypto";
 import test from "node:test";
-import {mkdtemp, writeFile} from "node:fs/promises";
+import {mkdtemp, readFile, writeFile} from "node:fs/promises";
 import {tmpdir} from "node:os";
 import {join} from "node:path";
-import {canonicalRoomContext, commandInstruction, cyclePhaseInstruction, epochConversationId, eventEpochId, isAssignedEvent, isAssignedMessage, normalizeEvent, OpenClawRoomRuntime, resolveStandaloneRecipientSelectors, validateActiveEpochPage} from "../src/runtime.js";
+import {canonicalRoomContext, commandInstruction, cyclePhaseInstruction, epochConversationId, epochEvidence, eventEpochId, isAssignedEvent, isAssignedMessage, isBoundaryEvent, isLifecycleOnlyCycleTerminal, normalizeEvent, OpenClawRoomRuntime, resolveStandaloneRecipientSelectors, validateActiveEpochPage} from "../src/runtime.js";
 import {RoomAPIError} from "../src/room-client.js";
 import {loadState, saveState, validateState} from "../src/state.js";
+
+const ZURIE_FIXTURE_HASHES = Object.freeze({
+  132: "136e0ad9f1b82b40338da0def2cecd6fccf2e05dcb70f8838520de23cf2b1194",
+  133: "6891830fa71f0592fd1749ea7cd6361add53e426e84de3ec94bd3024c7345bb4",
+  134: "fa953f52ef58410726a0c61687b88cc7d329874210820b015c93ca638dda0a49",
+});
+
+async function loadZurieFixture(seq) {
+  const bytes = await readFile(new URL(`./fixtures/zurie-epoch-boundary/seq-${seq}.canonical.json`, import.meta.url));
+  assert.equal(bytes.at(-1), 0x0a, `fixture ${seq} must have one repository final LF`);
+  const canonical = bytes.subarray(0, -1);
+  assert.equal(createHash("sha256").update(canonical).digest("hex"), ZURIE_FIXTURE_HASHES[seq]);
+  return JSON.parse(canonical.toString("utf8"));
+}
 
 test("derives stable epoch-scoped conversations and rotates them between epochs", () => {
   assert.match(epochConversationId("room-1", "epoch-1"), /^room-1:epoch:[a-f0-9]{32}$/);
@@ -1225,8 +1240,8 @@ test("active epoch page metadata is an inseparable validated pair and sequence i
   ]) assert.equal(eventEpochId(event, "epoch-new", 10), "", `${event.type} must remain historical without payload metadata`);
 });
 
-test("accepts only interrupted-cycle cleanup after a new epoch boundary", () => {
-  const cleanup = {
+test("accepts exactly the lifecycle-only terminal state, reason, and role table", () => {
+  const terminal = {
     seq: 11,
     type: "discussion.cycle_terminal",
     actorRole: "human_owner",
@@ -1239,12 +1254,169 @@ test("accepts only interrupted-cycle cleanup after a new epoch boundary", () => 
     },
   };
 
-  assert.equal(eventEpochId(cleanup, "epoch-new", 10), "epoch-old");
-  assert.equal(eventEpochId({...cleanup, actorRole: "system", payload: {...cleanup.payload, interruptedByEventId: undefined}}, "epoch-new", 10), "epoch-old");
-  assert.throws(() => eventEpochId({...cleanup, type: "message.posted"}, "epoch-new", 10), /contradicts/i);
-  assert.throws(() => eventEpochId({...cleanup, type: "discussion.cycle_attempt_ready"}, "epoch-new", 10), /contradicts/i);
-  assert.throws(() => eventEpochId({...cleanup, payload: {...cleanup.payload, state: "completed"}}, "epoch-new", 10), /contradicts/i);
-  assert.throws(() => eventEpochId({...cleanup, payload: {...cleanup.payload, reason: "budget_exhausted"}}, "epoch-new", 10), /contradicts/i);
+  const accepted = [
+    terminal,
+    {...terminal, actorRole: "agent_owner"},
+    {...terminal, actorRole: "system", payload: {...terminal.payload, state: "timed_out", reason: "cycle_deadline_reached"}},
+    {...terminal, actorRole: "system", payload: {...terminal.payload, reason: "coordination_mode_changed"}},
+    {...terminal, actorRole: "system", payload: {...terminal.payload, reason: "epoch_superseded"}},
+  ];
+  for (const event of accepted) {
+    assert.equal(isLifecycleOnlyCycleTerminal(event), true);
+    assert.equal(eventEpochId(event, "epoch-new", 10), "epoch-old");
+  }
+
+  const rejected = [
+    {...terminal, actorRole: "system"},
+    {...terminal, type: "message.posted"},
+    {...terminal, type: "discussion.cycle_attempt_ready"},
+    {...terminal, payload: {...terminal.payload, cycleId: ""}},
+    {...terminal, payload: {...terminal.payload, state: "completed"}},
+    {...terminal, payload: {...terminal.payload, state: "failed"}},
+    {...terminal, payload: {...terminal.payload, reason: "budget_exhausted"}},
+    {...terminal, actorRole: "human_owner", payload: {...terminal.payload, state: "timed_out", reason: "cycle_deadline_reached"}},
+  ];
+  for (const event of rejected) {
+    assert.equal(isLifecycleOnlyCycleTerminal(event), false);
+    assert.throws(() => eventEpochId(event, "epoch-new", 10), /contradicts/i);
+  }
+});
+
+test("epoch evidence is shared, exact, and contradiction-safe", () => {
+  assert.equal(epochEvidence({type: "message.posted", payload: {}}), "");
+  for (const payload of [
+    {epochId: "epoch-1"},
+    {epoch: {id: "epoch-1"}},
+    {epoch: {topic: {epochId: "epoch-1"}}},
+    {topic: {epochId: "epoch-1"}},
+  ]) assert.equal(epochEvidence({type: "message.posted", payload}), "epoch-1");
+  assert.equal(epochEvidence({
+    type: "discussion.cycle_terminal", payload: {summaryHandoff: {epochId: "epoch-1"}},
+  }), "epoch-1");
+  assert.equal(epochEvidence({
+    type: "message.posted", payload: {summaryHandoff: {epochId: "ignored"}},
+  }), "");
+  assert.throws(() => epochEvidence({
+    type: "discussion.cycle_terminal",
+    payload: {epochId: "epoch-1", summaryHandoff: {epochId: "epoch-2"}},
+  }), {message: "Room event contains contradictory epoch evidence"});
+});
+
+test("boundary classification depends only on sequence and epoch evidence", () => {
+  const event = {seq: 10, type: "message.posted", payload: {epochId: "epoch-old"}};
+  assert.equal(isBoundaryEvent({...event, seq: 9}, "epoch-new", 10), false);
+  assert.equal(isBoundaryEvent({...event, payload: {epochId: "epoch-new"}}, "epoch-new", 10), false);
+  assert.equal(isBoundaryEvent(event, "epoch-new", 10), true);
+  assert.equal(isBoundaryEvent({...event, payload: {}}, "epoch-new", 10), false);
+  assert.throws(() => isBoundaryEvent({
+    ...event, type: "discussion.cycle_terminal",
+    payload: {epochId: "epoch-old", summaryHandoff: {epochId: "epoch-other"}},
+  }, "epoch-new", 10), {message: "Room event contains contradictory epoch evidence"});
+});
+
+test("fixture 132-134 acknowledges the timed-out terminal as lifecycle-only", async () => {
+  const events = await Promise.all([132, 133, 134].map(loadZurieFixture));
+  const directory = await mkdtemp(join(tmpdir(), "openclaw-room-zurie-epoch-"));
+  const stateFile = join(directory, "default.json");
+  const controller = new AbortController();
+  const runtime = new OpenClawRoomRuntime({accountId: "test", stateFile, baseUrl: "https://room.example/api"});
+  runtime.state = {
+    version: 1, baseUrl: "https://room.example/api", roomId: "bczi4bui9f7q159",
+    membershipId: "nnrafww8dv4g7a6", credential: "redacted", clientInstanceId: "client-1",
+    cursor: 131, messagePayloadDialect: "v2", deliveryIntents: {}, terminalEvidence: {},
+    epochSessionRoutingInitialized: true, legacySessionEpochId: "qjw1tu1jfnm1wsp",
+  };
+  await saveState(stateFile, runtime.state);
+  runtime.connectorSession = {sessionId: "session-1"};
+  const acknowledgements = [];
+  runtime.client = {
+    readEvents: async () => ({
+      activeEpochId: "dqb8eamems9yi2e", activeEpochStartsAtSeq: 133, events,
+    }),
+    acknowledge: async (_state, seq) => {
+      acknowledgements.push(seq);
+      if (seq === 134) controller.abort();
+      return {acknowledgedSeq: seq};
+    },
+    roomPolicy: async () => { throw new Error("room policy must not be read"); },
+    startDiscussionCycle: async () => { throw new Error("cycle must not start"); },
+    claimDiscussionAttempt: async () => { throw new Error("attempt must not be claimed"); },
+    postMessage: async () => { throw new Error("message must not post"); },
+    acknowledgePeerContribution: async () => { throw new Error("peer ack must not run"); },
+  };
+  runtime.maintainPresence = async () => {};
+  runtime.recoverPostedEvidence = async () => false;
+  runtime.recoverPendingDelivery = async () => false;
+  runtime.markContextAcknowledged = async () => { throw new Error("activity acknowledgement must not run"); };
+  runtime.publishActivity = async () => { throw new Error("activity must not publish"); };
+  const evidence = [];
+  const supersedeHistoricalEvent = runtime.supersedeHistoricalEvent.bind(runtime);
+  runtime.supersedeHistoricalEvent = async (event, epochId) => {
+    evidence.push([event.seq, "superseded", "historical_epoch"]);
+    return supersedeHistoricalEvent(event, epochId);
+  };
+  const recordTerminalEvidence = runtime.recordTerminalEvidence.bind(runtime);
+  runtime.recordTerminalEvidence = async (event, status, options) => {
+    evidence.push([event.seq, status, options.reason]);
+    return recordTerminalEvidence(event, status, options);
+  };
+
+  const result = await runtime.assignedTurns(controller.signal).next();
+  assert.equal(result.done, true);
+  assert.deepEqual(acknowledgements, [132, 133, 134]);
+  assert.deepEqual(evidence, [
+    [132, "superseded", "historical_epoch"],
+    [133, "ignored", "not_assigned_or_technical"],
+    [134, "ignored", "prior_epoch_lifecycle"],
+  ]);
+  assert.equal(runtime.state.cursor, 134);
+  assert.deepEqual(runtime.state.terminalEvidence, {});
+  assert.deepEqual(runtime.state.deliveryIntents, {});
+});
+
+test("contradictory fixture terminal fails before evidence or acknowledgement", async () => {
+  const events = await Promise.all([132, 133, 134].map(loadZurieFixture));
+  events[2] = structuredClone(events[2]);
+  events[2].payload.summaryHandoff.epochId = "dqb8eamems9yi2e";
+  const directory = await mkdtemp(join(tmpdir(), "openclaw-room-zurie-contradiction-"));
+  const stateFile = join(directory, "default.json");
+  const runtime = new OpenClawRoomRuntime({accountId: "test", stateFile, baseUrl: "https://room.example/api"});
+  runtime.state = {
+    version: 1, baseUrl: "https://room.example/api", roomId: "bczi4bui9f7q159",
+    membershipId: "nnrafww8dv4g7a6", credential: "redacted", clientInstanceId: "client-1",
+    cursor: 131, messagePayloadDialect: "v2", deliveryIntents: {}, terminalEvidence: {},
+    epochSessionRoutingInitialized: true, legacySessionEpochId: "qjw1tu1jfnm1wsp",
+  };
+  await saveState(stateFile, runtime.state);
+  runtime.connectorSession = {sessionId: "session-1"};
+  const acknowledgements = [];
+  runtime.client = {
+    readEvents: async () => ({
+      activeEpochId: "dqb8eamems9yi2e", activeEpochStartsAtSeq: 133, events,
+    }),
+    acknowledge: async (_state, seq) => {
+      acknowledgements.push(seq);
+      return {acknowledgedSeq: seq};
+    },
+    roomPolicy: async () => { throw new Error("room policy must not be read"); },
+    startDiscussionCycle: async () => { throw new Error("cycle must not start"); },
+    claimDiscussionAttempt: async () => { throw new Error("attempt must not be claimed"); },
+    postMessage: async () => { throw new Error("message must not post"); },
+    acknowledgePeerContribution: async () => { throw new Error("peer ack must not run"); },
+  };
+  runtime.maintainPresence = async () => {};
+  runtime.recoverPostedEvidence = async () => false;
+  runtime.recoverPendingDelivery = async () => false;
+  runtime.markContextAcknowledged = async () => { throw new Error("activity acknowledgement must not run"); };
+  runtime.publishActivity = async () => { throw new Error("activity must not publish"); };
+
+  await assert.rejects(runtime.assignedTurns(new AbortController().signal).next(), {
+    message: "Room event contains contradictory epoch evidence",
+  });
+  assert.deepEqual(acknowledgements, [132, 133]);
+  assert.equal(runtime.state.cursor, 133);
+  assert.equal(runtime.state.terminalEvidence["134"], undefined);
+  assert.deepEqual(runtime.state.deliveryIntents, {});
 });
 
 test("epoch conversation discriminator is bounded, opaque, and stable", () => {

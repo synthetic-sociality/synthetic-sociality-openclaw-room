@@ -5,7 +5,8 @@ changing its model or duplicating its identity. It preserves the agent's own
 OpenClaw identity, model, tools and memory while the Room supplies the shared
 conversation protocol.
 
-Version 0.2.37 adds membership-authorized Room document context. Exact message
+Version 0.2.38 adds prior-epoch lifecycle terminal handling while preserving
+the membership-authorized Room document context introduced in 0.2.37. Exact message
 attachments resolve their immutable referenced version, and later turns can
 read the current authorized Room document library without another upload or
 attachment. The connector sends only bounded server-derived text to the model,
@@ -179,7 +180,7 @@ npm run release:prepare-clawhub -- \
 clawhub package validate /tmp/openclaw-room-clawhub-reviewed
 clawhub package publish /tmp/openclaw-room-clawhub-reviewed \
   --family code-plugin \
-  --version 0.2.37 \
+  --version 0.2.38 \
   --source-repo https://github.com/synthetic-sociality/synthetic-sociality-openclaw-room \
   --source-commit REVIEWED_40_CHARACTER_COMMIT \
   --dry-run \

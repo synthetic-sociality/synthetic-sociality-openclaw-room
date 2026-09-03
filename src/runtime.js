@@ -381,6 +381,12 @@ export class OpenClawRoomRuntime {
           await this.ackEvent(event);
           continue;
         }
+        if (isLifecycleOnlyCycleTerminal(event)
+            && isBoundaryEvent(event, pageActiveEpochId, pageEpoch.startsAtSeq)) {
+          await this.recordTerminalEvidence(event, "ignored", {reason: "prior_epoch_lifecycle"});
+          await this.ackEvent(event);
+          continue;
+        }
         if (!isAssignedEvent(event, this.state.membershipId)) {
           await this.recordTerminalEvidence(event, "ignored", {reason: "not_assigned_or_technical"});
           await this.ackEvent(event);
@@ -1359,24 +1365,58 @@ export function validateActiveEpochPage(page) {
   return {id, startsAtSeq};
 }
 
-export function eventEpochId(event, pageActiveEpochId = "", pageActiveEpochStartsAtSeq = 0) {
+export function epochEvidence(event) {
   const payload = eventPayload(event?.payload);
-  const evidence = [payload.epochId, payload.epoch?.id, payload.epoch?.topic?.epochId, payload.topic?.epochId]
+  const evidence = [
+    payload.epochId,
+    payload.epoch?.id,
+    payload.epoch?.topic?.epochId,
+    payload.topic?.epochId,
+    event?.type === "discussion.cycle_terminal" ? payload.summaryHandoff?.epochId : undefined,
+  ]
     .filter((value) => value !== undefined && value !== null && value !== "")
-    .map((value) => {
-      return exactEpochId(value, "Malformed Room event epoch evidence");
-    });
+    .map((value) => exactEpochId(value, "Malformed Room event epoch evidence"));
   const unique = [...new Set(evidence)];
   if (unique.length > 1) throw new Error("Room event contains contradictory epoch evidence");
-  const payloadEpochId = unique[0] ?? "";
+  return unique[0] ?? "";
+}
+
+const PRIOR_EPOCH_LIFECYCLE_TERMINALS = new Set([
+  "human_owner\u0000interrupted\u0000human_interrupted",
+  "agent_owner\u0000interrupted\u0000human_interrupted",
+  "system\u0000timed_out\u0000cycle_deadline_reached",
+  "system\u0000interrupted\u0000coordination_mode_changed",
+  "system\u0000interrupted\u0000epoch_superseded",
+]);
+
+export function isLifecycleOnlyCycleTerminal(event) {
+  epochEvidence(event);
+  const payload = eventPayload(event?.payload);
+  if (event?.type !== "discussion.cycle_terminal" || !String(payload.cycleId ?? "").trim()) return false;
+  return PRIOR_EPOCH_LIFECYCLE_TERMINALS.has([
+    String(event.actorRole ?? ""),
+    String(payload.state ?? ""),
+    String(payload.reason ?? ""),
+  ].join("\u0000"));
+}
+
+export function isBoundaryEvent(event, pageActiveEpochId, pageActiveEpochStartsAtSeq) {
+  const payloadEpochId = epochEvidence(event);
+  return Number.isSafeInteger(event?.seq)
+    && Number.isSafeInteger(pageActiveEpochStartsAtSeq)
+    && pageActiveEpochStartsAtSeq > 0
+    && event.seq >= pageActiveEpochStartsAtSeq
+    && Boolean(payloadEpochId)
+    && Boolean(pageActiveEpochId)
+    && payloadEpochId !== pageActiveEpochId;
+}
+
+export function eventEpochId(event, pageActiveEpochId = "", pageActiveEpochStartsAtSeq = 0) {
+  const payloadEpochId = epochEvidence(event);
   const historical = Number.isSafeInteger(event?.seq) && Number.isSafeInteger(pageActiveEpochStartsAtSeq)
     && pageActiveEpochStartsAtSeq > 0 && event.seq < pageActiveEpochStartsAtSeq;
-  const interruptedCycleCleanup = event?.type === "discussion.cycle_terminal"
-    && String(payload.cycleId ?? "").trim() !== ""
-    && String(payload.state ?? "") === "interrupted"
-    && String(payload.reason ?? "") === "human_interrupted";
   if (!historical && payloadEpochId && pageActiveEpochId && payloadEpochId !== pageActiveEpochId
-    && !interruptedCycleCleanup) {
+    && !isLifecycleOnlyCycleTerminal(event)) {
     throw new Error("Room event epoch evidence contradicts the authoritative active epoch boundary");
   }
   return payloadEpochId || (historical ? "" : exactEpochId(pageActiveEpochId, "Room page active epoch"));
