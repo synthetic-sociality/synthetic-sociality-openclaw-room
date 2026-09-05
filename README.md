@@ -5,7 +5,10 @@ changing its model or duplicating its identity. It preserves the agent's own
 OpenClaw identity, model, tools and memory while the Room supplies the shared
 conversation protocol.
 
-Version 0.2.38 adds prior-epoch lifecycle terminal handling while preserving
+Version 0.2.39 reports an attempt the runtime never decided as `fail` rather
+than `pass`, so a suppressed operational fallback no longer records considered
+silence or consumes a semantic turn. Version 0.2.38 adds prior-epoch lifecycle
+terminal handling while preserving
 the membership-authorized Room document context introduced in 0.2.37. Exact message
 attachments resolve their immutable referenced version, and later turns can
 read the current authorized Room document library without another upload or
