@@ -59,7 +59,7 @@ function context(account, controller = new AbortController()) {
 
 test("generic OpenClaw operational fallback passes without canonical Room post", async () => {
   const fallback = "⚠️ Auto-compaction could not recover this turn. I kept this conversation mapped to the current session. Please try again, use /compact, or use /new to start a fresh session.\n\nTo prevent this, increase your compaction buffer by setting `agents.defaults.compaction.reserveTokensFloor` to 20000 or higher in your config.";
-  const calls = {post: 0, pass: 0, skipped: [], ack: []};
+  const calls = {post: 0, settled: [], skipped: [], ack: []};
   const event = {
     id: "event-error", sourceEventId: "event-error", respondsToId: "event-error",
     roomId: "room-1", epochId: "epoch-1", conversationId: "room-1:epoch:error",
@@ -72,8 +72,8 @@ test("generic OpenClaw operational fallback passes without canonical Room post",
     assignedTurns: async function* () { yield event; },
     markTurnReading: async () => {},
     postAndFinish: async () => { calls.post += 1; return {eventId: "posted-error", sentAt: 1}; },
-    passDiscussionAttempt: async (attempt) => {
-      calls.pass += 1;
+    settleDiscussionAttempt: async (attempt, action) => {
+      calls.settled.push(action);
       assert.equal(attempt, event.cycleAttempt);
     },
     recordSkipped: async (eventId, reason) => calls.skipped.push([eventId, reason]),
@@ -99,7 +99,7 @@ test("generic OpenClaw operational fallback passes without canonical Room post",
 
   assert.deepEqual(calls, {
     post: 0,
-    pass: 1,
+    settled: ["fail"],
     skipped: [["event-error", "gateway_operational_error"]],
     ack: ["event-error"],
   });
@@ -114,7 +114,7 @@ test("operational fallback classification is exact and requires trusted error me
 
 test("model-authored fallback text remains a canonical Room contribution", async () => {
   const fallback = "⚠️ Something went wrong while processing your request. Please try again, or use /new to start a fresh session.";
-  const calls = {post: 0, pass: 0, skipped: [], ack: []};
+  const calls = {post: 0, settled: [], skipped: [], ack: []};
   const event = {
     id: "event-visible", sourceEventId: "event-visible", respondsToId: "event-visible",
     roomId: "room-1", epochId: "epoch-1", conversationId: "room-1:epoch:visible",
@@ -131,7 +131,7 @@ test("model-authored fallback text remains a canonical Room contribution", async
       assert.equal(text, fallback);
       return {eventId: "posted-visible", sentAt: 1};
     },
-    passDiscussionAttempt: async () => { calls.pass += 1; },
+    settleDiscussionAttempt: async (_attempt, action) => { calls.settled.push(action); },
     recordSkipped: async (eventId, reason) => calls.skipped.push([eventId, reason]),
     ack: async (eventId) => calls.ack.push(eventId),
     close: async () => {},
@@ -154,7 +154,7 @@ test("model-authored fallback text remains a canonical Room contribution", async
 
   assert.deepEqual(calls, {
     post: 1,
-    pass: 0,
+    settled: [],
     skipped: [],
     ack: ["event-visible"],
   });

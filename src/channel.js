@@ -162,6 +162,8 @@ export function createRoomChannel({makeClient}) {
             let cycleSettled = false;
             let visibleReplySent = false;
             let operationalFallbackSuppressed = false;
+            // A handler that throws never reached a deliberate decision either.
+            let handlerCompleted = false;
             ctx.setStatus({...ctx.getStatus(), running: true, connected: true, lastInboundAt: Date.now(), lastError: null});
             await client.markTurnReading(event.sourceEventId ?? event.id, ctx.abortSignal);
             try {
@@ -262,9 +264,13 @@ export function createRoomChannel({makeClient}) {
                 },
               },
               });
+              handlerCompleted = true;
             } finally {
               if (event.cycleAttempt && !cycleSettled) {
-                await client.passDiscussionAttempt(event.cycleAttempt, ctx.abortSignal);
+                // The skip record one line below already distinguishes these two
+                // cases; the attempt outcome must not throw that away.
+                const action = operationalFallbackSuppressed || !handlerCompleted ? "fail" : "pass";
+                await client.settleDiscussionAttempt(event.cycleAttempt, action, ctx.abortSignal);
               }
             }
             if (!visibleReplySent) {

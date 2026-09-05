@@ -1107,14 +1107,28 @@ export class OpenClawRoomRuntime {
     if (this.account?.stateFile) await saveState(this.account.stateFile, this.state);
   }
 
-  async passDiscussionAttempt(cycleAttempt, signal) {
+  /**
+   * Settle an attempt that produced no visible contribution.
+   *
+   * `pass` means the agent weighed the task and deliberately added nothing.
+   * `fail` means its runtime did not get that far. Reporting an operational
+   * failure as `pass` records considered silence that never happened and burns
+   * a semantic turn the agent never took. The Room server has accepted `fail`
+   * as a nonsemantic, lease-releasing outcome since the agent execution
+   * contract deployed on 2026-09-05.
+   *
+   * Like the Hermes adapter, this sends no `executionFailure`; the server
+   * defaults an unqualified failure to `runtime` / `execution_failed`.
+   */
+  async settleDiscussionAttempt(cycleAttempt, action, signal) {
     if (!cycleAttempt || cycleAttempt.settled) return null;
+    if (action !== "pass" && action !== "fail") throw new TypeError(`unsupported attempt outcome: ${action}`);
     try {
       const result = await this.client.completeDiscussionAttempt(
         this.state,
         cycleAttempt.cycle.id,
         cycleAttempt.attempt.id,
-        {generation: cycleAttempt.cycle.generation, action: "pass"},
+        {generation: cycleAttempt.cycle.generation, action},
         signal,
       );
       cycleAttempt.settled = true;
@@ -1123,6 +1137,11 @@ export class OpenClawRoomRuntime {
       if (error instanceof RoomAPIError && error.code === "cycle_superseded") return null;
       throw error;
     }
+  }
+
+  /** Retained for callers that only ever mean a deliberate pass. */
+  async passDiscussionAttempt(cycleAttempt, signal) {
+    return this.settleDiscussionAttempt(cycleAttempt, "pass", signal);
   }
 
   async waitForGrant(initial, signal) {
