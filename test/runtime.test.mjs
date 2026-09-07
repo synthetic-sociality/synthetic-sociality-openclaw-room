@@ -153,6 +153,52 @@ test("initializes one connector session when native startup and event polling ov
   await runtime.close();
 });
 
+test("persists an owner-approved Room before hot activation without a gateway restart", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "openclaw-room-enrollment-"));
+  const sourceFile = join(directory, "default.json");
+  const sourceState = {
+    version: 1, baseUrl: "https://room.example/api", roomId: "room-1",
+    membershipId: "member-1", credential: "secret-1", identityVersion: 3,
+    clientInstanceId: "client-1", cursor: 5,
+  };
+  await saveState(sourceFile, sourceState);
+  const activations = [];
+  const runtime = new OpenClawRoomRuntime(
+    {accountId: "default", stateFile: sourceFile, baseUrl: sourceState.baseUrl},
+    {
+      activateEnrollment: async (activation) => {
+        const persisted = await loadState(activation.stateFile);
+        activations.push({activation, persisted});
+      },
+    },
+  );
+  runtime.state = sourceState;
+  runtime.client = {
+    connectorEnrollments: async (state) => {
+      assert.equal(state.clientInstanceId, "client-1");
+      return [{invitationId: "invite-2", roomTitle: "WAM GGF3"}];
+    },
+    claimConnectorEnrollment: async (state, invitationId) => {
+      assert.equal(state.clientInstanceId, "client-1");
+      assert.equal(invitationId, "invite-2");
+      return {
+        roomId: "room-2", membershipId: "member-2", credential: "secret-2",
+        credentialExpiresAt: "2026-12-01T00:00:00Z", identityVersion: 3, headSeq: 7,
+      };
+    },
+  };
+
+  const activated = await runtime.acceptConnectorEnrollments();
+  assert.equal(activated.length, 1);
+  assert.equal(activations.length, 1);
+  assert.equal(activations[0].activation.accountId, "member-2");
+  assert.equal(activations[0].persisted.roomId, "room-2");
+  assert.equal(activations[0].persisted.membershipId, "member-2");
+  assert.equal(activations[0].persisted.credential, "secret-2");
+  assert.equal(activations[0].persisted.clientInstanceId, "client-1");
+  assert.equal(activations[0].persisted.cursor, 7);
+});
+
 test("verified build provenance stays embedded without violating strict registration metadata", async () => {
   const directory=await mkdtemp(join(tmpdir(),"openclaw-room-provenance-")); const stateFile=join(directory,"default.json");
   await saveState(stateFile,{version:1,baseUrl:"https://room.example/api",roomId:"room-1",membershipId:"member-1",credential:"secret",clientInstanceId:"client-1",cursor:0});

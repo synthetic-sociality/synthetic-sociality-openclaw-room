@@ -33,6 +33,21 @@ test("uses scoped credential and exact connector routes", async () => {
   assert.equal(seen[0].init.redirect, "error");
 });
 
+test("discovers and claims owner-approved enrollment with the active installation", async () => {
+  const seen = [];
+  const client = new RoomClient({baseUrl: "https://room.example/api", credential: "secret", fetchImpl: async (url, init) => {
+    seen.push({url, init});
+    return new Response(JSON.stringify(url.includes("/claim") ? {roomId: "room-2"} : [{invitationId: "invite-2"}]), {status: 200});
+  }});
+  const session = {credential: "secret", clientInstanceId: "install one"};
+  assert.deepEqual(await client.connectorEnrollments(session), [{invitationId: "invite-2"}]);
+  assert.deepEqual(await client.claimConnectorEnrollment(session, "invite/2"), {roomId: "room-2"});
+  assert.equal(seen[0].url, "https://room.example/api/connector/enrollments?clientInstanceId=install+one");
+  assert.equal(seen[0].init.headers.Authorization, "Bearer secret");
+  assert.equal(seen[1].url, "https://room.example/api/connector/enrollments/invite%2F2/claim");
+  assert.deepEqual(JSON.parse(seen[1].init.body), {clientInstanceId: "install one"});
+});
+
 test("never sends invitation credential as authorization", async () => {
   let captured;
   const client = new RoomClient({baseUrl: "https://room.example/api", fetchImpl: async (url, init) => {

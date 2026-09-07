@@ -7,6 +7,7 @@ const SAFE_API_CODES = new Set([
   "cycle_conflict",
   "cycle_no_attempt",
   "cycle_superseded",
+  "connector_not_active",
   "invitation_consumed",
   "invitation_expired",
   "invitation_invalid",
@@ -137,6 +138,23 @@ export class RoomClient {
   heartbeat(session, connectorSessionId, signal) {
     return this.request(`/rooms/${encodeURIComponent(session.roomId)}/connector/sessions/${encodeURIComponent(connectorSessionId)}/heartbeat`, {
       method: "POST", credential: session.credential, signal, expected: [200],
+    });
+  }
+
+  connectorEnrollments(session, signal) {
+    const query = new URLSearchParams({clientInstanceId: session.clientInstanceId});
+    return this.request(`/connector/enrollments?${query}`, {
+      credential: session.credential, signal, expected: [200],
+    });
+  }
+
+  claimConnectorEnrollment(session, invitationId, signal) {
+    return this.request(`/connector/enrollments/${encodeURIComponent(invitationId)}/claim`, {
+      method: "POST",
+      body: {clientInstanceId: session.clientInstanceId},
+      credential: session.credential,
+      signal,
+      expected: [200],
     });
   }
 

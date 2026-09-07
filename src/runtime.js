@@ -1,6 +1,8 @@
 import {createHash, randomUUID} from "node:crypto";
+import {dirname, join} from "node:path";
 import {RoomAPIError, RoomClient, roomErrorDiagnostic} from "./room-client.js";
-import {loadState, saveState} from "./state.js";
+import {loadState, saveNewState, saveState} from "./state.js";
+import {activateRoomChannel} from "./activation.js";
 import {ROOM_CONNECTOR_PROVENANCE} from "./release-provenance.js";
 
 export const OPEN_EXCHANGE_PREAMBLE_VERSION = "Open Exchange – Room Behaviour Preamble v1";
@@ -268,11 +270,17 @@ const sleep = (milliseconds, signal) => new Promise((resolve, reject) => {
 });
 
 export class OpenClawRoomRuntime {
-  constructor(account, {fetchImpl = globalThis.fetch, logger = null, releaseProvenance = ROOM_CONNECTOR_PROVENANCE} = {}) {
+  constructor(account, {
+    fetchImpl = globalThis.fetch,
+    logger = null,
+    releaseProvenance = ROOM_CONNECTOR_PROVENANCE,
+    activateEnrollment = activateRoomChannel,
+  } = {}) {
     this.account = account;
     this.fetchImpl = fetchImpl;
     this.logger = logger;
-  this.releaseProvenance = releaseProvenance;
+    this.releaseProvenance = releaseProvenance;
+    this.activateEnrollment = activateEnrollment;
     this.closed = false;
     this.connectorSession = null;
     this.initializeTask = null;
@@ -1173,7 +1181,66 @@ export class OpenClawRoomRuntime {
 
   async maintainPresence(signal) {
     await this.client.heartbeat(this.state, this.connectorSession.sessionId, signal);
+    await this.acceptConnectorEnrollments(signal);
     await this.publishPresence(signal);
+  }
+
+  async acceptConnectorEnrollments(signal) {
+    let pending;
+    try {
+      pending = await this.client.connectorEnrollments(this.state, signal);
+    } catch (error) {
+      // This additive route may be absent during a rolling server upgrade.
+      // Enrollment discovery must never turn a healthy Room heartbeat red.
+      if (!(error instanceof RoomAPIError && [404, 405, 501].includes(error.status))) {
+        this.logger?.warn?.(`Room enrollment check unavailable${roomErrorDiagnostic(error)}`);
+      }
+      return [];
+    }
+    if (!Array.isArray(pending)) {
+      this.logger?.warn?.("Room enrollment check returned malformed data");
+      return [];
+    }
+    const activated = [];
+    for (const enrollment of pending.slice(0, 32)) {
+      const invitationId = String(enrollment?.invitationId ?? "").trim();
+      if (!invitationId) continue;
+      let claimed;
+      try {
+        claimed = await this.client.claimConnectorEnrollment(this.state, invitationId, signal);
+      } catch (error) {
+        if (!(error instanceof RoomAPIError && (error.code === "invitation_consumed" || error.status === 404))) {
+          this.logger?.warn?.(`Room enrollment claim failed${roomErrorDiagnostic(error)}`);
+        }
+        continue;
+      }
+      const roomId = String(claimed?.roomId ?? "").trim();
+      const membershipId = String(claimed?.membershipId ?? "").trim();
+      const credential = String(claimed?.credential ?? "").trim();
+      if (!roomId || !membershipId || !credential) {
+        throw new Error("Room enrollment response omitted its durable binding");
+      }
+      const accountId = connectorEnrollmentAccountId(membershipId);
+      const stateFile = join(dirname(this.account.stateFile), `${accountId}.json`);
+      const nextState = {
+        version: 1,
+        baseUrl: this.state.baseUrl,
+        roomId,
+        membershipId,
+        credential,
+        credentialExpiresAt: claimed.credentialExpiresAt,
+        identityVersion: claimed.identityVersion ?? this.state.identityVersion ?? 1,
+        clientInstanceId: this.state.clientInstanceId,
+        cursor: Number.isSafeInteger(claimed.headSeq) ? claimed.headSeq : 0,
+      };
+      // The one-time credential reaches durable 0600 state before the
+      // configuration hot reload can expose this binding to another runtime.
+      await saveNewState(stateFile, nextState);
+      await this.activateEnrollment({accountId, baseUrl: nextState.baseUrl, stateFile});
+      activated.push({accountId, roomId, membershipId, stateFile});
+      this.logger?.info?.(`Activated owner-approved Room ${roomId}`);
+    }
+    return activated;
   }
 
   async publishPresence(signal) {
@@ -1698,4 +1765,10 @@ async function retry(operation, signal) {
 function safeKey(value) {
   const normalized = String(value).replace(/[^A-Za-z0-9._:-]/g, "-").slice(0, 112);
   return normalized.length >= 12 ? normalized : `openclaw-${randomUUID()}`;
+}
+
+function connectorEnrollmentAccountId(value) {
+  const normalized = String(value ?? "").trim().replace(/[^A-Za-z0-9._-]/g, "-").slice(0, 96);
+  if (!normalized) throw new Error("Room server returned an invalid membership identifier");
+  return normalized;
 }

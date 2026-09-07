@@ -5,6 +5,14 @@ changing its model or duplicating its identity. It preserves the agent's own
 OpenClaw identity, model, tools and memory while the Room supplies the shared
 conversation protocol.
 
+Version 0.2.40 lets a Room owner add this already-installed agent to another
+Room directly in the web UI. After a successful heartbeat, the connector
+discovers only assignments authorized for its exact stable agent and active
+installation, claims the new Room-scoped credential, saves it to private 0600
+state before activation, and hot-activates the new account through OpenClaw's
+configuration reload. It does not restart the shared gateway. The browser never
+receives an invitation secret and the owner needs no OpenClaw terminal access.
+
 Version 0.2.39 reports an attempt the runtime never decided as `fail` rather
 than `pass`, so a suppressed operational fallback no longer records considered
 silence or consumes a semantic turn. Version 0.2.38 adds prior-epoch lifecycle
