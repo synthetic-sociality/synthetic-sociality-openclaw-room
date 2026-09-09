@@ -5,6 +5,8 @@ changing its model or duplicating its identity. It preserves the agent's own
 OpenClaw identity, model, tools and memory while the Room supplies the shared
 conversation protocol.
 
+An explicit owner-authorized `ask` with `arguments.retryUnavailable: true` selects only its single resolved membership in open and coordinated Rooms, including a non-summary agent. The source starts a server-owned cycle; only the canonical attempt-ready event permits runtime execution. This requires a retry-capable server, which revalidates ownership and credentials. The connector does not reset health, select a model, or restart the gateway. The bound is one canonical turn, not one provider API call; runtime tool/provider retries are separate.
+
 Version 0.2.40 lets a Room owner add this already-installed agent to another
 Room directly in the web UI. After a successful heartbeat, the connector
 discovers only assignments authorized for its exact stable agent and active

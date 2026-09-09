@@ -459,6 +459,35 @@ test("human source starts one server-owned cycle but only its ready event claims
   assert.equal(starts[0].sourceEventId, "human-event");
 });
 
+test("explicit owner retry targets only the non-summary agent and never calls a model at source delivery", async () => {
+  const event = {id: "retry", type: "human.command", actorRole: "human_owner", payload: {command: {
+    command: "ask", resolvedTargetMembershipIds: ["second"], arguments: {instruction: "Try once", retryUnavailable: true},
+  }}};
+  assert.equal(isAssignedEvent(event, "second"), true);
+  assert.equal(isAssignedEvent(event, "first"), false);
+  assert.equal(isAssignedEvent({...event, actorRole: "participant_agent"}, "second"), false);
+  for (const mode of ["open", "coordinated"]) {
+    const runtime = new OpenClawRoomRuntime({accountId: "default", stateFile: "/unused", baseUrl: "https://room.example/api"});
+    runtime.state = {roomId: "room-1", membershipId: "second"};
+    const starts = [];
+    runtime.client = {
+      roomPolicy: async () => ({coordinationMode: mode, summaryCoordinatorMembershipId: "first"}),
+      roomState: async () => ({activeEpoch: {id: "epoch-1"}, roster: ["first", "second"].map(membershipId => ({
+        membershipId, displayName: membershipId, status: "active", role: "participant_agent", executionReady: false,
+      }))}),
+      startDiscussionCycle: async (_state, request) => { starts.push(request); return {id: "retry-cycle"}; },
+      claimDiscussionAttempt: async () => { throw new Error("source must not claim or execute"); },
+    };
+    assert.equal(await runtime.prepareCycleAttempt(event), false);
+    assert.deepEqual(starts[0].roster, [{membershipId: "second", displayName: "second"}]);
+    assert.equal(starts[0].sourceEventId, "retry");
+  }
+  for (const args of [{}, {retryUnavailable: "true"}]) {
+    assert.equal(isAssignedEvent({...event, payload: {command: {...event.payload.command, arguments: args}}}, "second"), false);
+  }
+  assert.equal(isAssignedEvent({...event, payload: {command: {...event.payload.command, resolvedTargetMembershipIds: ["first", "second"]}}}, "second"), false);
+});
+
 test("eligible agent contribution seeds once while a cycle-bound contribution continues its cycle", async () => {
   const runtime = new OpenClawRoomRuntime({accountId: "default", stateFile: "/unused", baseUrl: "https://room.example/api"});
   runtime.state = {roomId: "room-1", membershipId: "reader-member"};

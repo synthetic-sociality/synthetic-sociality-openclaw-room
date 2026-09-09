@@ -488,9 +488,14 @@ export class OpenClawRoomRuntime {
       roster = roster.filter((member) => selected.has(String(member.membershipId)));
     } else if (resolved?.size) roster = roster.filter((member) => resolved.has(String(member.membershipId)));
     if (event.type === "human.command") {
-      const policy = await this.client.roomPolicy(this.state, signal);
-      const coordinator = String(policy.summaryCoordinatorMembershipId ?? "");
-      roster = roster.filter((member, index) => String(member.membershipId) === coordinator || (!coordinator && index === 0));
+      if (isExplicitExecutionRetry(event)) {
+        const targets = payload.command.resolvedTargetMembershipIds;
+        roster = roster.filter((member) => targets.includes(String(member.membershipId)));
+      } else {
+        const policy = await this.client.roomPolicy(this.state, signal);
+        const coordinator = String(policy.summaryCoordinatorMembershipId ?? "");
+        roster = roster.filter((member, index) => String(member.membershipId) === coordinator || (!coordinator && index === 0));
+      }
     }
     if (!roster.some((member) => String(member.membershipId) === this.state.membershipId)) return null;
     const agents = roster.map((member) => ({membershipId: String(member.membershipId), displayName: String(member.displayName || "Agent")}));
@@ -1378,7 +1383,8 @@ export function isAssignedEvent(event, membershipId) {
   if (event?.type === "discussion.cycle_attempt_ready") {
     return String(eventPayload(event.payload).membershipId ?? "") === String(membershipId);
   }
-  if (event?.type === "human.command") return isHumanCycleSource(event);
+  if (event?.type === "human.command") return isHumanCycleSource(event)
+    && (!isExplicitExecutionRetry(event) || eventPayload(event.payload).command.resolvedTargetMembershipIds.includes(String(membershipId)));
   return isAssignedMessage(event, membershipId);
 }
 
@@ -1400,7 +1406,17 @@ function isHumanCycleSource(event) {
   if (!(role === "human" || role.startsWith("human_") || role === "agent_owner")) return false;
   if (event?.type === "message.posted") return true;
   const command = eventPayload(event?.payload).command;
-  return event?.type === "human.command" && command?.command === "summarize";
+  return event?.type === "human.command" && (command?.command === "summarize" || isExplicitExecutionRetry(event));
+}
+
+// Only canonical, explicitly targeted retry intent opts into this ask path.
+// Ownership and execution admission remain server decisions, never model prose.
+function isExplicitExecutionRetry(event) {
+  const command = eventPayload(event?.payload).command;
+  return event?.type === "human.command" && command?.command === "ask"
+    && command?.arguments?.retryUnavailable === true
+    && Array.isArray(command.resolvedTargetMembershipIds) && command.resolvedTargetMembershipIds.length === 1
+    && (!command.targetSelectors || command.targetSelectors.length === 0);
 }
 
 function isAgentCycleSeed(event) {
