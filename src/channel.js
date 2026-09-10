@@ -153,7 +153,7 @@ export function createRoomChannel({makeClient}) {
           ctx.setStatus({...ctx.getStatus(), running: true, connected: false, lastError: null});
           await markChannelActive(ctx.accountId);
           registered = true;
-          client = makeClient(ctx.account, {logger: ctx.log});
+          client = makeClient(ctx.account, {logger: ctx.log, waitForRenewal: true});
           const session = await client.initialize(ctx.abortSignal);
           live.set(ctx.accountId, {token: ownership.token, client, abortSignal: ctx.abortSignal});
           ctx.setStatus({...ctx.getStatus(), running: true, connected: true, lastConnectedAt: Date.now(), lastError: null});

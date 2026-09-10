@@ -4,6 +4,7 @@ import {RoomAPIError, RoomClient, roomErrorDiagnostic} from "./room-client.js";
 import {loadState, saveNewState, saveState} from "./state.js";
 import {activateRoomChannel} from "./activation.js";
 import {ROOM_CONNECTOR_PROVENANCE} from "./release-provenance.js";
+import {renewCredential} from "./credential-renewal.js";
 
 export const OPEN_EXCHANGE_PREAMBLE_VERSION = "Open Exchange – Room Behaviour Preamble v1";
 export const OPEN_EXCHANGE_PREAMBLE = `This room uses Open Exchange as its default form of interaction.
@@ -275,12 +276,16 @@ export class OpenClawRoomRuntime {
     logger = null,
     releaseProvenance = ROOM_CONNECTOR_PROVENANCE,
     activateEnrollment = activateRoomChannel,
+    waitForRenewal = false,
+    renewalWait = sleep,
   } = {}) {
     this.account = account;
     this.fetchImpl = fetchImpl;
     this.logger = logger;
     this.releaseProvenance = releaseProvenance;
     this.activateEnrollment = activateEnrollment;
+    this.waitForRenewal = waitForRenewal;
+    this.renewalWait = renewalWait;
     this.closed = false;
     this.connectorSession = null;
     this.initializeTask = null;
@@ -294,6 +299,8 @@ export class OpenClawRoomRuntime {
     this.activityStreamSeq = 0;
     this.activitySourceEventId = "";
     this.pendingActivityFrame = null;
+    this.bindingOperation = Promise.resolve();
+    this.lastRenewalCheck = 0;
   }
 
   async initialize(signal) {
@@ -311,6 +318,32 @@ export class OpenClawRoomRuntime {
     this.state = await waitForState(this.account.stateFile, signal);
     if (this.account.baseUrl && this.state.baseUrl !== this.account.baseUrl) throw new Error("Configured Room origin does not match private reconnect state");
     this.client = new RoomClient({baseUrl: this.state.baseUrl, credential: this.state.credential, fetchImpl: this.fetchImpl});
+    await this.renewAccess(signal);
+    while (!this.closed) {
+      try {
+        await this.registerConnector(signal);
+        break;
+      } catch (error) {
+        if (!this.waitForRenewal || !(error instanceof RoomAPIError) || error.code !== "credential_expired") throw error;
+        // Keep this enabled account's renewal-only maintenance alive even if
+        // the host would otherwise exhaust its account restart budget. Never
+        // infer expiry from generic auth failure, nor register a revoked base.
+        const maintenanceSignal = signal ? AbortSignal.any([signal, this.heartbeatAbort.signal]) : this.heartbeatAbort.signal;
+        await this.renewalWait(30_000, maintenanceSignal);
+        this.lastRenewalCheck = 0;
+        await this.renewAccess(maintenanceSignal);
+      }
+    }
+    if (this.closed) throw new Error("Room account closed during credential maintenance");
+    await this.repairPendingLifecycles(signal);
+    await this.publishPresence(signal);
+    if (this.activityError) this.logger?.warn?.(`Room activity signal unavailable${roomErrorDiagnostic(this.activityError)}`);
+    else this.logger?.info?.("Room activity signal established");
+    this.runHeartbeat();
+    return this.connectorSession;
+  }
+
+  async registerConnector(signal) {
     this.connectorSession = await this.client.register(this.state, {
       clientInstanceId: this.state.clientInstanceId,
       contractVersion: 1,
@@ -334,17 +367,47 @@ export class OpenClawRoomRuntime {
     this.state.deliveryIntents ??= {};
     this.state.terminalEvidence ??= {};
     await saveState(this.account.stateFile, this.state);
-    await this.repairPendingLifecycles(signal);
-    await this.publishPresence(signal);
-    if (this.activityError) this.logger?.warn?.(`Room activity signal unavailable${roomErrorDiagnostic(this.activityError)}`);
-    else this.logger?.info?.("Room activity signal established");
-    this.runHeartbeat();
     return this.connectorSession;
+  }
+
+  withBindingOperation(operation) {
+    const task = this.bindingOperation.catch(() => {}).then(operation);
+    this.bindingOperation = task;
+    return task;
+  }
+
+  async renewAccess(signal) {
+    return this.withBindingOperation(async () => {
+      // Do not rotate while the channel owns a delivered model turn or while
+      // durable outbound/lifecycle work needs its original credential.
+      if (this.closed || this.pendingEvent) return false;
+      if (!this.state.credentialRotation && Date.now() - this.lastRenewalCheck < 30_000) return false;
+      this.lastRenewalCheck = Date.now();
+      const bounded = AbortSignal.timeout(15_000);
+      const renewalSignal = signal ? AbortSignal.any([signal, bounded]) : bounded;
+      try {
+        const changed = await renewCredential({state: this.state, stateFile: this.account.stateFile,
+          account: this.account, client: this.client, signal: renewalSignal});
+        if (changed) {
+          this.client.credential = this.state.credential;
+          if (this.connectorSession) await this.registerConnector(signal);
+        }
+        return changed;
+      } catch (error) {
+        // Old servers may return 200 HTML for an unknown optional route.
+        // Discovery alone must not terminate ordinary delivery. Once secrets
+        // were journaled, however, no participation may race a partial swap.
+        if (this.state.credentialRotation) throw error;
+        this.logger?.warn?.(`Room renewal discovery unavailable${roomErrorDiagnostic(error)}`);
+        return false;
+      }
+    });
   }
 
   async *assignedTurns(signal) {
     await this.initialize(signal);
     while (!signal.aborted && !this.closed) {
+      await this.renewAccess(signal);
       const page = await retry(() => this.client.readEvents(this.state, this.state.cursor, {wait: 20, signal}), signal);
       const pageEpoch = validateActiveEpochPage(page);
       const pageActiveEpochId = pageEpoch.id;
@@ -728,7 +791,14 @@ export class OpenClawRoomRuntime {
     if (this.pendingEvent && this.pendingEvent.seq <= authoritative) this.pendingEvent = null;
   }
 
-  async postAndFinish({roomId, text, replyToId, idempotencyKey, signal, sourceEventId, sourceEpochId = "", cycleAttempt = null, resolveRecipientMentions = false}) {
+  async postAndFinish(request) {
+    return this.withBindingOperation(() => {
+      if (this.state.credentialRotation) throw new Error("Room access renewal is pending; outbound delivery paused");
+      return this.postAndFinishOnce(request);
+    });
+  }
+
+  async postAndFinishOnce({roomId, text, replyToId, idempotencyKey, signal, sourceEventId, sourceEpochId = "", cycleAttempt = null, resolveRecipientMentions = false}) {
     if (roomId !== this.state.roomId) throw new Error("Outbound Room does not match connector membership");
     const body = String(text ?? "").trim();
     if (!body) throw new Error("OpenClaw produced an empty Room response");
@@ -1185,9 +1255,12 @@ export class OpenClawRoomRuntime {
   }
 
   async maintainPresence(signal) {
-    await this.client.heartbeat(this.state, this.connectorSession.sessionId, signal);
-    await this.acceptConnectorEnrollments(signal);
-    await this.publishPresence(signal);
+    return this.withBindingOperation(async () => {
+      if (this.state.credentialRotation) return;
+      await this.client.heartbeat(this.state, this.connectorSession.sessionId, signal);
+      await this.acceptConnectorEnrollments(signal);
+      await this.publishPresence(signal);
+    });
   }
 
   async acceptConnectorEnrollments(signal) {
@@ -1344,6 +1417,7 @@ export class OpenClawRoomRuntime {
     this.closed = true;
     this.heartbeatAbort.abort();
     await this.heartbeatTask?.catch(() => {});
+    await this.bindingOperation.catch(() => {});
   }
 }
 

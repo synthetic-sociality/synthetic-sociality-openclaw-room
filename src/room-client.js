@@ -8,6 +8,8 @@ const SAFE_API_CODES = new Set([
   "cycle_no_attempt",
   "cycle_superseded",
   "connector_not_active",
+  "credential_expired",
+  "credential_revoked",
   "invitation_consumed",
   "invitation_expired",
   "invitation_invalid",
@@ -145,6 +147,37 @@ export class RoomClient {
     const query = new URLSearchParams({clientInstanceId: session.clientInstanceId});
     return this.request(`/connector/enrollments?${query}`, {
       credential: session.credential, signal, expected: [200],
+    });
+  }
+
+  credentialRenewalIntent(session, signal) {
+    const query = new URLSearchParams({clientInstanceId: session.clientInstanceId});
+    return this.request(`/rooms/${encodeURIComponent(session.roomId)}/credential-renewal-intent?${query}`, {
+      credential: session.credential, signal,
+    });
+  }
+
+  requestCredentialRenewal(session, request, signal) {
+    return this.request(`/rooms/${encodeURIComponent(session.roomId)}/credential-renewal-requests`, {
+      method: "POST", body: request, credential: session.credential, signal, expected: [200, 201],
+    });
+  }
+
+  redeemCredentialRenewal(session, grantId, body, signal) {
+    return this.request(`/rooms/${encodeURIComponent(session.roomId)}/credential-renewal-grants/${encodeURIComponent(grantId)}/redeem`, {
+      method: "POST", body, credential: session.credential, signal,
+    });
+  }
+
+  verifyCredentialRenewal(session, grantId, signal) {
+    return this.request(`/rooms/${encodeURIComponent(session.roomId)}/credential-renewal-grants/${encodeURIComponent(grantId)}/verify`, {
+      credential: session.credential, signal,
+    });
+  }
+
+  confirmCredentialRenewal(session, grantId, signal) {
+    return this.request(`/rooms/${encodeURIComponent(session.roomId)}/credential-renewal-grants/${encodeURIComponent(grantId)}/confirm`, {
+      method: "POST", credential: session.credential, signal,
     });
   }
 

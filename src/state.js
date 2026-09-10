@@ -2,6 +2,7 @@ import {randomUUID} from "node:crypto";
 import {open, readFile, rename, mkdir, chmod, lstat, link, unlink} from "node:fs/promises";
 import {dirname, join, resolve} from "node:path";
 import {homedir} from "node:os";
+import {validateRenewalJournal} from "./credential-renewal.js";
 
 export function openClawStateDirectory({env = process.env, home = homedir()} = {}) {
   const configured = String(env.OPENCLAW_STATE_DIR ?? "").trim();
@@ -114,6 +115,7 @@ export function validateState(value) {
     if (typeof value[field] !== "string" || !value[field].trim()) throw new Error(`Room state is missing ${field}`);
   }
   if (!Number.isSafeInteger(value.cursor) || value.cursor < 0) throw new Error("Room state cursor is invalid");
+  if (value.credentialRotation !== undefined) validateRenewalJournal(value.credentialRotation, value);
   if (value.epochSessionRoutingInitialized !== undefined && typeof value.epochSessionRoutingInitialized !== "boolean") {
     throw new Error("Room epoch session routing marker is invalid");
   }
