@@ -29,6 +29,12 @@ function delivery(value, expected) {
   }
 }
 
+function deliverySnapshot(request, state) {
+  if (!seq(request?.deliveredSeq) || request.deliveredSeq < state.cursor
+    || request.acknowledgedSeq !== state.cursor) fail();
+  return {deliveredSeq: request.deliveredSeq, acknowledgedSeq: request.acknowledgedSeq};
+}
+
 function member(snapshot, expected) {
   if (snapshot?.roomId !== expected.roomId || !Array.isArray(snapshot.roster)) fail();
   const matches = snapshot.roster.filter((item) => item.membershipId === expected.membershipId);
@@ -79,7 +85,8 @@ export async function renewCredential({state, stateFile, account, client, signal
       clientInstanceId: state.clientInstanceId, baseCredentialGeneration: request.baseCredentialGeneration,
       localCursor: state.cursor,
       expected: {roomId: state.roomId, membershipId: state.membershipId,
-        displayName: request.displayName, identityVersion: request.identityVersion},
+        displayName: request.displayName, identityVersion: request.identityVersion,
+        ...deliverySnapshot(request, state)},
     };
     validateRenewalJournal(journal, state);
     await persist({...state, credentialRotation: journal});
@@ -93,18 +100,19 @@ export async function renewCredential({state, stateFile, account, client, signal
   };
   if (journal.phase === "requested") {
     if (!seq(journal.expected.deliveredSeq)) {
-      const current = member(await client.roomState(base, signal), journal.expected);
+      // Resume an older private preparation through renewal-only authority.
+      // An expired base must never be granted or require ordinary /state.
+      const current = (await client.credentialRenewalIntent(base, signal))?.request;
       identity(current, journal.expected);
-      if (!seq(current.deliveredSeq) || current.deliveredSeq < state.cursor
-        || current.acknowledgedSeq !== state.cursor) fail();
-      await update({expected: {...journal.expected, deliveredSeq: current.deliveredSeq, acknowledgedSeq: current.acknowledgedSeq}});
+      if (current.requestId !== journal.requestId || current.baseCredentialGeneration !== journal.baseCredentialGeneration) fail();
+      await update({expected: {...journal.expected, ...deliverySnapshot(current, state)}});
     }
     const requested = await client.requestCredentialRenewal(base, {
       requestId: journal.requestId,
       grantSecretHash: createHash("sha256").update(journal.grantSecret).digest("hex"),
       clientInstanceId: state.clientInstanceId,
     }, signal);
-    identity(requested, journal.expected);
+    delivery(requested, journal.expected);
     if (requested.requestId !== journal.requestId || requested.baseCredentialGeneration !== journal.baseCredentialGeneration
       || !["issued", "redeemed"].includes(requested.state) || !requested.grantId) fail();
     await update({phase: "prepared", grantId: requested.grantId});

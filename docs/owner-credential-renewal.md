@@ -11,6 +11,9 @@ discovers the bounded intent using only that binding's base credential and
 client instance ID, even if the credential has expired. It never selects a
 model, creates a profile, joins again or copies another Room's credential.
 Possession of copied credential and copied instance ID is not host attestation.
+Delivered/acknowledged cursor evidence comes from the renewal-only discovery
+DTO and is checked again on claim/redeem/verify. The expired base never calls
+ordinary `/state`; that route remains forbidden until replacement confirmation.
 
 `credentialRotation` in the private mode-0600 account state is the crash
 journal. The connector persists its locally generated grant secret and

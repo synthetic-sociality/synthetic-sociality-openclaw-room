@@ -17,6 +17,7 @@ async function fixture() {
   await saveState(stateFile, state);
   const request = {roomId: state.roomId, membershipId: state.membershipId, displayName: "An agent",
     identityVersion: 2, baseCredentialGeneration: 1, requestId: randomBytes(32).toString("base64url"),
+    deliveredSeq: 9, acknowledgedSeq: 7,
     state: "owner_requested", expiresAt: new Date(Date.now() + 60_000).toISOString()};
   const proof = {...request, grantId: "grant-1", deliveredSeq: 9, acknowledgedSeq: 7,
     credentialExpiresAt: "2030-01-01T00:00:00Z"};
@@ -24,7 +25,13 @@ async function fixture() {
   const calls = [];
   const client = {
     credentialRenewalIntent: async () => { calls.push("discover"); return {request: confirmed ? null : request}; },
-    roomState: async () => ({roomId: state.roomId, roster: [proof]}),
+    roomState: async (session) => {
+      // Real server authority: expired base is forbidden on ordinary /state.
+      assert.notEqual(session.credential, "expired-base");
+      assert.equal(session.credential, replacement);
+      assert.equal(confirmed, true);
+      return {roomId: state.roomId, roster: [proof]};
+    },
     requestCredentialRenewal: async (session, body) => {
       const durable = (await loadState(stateFile)).credentialRotation;
       assert.equal(body.requestId, durable.requestId);
@@ -94,7 +101,7 @@ test("failed final state verification retains confirmed journal and replacement"
   const f = await fixture();
   const original = f.client.roomState;
   let n = 0;
-  f.client.roomState = async (...args) => { if (++n === 2) throw new Error("lost final state"); return original(...args); };
+  f.client.roomState = async (...args) => { if (++n === 1) throw new Error("lost final state"); return original(...args); };
   await assert.rejects(renewCredential(f), /lost final/);
   assert.equal(f.state.credentialRotation.phase, "confirmed");
   assert.equal(await renewCredential(f), true);
@@ -106,6 +113,8 @@ for (const mutation of [
   (f) => { f.proof.identityVersion = 999; },
   (f) => { f.proof.acknowledgedSeq = 8; },
   (f) => { f.request.expiresAt = "2020-01-01T00:00:00Z"; },
+  (f) => { delete f.request.deliveredSeq; },
+  (f) => { f.request.acknowledgedSeq = 8; },
 ]) {
   test("rejects wrong identity, cursor or expired intent", async () => {
     const f = await fixture(); mutation(f);
@@ -195,7 +204,7 @@ test("enabled expired native account keeps renewal-only discovery alive and hot-
     else if (path.endsWith("/redeem")) response = await f.client.redeemCredentialRenewal(session, "grant-1", body);
     else if (path.endsWith("/verify")) response = await f.client.verifyCredentialRenewal(session);
     else if (path.endsWith("/confirm")) { response = await f.client.confirmCredentialRenewal(session); offered = false; }
-    else if (path.endsWith("/state")) response = await f.client.roomState();
+    else if (path.endsWith("/state")) response = await f.client.roomState(session);
     else if (path.endsWith("/connector/sessions")) {
       registrations++;
       if (session.credential === "expired-base") { response = {code: "credential_expired"}; status = 401; }
