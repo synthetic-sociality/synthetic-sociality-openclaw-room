@@ -523,10 +523,10 @@ export class OpenClawRoomRuntime {
       && (intent.deliveryState === "quarantined" || (intent.version === 1 && intent.deliveryState === undefined))
       && intent.identity?.sourceEventId === event.id
       && intent.identity?.roomId === this.state.roomId
-      // Supported v1 state may predate the binding snapshot. Isolating an
-      // already-quarantined exact source grants no authority and emits no ack.
-      // Do not invoke legacy migration or regenerate its model response.
-      && ((intent.version === 1 && intent.binding === undefined)
+      // Supported v1 state may lack a binding snapshot or retain a stale one.
+      // Such uncertainty must not revive this exact room/source. Isolation
+      // grants no authority, migrates nothing and emits no acknowledgement.
+      && (intent.version === 1
         || (intent.binding?.roomId === this.state.roomId
           && intent.binding?.membershipId === this.state.membershipId
           && intent.binding?.clientInstanceId === this.state.clientInstanceId)));

@@ -173,7 +173,7 @@ test("external state writer prevents renewal overwriting local cursor", async ()
   assert.equal((await loadState(f.stateFile)).cursor, 8);
 });
 
-for (const legacy of ["none", "bound-v1", "unbound-v1"]) {
+for (const legacy of ["none", "bound-v1", "unbound-v1", "stale-binding-v1"]) {
 test(`renewed runtime scans past quarantine and never replays on restart (${legacy})`, async () => {
   const f = await fixture();
   f.state.epochSessionRoutingInitialized = true;
@@ -189,6 +189,7 @@ test(`renewed runtime scans past quarantine and never replays on restart (${lega
     intent.version = 1;
     delete intent.deliveryState;
     if (legacy === "unbound-v1") delete intent.binding;
+    if (legacy === "stale-binding-v1") intent.binding.clientInstanceId = "previous-instance";
   }
   await saveState(f.stateFile, f.state);
   const quarantine = structuredClone(f.state.deliveryIntents);
