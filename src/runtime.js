@@ -380,7 +380,11 @@ export class OpenClawRoomRuntime {
     return this.withBindingOperation(async () => {
       // Do not rotate while the channel owns a delivered model turn or while
       // durable outbound/lifecycle work needs its original credential.
-      if (this.closed || this.pendingEvent) return false;
+      if (this.closed) return false;
+      if (this.pendingEvent) {
+        if (!this.isQuarantinedEvent(this.pendingEvent)) return false;
+        this.pendingEvent = null;
+      }
       if (!this.state.credentialRotation && Date.now() - this.lastRenewalCheck < 30_000) return false;
       this.lastRenewalCheck = Date.now();
       const bounded = AbortSignal.timeout(15_000);
@@ -406,9 +410,12 @@ export class OpenClawRoomRuntime {
 
   async *assignedTurns(signal) {
     await this.initialize(signal);
+    // A scan position is not a canonical acknowledgement. Restart re-scans
+    // from the durable frontier and consults the per-event evidence again.
+    let scanCursor = this.state.cursor;
     while (!signal.aborted && !this.closed) {
       await this.renewAccess(signal);
-      const page = await retry(() => this.client.readEvents(this.state, this.state.cursor, {wait: 20, signal}), signal);
+      const page = await retry(() => this.client.readEvents(this.state, Math.max(scanCursor, this.state.cursor), {wait: 20, signal}), signal);
       const pageEpoch = validateActiveEpochPage(page);
       const pageActiveEpochId = pageEpoch.id;
       if (this.state.epochSessionRoutingInitialized !== true) {
@@ -428,6 +435,12 @@ export class OpenClawRoomRuntime {
       await retry(() => this.maintainPresence(signal), signal);
       for (const event of page.events ?? []) {
         if (event.seq <= this.state.cursor) continue;
+        if (this.isQuarantinedEvent(event)) {
+          // No replay, superseding, deletion or fabricated terminal receipt.
+          if (this.pendingEvent?.id === event.id) this.pendingEvent = null;
+          scanCursor = event.seq;
+          continue;
+        }
         const historical = event.seq < pageEpoch.startsAtSeq;
         const canonicalEventEpochId = eventEpochId(event, pageActiveEpochId, pageEpoch.startsAtSeq);
         if (historical) this.assertHistoricalIntentSafety(event);
@@ -435,32 +448,38 @@ export class OpenClawRoomRuntime {
         if (await this.recoverPostedEvidence(event)) {
           this.pendingEvent = event;
           await this.ackEvent(event);
+          scanCursor = event.seq;
           continue;
         }
         if (historical) {
           await this.supersedeHistoricalEvent(event, canonicalEventEpochId);
           await this.ackEvent(event);
+          scanCursor = event.seq;
           continue;
         }
         if (existingTerminalEvidence) {
           this.pendingEvent = event;
           await this.ackEvent(event);
+          scanCursor = event.seq;
           continue;
         }
         if (await this.recoverPendingDelivery(event, signal)) {
           this.pendingEvent = event;
           await this.ackEvent(event);
+          scanCursor = event.seq;
           continue;
         }
         if (isLifecycleOnlyCycleTerminal(event)
             && isBoundaryEvent(event, pageActiveEpochId, pageEpoch.startsAtSeq)) {
           await this.recordTerminalEvidence(event, "ignored", {reason: "prior_epoch_lifecycle"});
           await this.ackEvent(event);
+          scanCursor = event.seq;
           continue;
         }
         if (!isAssignedEvent(event, this.state.membershipId)) {
           await this.recordTerminalEvidence(event, "ignored", {reason: "not_assigned_or_technical"});
           await this.ackEvent(event);
+          scanCursor = event.seq;
           continue;
         }
         // Reception is independent of turn assignment: every addressed agent
@@ -473,6 +492,7 @@ export class OpenClawRoomRuntime {
         if (cycleAttempt === false) {
           await this.recordTerminalEvidence(event, "skipped", {reason: "coordination_handled_without_model"});
           await this.ackEvent(event);
+          scanCursor = event.seq;
           continue;
         }
         this.pendingEvent = event;
@@ -485,8 +505,26 @@ export class OpenClawRoomRuntime {
           pageActiveEpochId,
           this.state.legacySessionEpochId,
         );
+        if (event.seq <= this.state.cursor || this.terminalEvidenceFor(event) || this.isQuarantinedEvent(event)) {
+          scanCursor = event.seq;
+          if (this.pendingEvent?.id === event.id) this.pendingEvent = null;
+        } else {
+          // Do not scan over an unfinished turn merely because its consumer
+          // resumed the iterator. A later pass must recover this exact work.
+          break;
+        }
       }
     }
+  }
+
+  isQuarantinedEvent(event) {
+    return Object.values(this.state.deliveryIntents ?? {}).some((intent) =>
+      intent.status === "quarantined" && intent.deliveryState === "quarantined"
+      && intent.identity?.sourceEventId === event.id
+      && intent.identity?.roomId === this.state.roomId
+      && intent.binding?.roomId === this.state.roomId
+      && intent.binding?.membershipId === this.state.membershipId
+      && intent.binding?.clientInstanceId === this.state.clientInstanceId);
   }
 
   async sharedRoomContext(event, sourceEpoch, signal) {
@@ -777,7 +815,12 @@ export class OpenClawRoomRuntime {
       if (!validTerminalEvidence(next) || next.sourceSeq !== frontier + 1) break;
       frontier += 1;
     }
-    if (frontier <= this.state.cursor) throw new Error("Room event acknowledgement has a non-contiguous terminal ledger");
+    if (frontier <= this.state.cursor) {
+      // This event completed; an earlier isolated source still owns the gap.
+      // Keep the receipt and acknowledgement frontier, but release this turn.
+      if (this.pendingEvent?.id === event.id) this.pendingEvent = null;
+      return;
+    }
     const response = await this.client.acknowledge(this.state, frontier);
     const authoritative = response?.acknowledgedSeq;
     if (!Number.isSafeInteger(authoritative) || authoritative !== frontier) {
@@ -788,7 +831,7 @@ export class OpenClawRoomRuntime {
       Object.entries(this.state.terminalEvidence ?? {}).filter(([seq]) => Number(seq) > authoritative),
     );
     await saveState(this.account.stateFile, this.state);
-    if (this.pendingEvent && this.pendingEvent.seq <= authoritative) this.pendingEvent = null;
+    if (this.pendingEvent && (this.pendingEvent.seq <= authoritative || this.pendingEvent.id === event.id)) this.pendingEvent = null;
   }
 
   async postAndFinish(request) {

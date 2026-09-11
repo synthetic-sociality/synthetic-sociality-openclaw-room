@@ -29,8 +29,12 @@ renewal-only maintenance loop alive after a proved `credential_expired`
 registration, without depending on the gateway's restart budget or a live
 lease. Generic auth failures and revocation never enter that recovery path.
 The account lifecycle gate serializes maintenance with outbound writes and
-heartbeats. An in-flight delivered model turn defers renewal; unresolved
-delivery/lifecycle/ack evidence and quarantine fail closed. Explicitly
+heartbeats. An in-flight delivered model turn or active outbound/lifecycle work
+defers renewal. Quarantined work and completed evidence behind an acknowledgement
+gap are inert: renewal preserves them without replay or acknowledgement.
+The event reader scans beyond isolated sources; canonical acknowledgement still
+requires contiguous terminal evidence. A restart re-scans from that durable
+frontier and never redispatches quarantined or proved-completed work. Explicitly
 disabled accounts and revoked bindings are not silently enabled. OpenClaw
 has no separate historical expiry-disable marker; arbitrary `enabled=false`
 cannot be treated as proof of expiration.

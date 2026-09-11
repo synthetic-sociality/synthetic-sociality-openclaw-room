@@ -124,8 +124,8 @@ for (const mutation of [
   });
 }
 
-for (const disabled of [{account: {enabled: false}}, {state: {revoked: true}}, {state: {enabled: false}}, {state: {quarantined: true}}]) {
-  test("never clears intentional disablement, revocation or quarantine", async () => {
+for (const disabled of [{account: {enabled: false}}, {state: {revoked: true}}, {state: {enabled: false}}]) {
+  test("never clears intentional disablement or revocation", async () => {
     const f = await fixture();
     if (disabled.state) Object.assign(f.state, disabled.state);
     f.account = disabled.account;
@@ -134,11 +134,110 @@ for (const disabled of [{account: {enabled: false}}, {state: {revoked: true}}, {
   });
 }
 
+for (const lost of [null, "requestCredentialRenewal", "redeemCredentialRenewal", "verifyCredentialRenewal", "confirmCredentialRenewal", "roomState"]) {
+  test(`quarantine and gap evidence survive renewal, lost reply=${lost}`, async () => {
+    const f = await fixture();
+    f.state.quarantined = true;
+    f.state.deliveryIntents = {"source-8:final": {
+      version: 2, status: "quarantined", deliveryState: "quarantined", lifecycleState: "not_started",
+      messagePayloadDialect: "v1",
+      identity: {roomId: "room-1", sourceEventId: "source-8", body: "retained draft"},
+      binding: {roomId: "room-1", membershipId: "member-1", clientInstanceId: "instance-1"},
+    }};
+    f.state.terminalEvidence = {"9": {sourceSeq: 9, sourceEventId: "source-9", status: "ignored", reason: "technical"}};
+    await saveState(f.stateFile, f.state);
+    const before = structuredClone(f.state);
+    if (lost) {
+      const original = f.client[lost];
+      let fail = true;
+      f.client[lost] = async (...args) => {
+        const result = await original(...args);
+        if (fail) { fail = false; throw new Error("lost reply"); }
+        return result;
+      };
+      await assert.rejects(renewCredential(f), /lost reply/);
+      f.state = await loadState(f.stateFile);
+    }
+    assert.equal(await renewCredential(f), true);
+    for (const key of ["quarantined", "deliveryIntents", "terminalEvidence", "cursor", "clientInstanceId", "membershipId"])
+      assert.deepEqual(f.state[key], before[key]);
+    assert.equal(f.state.credentialRotation, undefined);
+    assert.ok(f.calls.includes("confirm"));
+  });
+}
+
 test("external state writer prevents renewal overwriting local cursor", async () => {
   const f = await fixture();
   await saveState(f.stateFile, {...f.state, cursor: 8});
   await assert.rejects(renewCredential(f), /evidence mismatch/);
   assert.equal((await loadState(f.stateFile)).cursor, 8);
+});
+
+test("renewed runtime scans multiple pages past quarantine, delivers new work and restart never replays it", async () => {
+  const f = await fixture();
+  f.state.epochSessionRoutingInitialized = true;
+  f.state.legacySessionEpochId = "epoch-1";
+  f.state.deliveryIntents = {"source-8:final": {
+    version: 2, status: "quarantined", deliveryState: "quarantined", lifecycleState: "not_started",
+    messagePayloadDialect: "v1",
+    identity: {roomId: "room-1", sourceEventId: "source-8", body: "isolated draft"},
+    binding: {roomId: "room-1", membershipId: "member-1", clientInstanceId: "instance-1"},
+  }};
+  await saveState(f.stateFile, f.state);
+  const quarantine = structuredClone(f.state.deliveryIntents);
+  const maintenance = new OpenClawRoomRuntime({stateFile: f.stateFile});
+  maintenance.state = f.state;
+  maintenance.client = f.client;
+  maintenance.pendingEvent = {id: "source-8", seq: 8};
+  assert.equal(await maintenance.renewAccess(), true);
+  assert.equal(maintenance.pendingEvent, null);
+  await maintenance.close();
+  const events = [
+    {id: "source-8", seq: 8, type: "message.posted", actorRole: "human_owner", payload: {body: "old", epochId: "epoch-1"}},
+    {id: "source-9", seq: 9, type: "credential.renewed", payload: {}},
+    {id: "source-10", seq: 10, type: "message.posted", actorRole: "human_owner", payload: {body: "new", epochId: "epoch-1"}},
+  ];
+  for (const restarted of [false, true]) {
+    const runtime = new OpenClawRoomRuntime({stateFile: f.stateFile});
+    runtime.state = await loadState(f.stateFile);
+    runtime.initialize = async () => {};
+    runtime.renewAccess = async () => false;
+    runtime.maintainPresence = async () => {};
+    const reads = [], dispatched = [];
+    const controller = new AbortController();
+    runtime.client = {
+      readEvents: async (_state, cursor) => {
+        reads.push(cursor);
+        const page = events.filter((e) => e.seq > cursor).slice(0, 1);
+        if (!page.length) controller.abort();
+        return {activeEpochId: "epoch-1", activeEpochStartsAtSeq: 1, events: page};
+      },
+      acknowledge: async () => { throw new Error("must not acknowledge across isolated source 8"); },
+    };
+    runtime.markContextAcknowledged = async (event) => { dispatched.push(event.id); };
+    runtime.prepareCycleAttempt = async () => null;
+    runtime.sharedRoomContext = async () => "canonical context";
+    const iterator = runtime.assignedTurns(controller.signal);
+    const result = await iterator.next();
+    if (!restarted) {
+      assert.equal(result.value.sourceEventId, "source-10");
+      assert.deepEqual(dispatched, ["source-10"]);
+      // A caller completes the new turn independently of the old gap.
+      await runtime.recordTerminalEvidence(events[2], "skipped", {reason: "explicit_pass"});
+      await runtime.ackEvent(events[2]);
+      assert.equal(runtime.pendingEvent, null);
+      assert.equal((await iterator.next()).done, true);
+    } else {
+      assert.equal(result.done, true);
+      assert.deepEqual(dispatched, []);
+    }
+    assert.deepEqual(reads, [7, 8, 9, 10]);
+    assert.equal(runtime.state.cursor, 7);
+    assert.deepEqual(runtime.state.deliveryIntents, quarantine);
+    assert.ok(runtime.state.terminalEvidence["9"]);
+    assert.ok(runtime.state.terminalEvidence["10"]);
+    await runtime.close();
+  }
 });
 
 test("optional HTML discovery cannot kill runtime or invoke a model", async () => {
