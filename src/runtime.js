@@ -519,12 +519,17 @@ export class OpenClawRoomRuntime {
 
   isQuarantinedEvent(event) {
     return Object.values(this.state.deliveryIntents ?? {}).some((intent) =>
-      intent.status === "quarantined" && intent.deliveryState === "quarantined"
+      intent.status === "quarantined"
+      && (intent.deliveryState === "quarantined" || (intent.version === 1 && intent.deliveryState === undefined))
       && intent.identity?.sourceEventId === event.id
       && intent.identity?.roomId === this.state.roomId
-      && intent.binding?.roomId === this.state.roomId
-      && intent.binding?.membershipId === this.state.membershipId
-      && intent.binding?.clientInstanceId === this.state.clientInstanceId);
+      // Supported v1 state may predate the binding snapshot. Isolating an
+      // already-quarantined exact source grants no authority and emits no ack.
+      // Do not invoke legacy migration or regenerate its model response.
+      && ((intent.version === 1 && intent.binding === undefined)
+        || (intent.binding?.roomId === this.state.roomId
+          && intent.binding?.membershipId === this.state.membershipId
+          && intent.binding?.clientInstanceId === this.state.clientInstanceId)));
   }
 
   async sharedRoomContext(event, sourceEpoch, signal) {

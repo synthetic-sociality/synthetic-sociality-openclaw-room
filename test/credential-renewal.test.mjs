@@ -173,7 +173,8 @@ test("external state writer prevents renewal overwriting local cursor", async ()
   assert.equal((await loadState(f.stateFile)).cursor, 8);
 });
 
-test("renewed runtime scans multiple pages past quarantine, delivers new work and restart never replays it", async () => {
+for (const legacy of ["none", "bound-v1", "unbound-v1"]) {
+test(`renewed runtime scans past quarantine and never replays on restart (${legacy})`, async () => {
   const f = await fixture();
   f.state.epochSessionRoutingInitialized = true;
   f.state.legacySessionEpochId = "epoch-1";
@@ -183,6 +184,12 @@ test("renewed runtime scans multiple pages past quarantine, delivers new work an
     identity: {roomId: "room-1", sourceEventId: "source-8", body: "isolated draft"},
     binding: {roomId: "room-1", membershipId: "member-1", clientInstanceId: "instance-1"},
   }};
+  if (legacy !== "none") {
+    const intent = f.state.deliveryIntents["source-8:final"];
+    intent.version = 1;
+    delete intent.deliveryState;
+    if (legacy === "unbound-v1") delete intent.binding;
+  }
   await saveState(f.stateFile, f.state);
   const quarantine = structuredClone(f.state.deliveryIntents);
   const maintenance = new OpenClawRoomRuntime({stateFile: f.stateFile});
@@ -239,6 +246,7 @@ test("renewed runtime scans multiple pages past quarantine, delivers new work an
     await runtime.close();
   }
 });
+}
 
 test("optional HTML discovery cannot kill runtime or invoke a model", async () => {
   const f = await fixture();
