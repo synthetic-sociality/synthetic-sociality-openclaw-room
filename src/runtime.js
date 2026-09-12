@@ -564,7 +564,10 @@ export class OpenClawRoomRuntime {
       (artifactId) => this.client.getArtifact(this.state, artifactId, signal),
       library?.items,
     );
-    return [roomContext, handoverContext, artifactContext].filter(Boolean).join("\n\n");
+    const combined = [roomContext, handoverContext, artifactContext].filter(Boolean).join("\n\n");
+    // Bounded size telemetry for the pilot: character counts only, never content.
+    this.logger?.info?.(`Room ${this.state.roomId} context sizes for ${String(event?.id ?? "")}: transcript=${roomContext.length} handover=${handoverContext.length} documents=${artifactContext.length} total=${combined.length}`);
+    return combined;
   }
 
   async epochHandoverContext(event, sourceEpoch, pageEvents, signal) {

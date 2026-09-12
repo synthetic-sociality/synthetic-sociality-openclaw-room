@@ -1815,7 +1815,12 @@ test("B34: the new discussion's model context carries the handover, a library ca
     listArtifacts: async () => ({items: [{artifactId: "artifact-1", visibility: "room_shared", title: "Kabeltracker", currentVersion: {versionId: "v1", name: "kabeltracker.pdf", extractionStatus: "ready", extractedText: "LIBRARY FULL TEXT ".repeat(2_000)}}]}),
     getArtifact: async () => { throw new Error("catalog listing must not fetch artifacts"); },
   };
+  const infoLines = [];
+  runtime.logger = {info: (line) => infoLines.push(line)};
   const rendered = await runtime.sharedRoomContext(HANDOVER_START, {id: "epoch-2", startsAtSeq: 41});
+  assert.equal(infoLines.filter((line) => line.includes("context sizes")).length, 1, infoLines);
+  assert.match(infoLines[0], new RegExp(`total=${rendered.length}$`));
+  assert.doesNotMatch(infoLines[0], /Keep decisions|LIBRARY FULL TEXT/);
   assert.match(rendered, /Reviewed handover from discussion #1/);
   assert.match(rendered, /kabeltracker\.pdf/);
   assert.doesNotMatch(rendered, /LIBRARY FULL TEXT/);

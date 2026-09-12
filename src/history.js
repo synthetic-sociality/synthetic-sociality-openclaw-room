@@ -132,7 +132,7 @@ function selectEpoch(epochs, state, epochId, ordinal) {
   return epochs.find((item) => item.id === activeId) ?? epochs.at(-1) ?? null;
 }
 
-export async function readRoomHistory({client, session, args = {}, cache = scanCache, signal}) {
+export async function readRoomHistory({client, session, args = {}, cache = scanCache, signal, logger = null}) {
   const epochId = String(args.epochId ?? "").trim();
   const ordinal = Number(args.epochOrdinal ?? 0);
   const afterSeq = Math.max(0, Number(args.afterSeq ?? 0));
@@ -196,6 +196,7 @@ export async function readRoomHistory({client, session, args = {}, cache = scanC
       }
     }
     const complete = scannedThrough >= endsBefore - 1;
+    logger?.info?.(`Room ${session.roomId} history read: epoch=${epoch.id} ordinal=${epoch.ordinal} from=${startAfter + 1} through=${scannedThrough} messages=${messages.length} hidden=${hiddenExcluded} complete=${complete}`);
     return {
       success: true,
       roomId: session.roomId,
@@ -257,7 +258,7 @@ export function registerRoomHistoryTool(api, {makeClient = (session) => new Room
           ? {success: false, selectionRequired: true, rooms: resolved.choices}
           : {success: false, error: "No Synthetic Sociality Room is configured for this OpenClaw agent."};
       } else {
-        result = await readRoomHistory({client: makeClient(resolved.session), session: resolved.session, args, signal});
+        result = await readRoomHistory({client: makeClient(resolved.session), session: resolved.session, args, signal, logger: api.logger ?? null});
       }
       return {content: [{type: "text", text: JSON.stringify(result)}], details: result};
     },

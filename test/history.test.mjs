@@ -52,7 +52,11 @@ test.beforeEach(() => resetHistoryScanCache());
 
 test("default scope is the current discussion; hidden messages are excluded room-wide", async () => {
   const client = fakeClient(EVENTS);
-  const result = await readRoomHistory({client, session, args: {}});
+  const lines = [];
+  const result = await readRoomHistory({client, session, args: {}, logger: {info: (line) => lines.push(line)}});
+  assert.equal(lines.length, 1, lines);
+  assert.match(lines[0], /history read: epoch=epoch-2 .*messages=2 hidden=0 complete=true/);
+  assert.doesNotMatch(lines[0], /new discussion opener/);
   assert.equal(result.success, true, JSON.stringify(result));
   assert.equal(result.epoch.id, "epoch-2");
   assert.deepEqual(result.messages.map((m) => m.body), ["new discussion opener", "follow-up mentioning decision"]);
