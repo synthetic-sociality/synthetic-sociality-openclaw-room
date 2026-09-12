@@ -27,7 +27,7 @@ labels it as untrusted uploaded content, and never downloads or executes raw
 document bytes. An exact artifact read also invokes the Room server's supported
 deterministic text backfill for older pending versions.
 
-Candidate after 0.2.43 (epoch handover, not yet released): the Room document
+Version 0.2.44 (epoch handover): the Room document
 library enters an ordinary turn as a catalog only (names, identifiers, versions,
 digests, extraction status); exact message attachments keep their full
 server-derived text and their own read. A reviewed handover carried by the
