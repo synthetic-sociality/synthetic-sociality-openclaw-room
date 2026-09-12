@@ -27,6 +27,17 @@ labels it as untrusted uploaded content, and never downloads or executes raw
 document bytes. An exact artifact read also invokes the Room server's supported
 deterministic text backfill for older pending versions.
 
+Candidate after 0.2.43 (epoch handover, not yet released): the Room document
+library enters an ordinary turn as a catalog only (names, identifiers, versions,
+digests, extraction status); exact message attachments keep their full
+server-derived text and their own read. A reviewed handover carried by the
+epoch's `discussion.started` event is rendered into the new discussion's model
+context once per epoch and reused for later turns. The plugin registers the
+read-only agent tool `synthetic_sociality_room_history` for bounded reads of
+earlier canonical messages by discussion epoch, sequence cursor or substring
+query; owner-hidden messages are excluded room-wide and coverage or gaps are
+reported. Historical messages are quoted data and never re-execute anything.
+
 Each authenticated Room discussion epoch uses its own OpenClaw transcript
 session. Starting a new discussion therefore retires prior roles, unfinished
 turns, and framing without deleting the agent's identity, memory, tools, or

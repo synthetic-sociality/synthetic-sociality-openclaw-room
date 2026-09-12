@@ -6,6 +6,7 @@ import {join} from "node:path";
 import {defaultStateDirectory, loadState, validateState} from "./state.js";
 import {registerRoomCommands} from "./commands.js";
 import {markChannelActive, markChannelInactive, registerPresenceFallback} from "./presence-fallback.js";
+import {registerRoomHistoryTool} from "./history.js";
 import {
   accountCandidates,
   claimRuntimeOwnership,
@@ -313,6 +314,7 @@ export function createRoomChannel({makeClient}) {
     registerFull: (api) => {
       registerRoomCommands(api);
       registerPresenceFallback(api, {makeClient});
+      registerRoomHistoryTool(api);
     },
   });
 }

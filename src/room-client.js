@@ -241,6 +241,15 @@ export class RoomClient {
     });
   }
 
+  listEpochs(session, signal) {
+    // Additive server route; older servers answer 404 or through their SPA
+    // fallback. Callers treat any failure as "route unavailable" and fall
+    // back to scanning discussion.started events.
+    return this.request(`/rooms/${encodeURIComponent(session.roomId)}/epochs`, {
+      credential: session.credential, signal, expected: [200],
+    });
+  }
+
   startDiscussionCycle(session, request, signal) {
     return this.request(`/rooms/${encodeURIComponent(session.roomId)}/cycles`, {
       method: "POST", body: request, credential: session.credential, signal, expected: [201],

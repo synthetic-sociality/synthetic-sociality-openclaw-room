@@ -4,7 +4,7 @@ import test from "node:test";
 import {mkdtemp, readFile, writeFile} from "node:fs/promises";
 import {tmpdir} from "node:os";
 import {join} from "node:path";
-import {canonicalRoomContext, commandInstruction, cyclePhaseInstruction, epochConversationId, epochEvidence, eventEpochId, isAssignedEvent, isAssignedMessage, isBoundaryEvent, isLifecycleOnlyCycleTerminal, normalizeEvent, OpenClawRoomRuntime, resolveStandaloneRecipientSelectors, validateActiveEpochPage} from "../src/runtime.js";
+import {ARTIFACT_CONTEXT_CHARACTER_LIMIT, HANDOVER_CONTEXT_CHARACTER_LIMIT, canonicalRoomContext, commandInstruction, discussionHandoverContext, sourceArtifactContext, cyclePhaseInstruction, epochConversationId, epochEvidence, eventEpochId, isAssignedEvent, isAssignedMessage, isBoundaryEvent, isLifecycleOnlyCycleTerminal, normalizeEvent, OpenClawRoomRuntime, resolveStandaloneRecipientSelectors, validateActiveEpochPage} from "../src/runtime.js";
 import {RoomAPIError} from "../src/room-client.js";
 import {loadState, saveState, validateState} from "../src/state.js";
 
@@ -1691,7 +1691,7 @@ test("shared context resolves the exact attached document version as untrusted e
   assert.doesNotMatch(rendered, /wrong/);
 });
 
-test("a later message receives the authorized Room document library without reattachment", async () => {
+test("a later message receives the Room document library as a catalog without document text", async () => {
   const runtime = deliveryLifecycleRuntime();
   runtime.client = {
     roomState: async () => ({title: "OpenClaw", headSeq: 20, activeEpoch: {id: "epoch-1", startsAtSeq: 1}}),
@@ -1699,21 +1699,27 @@ test("a later message receives the authorized Room document library without reat
     readEvents: async () => ({activeEpochId: "epoch-1", activeEpochStartsAtSeq: 1, events: []}),
     listArtifacts: async () => ({items: [{
       artifactId: "artifact-1", visibility: "room_shared", title: "Agenda",
-      currentVersion: {versionId: "version-1", name: "agenda.docx", extractionStatus: "ready", extractedText: "Collective agenda text"},
+      currentVersion: {versionId: "version-1", name: "agenda.docx", sha256: "b".repeat(64), extractionStatus: "ready", extractedText: "Collective agenda text"},
+    }, {
+      artifactId: "artifact-private", visibility: "private", title: "Hidden",
+      currentVersion: {versionId: "version-p", name: "hidden.pdf", extractedText: "secret"},
     }]}),
-    getArtifact: async () => { throw new Error("ready library item must not trigger a second fetch"); },
+    getArtifact: async () => { throw new Error("catalog listing must not fetch any artifact"); },
   };
   const rendered = await runtime.sharedRoomContext(
     {id: "later-20", seq: 20, type: "message.posted", payload: {body: "Read the document"}},
     {id: "epoch-1", startsAtSeq: 1},
   );
+  assert.match(rendered, /catalog only/);
   assert.match(rendered, /agenda\.docx/);
-  assert.match(rendered, /Collective agenda text/);
+  assert.match(rendered, /artifact-1 \/ version-1/);
+  assert.match(rendered, new RegExp("b".repeat(64)));
+  assert.doesNotMatch(rendered, /Collective agenda text/);
+  assert.doesNotMatch(rendered, /hidden\.pdf|secret/);
 });
 
-test("a pending library version uses the supported exact-read text backfill", async () => {
+test("a pending library version is listed as pending without a backfill read", async () => {
   const runtime = deliveryLifecycleRuntime();
-  let exactReads = 0;
   runtime.client = {
     roomState: async () => ({title: "OpenClaw", headSeq: 21, activeEpoch: {id: "epoch-1", startsAtSeq: 1}}),
     roomPolicy: async () => ({policy: {coordinationMode: "open"}}),
@@ -1722,16 +1728,126 @@ test("a pending library version uses the supported exact-read text backfill", as
       artifactId: "artifact-1", visibility: "room_shared", title: "Agenda",
       currentVersion: {versionId: "version-1", name: "agenda.docx", extractionStatus: "pending", extractedText: ""},
     }]}),
-    getArtifact: async () => {
-      exactReads += 1;
-      return {currentVersion: {versionId: "version-1", name: "agenda.docx", extractionStatus: "ready", extractedText: "Backfilled agenda text"}};
-    },
+    getArtifact: async () => { throw new Error("catalog listing must not read pending versions"); },
   };
   const rendered = await runtime.sharedRoomContext(
     {id: "later-21", seq: 21, type: "message.posted", payload: {body: "Read the document"}},
     {id: "epoch-1", startsAtSeq: 1},
   );
-  assert.equal(exactReads, 1);
-  assert.match(rendered, /Extraction status: ready/);
-  assert.match(rendered, /Backfilled agenda text/);
+  assert.match(rendered, /extraction pending/);
+});
+
+test("a bound attachment keeps its exact full text while the rest of the library stays a catalog", async () => {
+  const runtime = deliveryLifecycleRuntime();
+  const source = {
+    id: "human-30", seq: 30, type: "message.posted", actorRole: "human_owner",
+    payload: {body: "Read this", attachments: [{artifactId: "artifact-1", versionId: "version-1", name: "bound.pdf", mediaType: "application/pdf", sha256: "d".repeat(64)}]},
+  };
+  runtime.client = {
+    roomState: async () => ({title: "OpenClaw", headSeq: 30, activeEpoch: {id: "epoch-1", startsAtSeq: 1}}),
+    roomPolicy: async () => ({policy: {coordinationMode: "open"}}),
+    readEvents: async () => ({activeEpochId: "epoch-1", activeEpochStartsAtSeq: 1, events: [source]}),
+    listArtifacts: async () => ({items: [
+      {artifactId: "artifact-1", visibility: "room_shared", title: "Bound", currentVersion: {versionId: "version-1", name: "bound.pdf", extractionStatus: "ready", extractedText: "IGNORED"}},
+      {artifactId: "artifact-2", visibility: "room_shared", title: "Other", currentVersion: {versionId: "version-9", name: "other.pdf", extractionStatus: "ready", extractedText: "Other full text"}},
+    ]}),
+    getArtifact: async () => ({currentVersion: {versionId: "version-1", extractionStatus: "ready", extractedText: "Exact bound text"}}),
+  };
+  const rendered = await runtime.sharedRoomContext(source, {id: "epoch-1", startsAtSeq: 1});
+  assert.match(rendered, /Exact bound text/);
+  assert.match(rendered, /other\.pdf/);
+  assert.doesNotMatch(rendered, /Other full text/);
+  assert.doesNotMatch(rendered, /- bound\.pdf/);
+});
+
+test("B13: library growth and wave count do not grow the OpenClaw document context", async () => {
+  const documents = [0, 1].map((index) => ({
+    artifactId: `artifact-${index}`, visibility: "room_shared", title: `Doc ${index}`,
+    currentVersion: {versionId: `v${index}`, name: `doc-${index}.pdf`, mediaType: "application/pdf", sha256: String.fromCharCode(97 + index).repeat(64), extractionStatus: "ready", extractedText: "Lorem ipsum ".repeat(2_050).slice(0, 22_500)},
+  }));
+  const before = Math.min(ARTIFACT_CONTEXT_CHARACTER_LIMIT, documents.reduce((sum, d) => sum + d.currentVersion.extractedText.length, 0));
+  const sizes = [];
+  for (let wave = 0; wave < 12; wave += 1) {
+    const rendered = await sourceArtifactContext({id: `wave-${wave}`, type: "message.posted", payload: {body: `Question ${wave}`}}, [], async () => { throw new Error("no fetch"); }, documents);
+    sizes.push(rendered.length);
+    assert.doesNotMatch(rendered, /Lorem ipsum/);
+  }
+  assert.equal(new Set(sizes).size, 1, JSON.stringify(sizes));
+  assert.ok(sizes[0] < 1_000);
+  assert.ok(before > 40_000);
+  console.log(`B13 measurement (OpenClaw document context per wave): before=${before} chars, after=${sizes[0]} chars, waves=12`);
+});
+
+const HANDOVER_START = {
+  id: "start-2", seq: 41, type: "discussion.started", actorRole: "human_owner", actorId: "owner-1",
+  payload: {
+    epoch: {id: "epoch-2", ordinal: 2, startsAtSeq: 41, topic: {title: "Continue the work"}, status: "active"},
+    handover: {
+      sourceEpochId: "epoch-1", sourceEpochOrdinal: 1, coveredThroughSeq: 40, revision: 1, reviewStatus: "human_reviewed",
+      digest: "f".repeat(64), submittedByMembershipId: "owner-1",
+      sections: {goal: "Keep decisions, drop the accumulated history.", decisions: [{statement: "Fresh session per discussion.", rationale: "Prompts grew to 59k characters."}], openQuestions: ["Which runtime hook reports usage?"]},
+      sourceRefs: [{kind: "event", eventId: "evt-40", seq: 40, note: "decision message"}],
+    },
+  },
+};
+
+test("discussionHandoverContext renders bounded sections and sources, nothing without a handover", () => {
+  const rendered = discussionHandoverContext(HANDOVER_START);
+  for (const expected of ["Reviewed handover from discussion #1", "covered through canonical seq 40", "Goal: Keep decisions", "- Fresh session per discussion. — because Prompts grew to 59k characters.", "Open questions:", "event evt-40 (seq 40) — decision message", "Derived summary, not a source"]) {
+    assert.ok(rendered.includes(expected), expected);
+  }
+  assert.equal(discussionHandoverContext({payload: {epoch: {}}}), "");
+  assert.equal(discussionHandoverContext(undefined), "");
+  const huge = structuredClone(HANDOVER_START);
+  huge.payload.handover.sections.results = Array.from({length: 10}, () => "x".repeat(2_000));
+  assert.ok(discussionHandoverContext(huge).length <= HANDOVER_CONTEXT_CHARACTER_LIMIT);
+});
+
+test("B34: the new discussion's model context carries the handover, a library catalog and a fresh conversation id", async () => {
+  const runtime = deliveryLifecycleRuntime();
+  runtime.state.epochSessionRoutingInitialized = true;
+  runtime.state.legacySessionEpochId = "epoch-1";
+  const reads = [];
+  runtime.client = {
+    roomState: async () => ({title: "OpenClaw", headSeq: 41, activeEpoch: {id: "epoch-2", startsAtSeq: 41}}),
+    roomPolicy: async () => ({policy: {coordinationMode: "open"}}),
+    readEvents: async (_session, after) => { reads.push(after); return {activeEpochId: "epoch-2", activeEpochStartsAtSeq: 41, events: [HANDOVER_START]}; },
+    listArtifacts: async () => ({items: [{artifactId: "artifact-1", visibility: "room_shared", title: "Kabeltracker", currentVersion: {versionId: "v1", name: "kabeltracker.pdf", extractionStatus: "ready", extractedText: "LIBRARY FULL TEXT ".repeat(2_000)}}]}),
+    getArtifact: async () => { throw new Error("catalog listing must not fetch artifacts"); },
+  };
+  const rendered = await runtime.sharedRoomContext(HANDOVER_START, {id: "epoch-2", startsAtSeq: 41});
+  assert.match(rendered, /Reviewed handover from discussion #1/);
+  assert.match(rendered, /kabeltracker\.pdf/);
+  assert.doesNotMatch(rendered, /LIBRARY FULL TEXT/);
+  assert.equal(reads.length, 1, "the start event is in the loaded page; no extra read");
+  const normalized = normalizeEvent(HANDOVER_START, "room-1", null, rendered, "epoch-2", "epoch-1");
+  assert.equal(normalized.conversationId, epochConversationId("room-1", "epoch-2"));
+  assert.notEqual(normalized.conversationId, "room-1");
+  assert.match(normalized.text, /synthetic_sociality_room_history/);
+  assert.ok(normalized.text.length < 8_000, String(normalized.text.length));
+  console.log(`B34 measurement (OpenClaw first prompt of new discussion incl. handover): ${normalized.text.length} chars; library text present: ${normalized.text.includes("LIBRARY FULL TEXT")}`);
+  // A later turn far past the epoch start reuses the cached handover without re-reading it.
+  const later = {id: "m-99", seq: 99, type: "message.posted", actorRole: "human_owner", payload: {body: "What did we decide?"}};
+  runtime.client.roomState = async () => ({title: "OpenClaw", headSeq: 99, activeEpoch: {id: "epoch-2", startsAtSeq: 41}});
+  runtime.client.readEvents = async (_session, after) => { reads.push(after); return {activeEpochId: "epoch-2", activeEpochStartsAtSeq: 41, events: [later]}; };
+  const againRendered = await runtime.sharedRoomContext(later, {id: "epoch-2", startsAtSeq: 41});
+  assert.match(againRendered, /Reviewed handover from discussion #1/);
+  assert.deepEqual(reads, [40, 49]);
+});
+
+test("a later turn fetches the epoch start event once when it lies outside the transcript window", async () => {
+  const runtime = deliveryLifecycleRuntime();
+  const reads = [];
+  const later = {id: "m-99", seq: 99, type: "message.posted", actorRole: "human_owner", payload: {body: "Later"}};
+  runtime.client = {
+    roomState: async () => ({title: "OpenClaw", headSeq: 99, activeEpoch: {id: "epoch-2", startsAtSeq: 41}}),
+    roomPolicy: async () => ({policy: {coordinationMode: "open"}}),
+    readEvents: async (_session, after) => { reads.push(after); return {activeEpochId: "epoch-2", activeEpochStartsAtSeq: 41, events: after === 40 ? [HANDOVER_START] : [later]}; },
+    listArtifacts: async () => ({items: []}),
+  };
+  const first = await runtime.sharedRoomContext(later, {id: "epoch-2", startsAtSeq: 41});
+  const second = await runtime.sharedRoomContext(later, {id: "epoch-2", startsAtSeq: 41});
+  assert.match(first, /Reviewed handover/);
+  assert.match(second, /Reviewed handover/);
+  assert.deepEqual(reads, [49, 40, 49]);
 });
