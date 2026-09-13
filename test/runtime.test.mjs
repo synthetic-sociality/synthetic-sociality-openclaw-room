@@ -14,6 +14,24 @@ const ZURIE_FIXTURE_HASHES = Object.freeze({
   134: "fa953f52ef58410726a0c61687b88cc7d329874210820b015c93ca638dda0a49",
 });
 
+test("disabled account refuses initialization before any state read or network call", async () => {
+  let calls=0;
+  const runtime=new OpenClawRoomRuntime({accountId:"disabled",enabled:false,stateFile:"/does-not-exist/state.json"},{fetchImpl:async()=>{calls++;throw Error("unexpected network");}});
+  await assert.rejects(runtime.initialize(),/disabled/);assert.equal(calls,0);
+});
+
+test("disabled or revoked private state refuses registration without rewriting it", async () => {
+  for (const flag of [{enabled:false},{revoked:true}]) {
+    const directory=await mkdtemp(join(tmpdir(),"openclaw-disabled-state-"));
+    const stateFile=join(directory,"state.json");
+    await saveState(stateFile,{version:1,baseUrl:"https://fixture.invalid/api",roomId:"room",membershipId:"membership",credential:"fixture-only",clientInstanceId:"fixture",cursor:0,...flag});
+    const before=await readFile(stateFile);let calls=0;
+    const runtime=new OpenClawRoomRuntime({accountId:"fixture",enabled:true,stateFile},{fetchImpl:async()=>{calls++;throw Error("unexpected network");}});
+    await assert.rejects(runtime.initialize(),/disabled, revoked or closed/);
+    assert.equal(calls,0);assert.deepEqual(await readFile(stateFile),before);
+  }
+});
+
 async function loadZurieFixture(seq) {
   const bytes = await readFile(new URL(`./fixtures/zurie-epoch-boundary/seq-${seq}.canonical.json`, import.meta.url));
   assert.equal(bytes.at(-1), 0x0a, `fixture ${seq} must have one repository final LF`);

@@ -27,6 +27,15 @@ labels it as untrusted uploaded content, and never downloads or executes raw
 document bytes. An exact artifact read also invokes the Room server's supported
 deterministic text backfill for older pending versions.
 
+Version 0.2.45 (disabled-account lifecycle): native channels and the presence
+fallback share the same account selection, enabled flags and state-file alias
+resolution. The fallback reads the host's current runtime config each reconcile,
+closes disabled/removed/rebound accounts, and aborts pending initialization on
+disable or native takeover. An administrative disable cannot be bypassed by
+managed-state discovery. Enabled quarantined accounts retain credential renewal;
+no journal, cursor, model or profile is reset. Config changes follow the host's
+normal apply/restart semantics; this release does not promise hot reload.
+
 Version 0.2.44 (epoch handover): the Room document
 library enters an ordinary turn as a catalog only (names, identifiers, versions,
 digests, extraction status); exact message attachments keep their full

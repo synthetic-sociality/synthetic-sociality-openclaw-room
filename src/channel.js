@@ -1,19 +1,12 @@
 import {defineChannelPluginEntry} from "openclaw/plugin-sdk/channel-core";
 import {defineChannelMessageAdapter} from "openclaw/plugin-sdk/channel-message";
 import {buildChannelInboundEventContext} from "openclaw/plugin-sdk/channel-inbound";
-import {existsSync, readFileSync, readdirSync, lstatSync} from "node:fs";
-import {join} from "node:path";
-import {defaultStateDirectory, loadState, validateState} from "./state.js";
+import {loadState} from "./state.js";
 import {registerRoomCommands} from "./commands.js";
 import {markChannelActive, markChannelInactive, registerPresenceFallback} from "./presence-fallback.js";
 import {registerRoomHistoryTool} from "./history.js";
-import {
-  accountCandidates,
-  claimRuntimeOwnership,
-  resolveAccountConfig,
-  resolveAccountSelection,
-  selectUniqueAccountIds,
-} from "./account.js";
+import {claimRuntimeOwnership} from "./account.js";
+import {resolveRoomAccount as resolveAccount, resolvedRoomAccounts} from "./account-discovery.js";
 import {looksLikeRoomId, normalizeRoomTarget, resolveConfiguredRoomTarget} from "./target.js";
 import {outboundIdempotencyKey} from "./outbound.js";
 import {roomErrorDiagnostic} from "./room-client.js";
@@ -39,48 +32,6 @@ const receipt = (eventId, sentAt) => ({
   parts: [{platformMessageId: eventId, kind: "text", index: 0}],
   sentAt,
 });
-
-function channelConfig(cfg) { return cfg?.channels?.[ID] ?? {}; }
-
-function managedAccounts() {
-  const directory = defaultStateDirectory();
-  try {
-    return readdirSync(directory, {withFileTypes: true})
-      .filter((entry) => entry.isFile() && !entry.isSymbolicLink() && entry.name.endsWith(".json"))
-      .map((entry) => entry.name.slice(0, -5));
-  } catch { return []; }
-}
-
-function managedAccount(accountId) {
-  const stateFile = join(defaultStateDirectory(), `${accountId}.json`);
-  if (!existsSync(stateFile)) return null;
-  try {
-    const stat = lstatSync(stateFile);
-    if (!stat.isFile() || stat.isSymbolicLink() || (stat.mode & 0o077) !== 0) return null;
-    const state = JSON.parse(readFileSync(stateFile, "utf8"));
-    validateState(state);
-    return {baseUrl: state.baseUrl, stateFile};
-  } catch { return null; }
-}
-
-function resolveAccount(cfg, accountId = "default", {managedResolver = managedAccount} = {}) {
-  const section = channelConfig(cfg);
-  const raw = resolveAccountConfig(section, accountId);
-  const selected = resolveAccountSelection({
-    accountId,
-    raw,
-    managed: managedResolver(accountId),
-    defaultStateFile: join(defaultStateDirectory(), "default.json"),
-  });
-  return {
-    accountId,
-    enabled: raw.enabled !== false,
-    configured: accountId === "default" || selected.managed !== null || (typeof raw.baseUrl === "string" && typeof raw.stateFile === "string"),
-    baseUrl: selected.baseUrl,
-    stateFile: selected.stateFile,
-    agentId: String(raw.agentId ?? "main"),
-  };
-}
 
 export function createRoomChannel({makeClient}) {
   const live = new Map();
@@ -132,10 +83,7 @@ export function createRoomChannel({makeClient}) {
       },
     },
     config: {
-      listAccountIds: (cfg) => selectUniqueAccountIds(
-        accountCandidates(channelConfig(cfg), managedAccounts()),
-        (accountId) => resolveAccount(cfg, accountId),
-      ),
+      listAccountIds: (cfg) => resolvedRoomAccounts(cfg).map((account) => account.accountId),
       resolveAccount: (cfg, accountId) => resolveAccount(cfg, accountId ?? "default"),
       isEnabled: (account) => account.enabled,
       isConfigured: (account) => account.configured,

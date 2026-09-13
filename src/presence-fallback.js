@@ -1,6 +1,5 @@
-import {readdirSync} from "node:fs";
-import {join} from "node:path";
-import {defaultStateDirectory} from "./state.js";
+import {resolvedRoomAccounts} from "./account-discovery.js";
+import {canonicalStateFileIdentity} from "./account.js";
 import {roomErrorDiagnostic} from "./room-client.js";
 
 const START_GRACE_MS = 5_000;
@@ -12,24 +11,16 @@ let serviceRunning = false;
 let serviceTask = null;
 let wakeStop = null;
 
-function stateAccounts() {
-  try {
-    return readdirSync(defaultStateDirectory(), {withFileTypes: true})
-      .filter((entry) => entry.isFile() && !entry.isSymbolicLink() && entry.name.endsWith(".json"))
-      .map((entry) => ({
-        accountId: entry.name.slice(0, -5),
-        stateFile: join(defaultStateDirectory(), entry.name),
-      }));
-  } catch {
-    return [];
-  }
+function accountKey(account) {
+  return JSON.stringify([canonicalStateFileIdentity(account.stateFile), account.baseUrl, account.agentId]);
 }
 
 async function stopFallback(accountId) {
-  const runtime = fallbackRuntimes.get(accountId);
-  if (!runtime) return;
+  const entry = fallbackRuntimes.get(accountId);
+  if (!entry) return;
   fallbackRuntimes.delete(accountId);
-  await runtime.close().catch(() => {});
+  entry.abort.abort();
+  await entry.runtime.close().catch(() => {});
 }
 
 export async function markChannelActive(accountId) {
@@ -45,7 +36,7 @@ export function registerPresenceFallback(api, {
   makeClient,
   startGraceMs = START_GRACE_MS,
   reconcileMs = RECONCILE_MS,
-  accounts = stateAccounts,
+  accounts = () => resolvedRoomAccounts(api.runtime.config.current()),
   waitFn = wait,
 } = {}) {
   api.registerService({
@@ -57,23 +48,45 @@ export function registerPresenceFallback(api, {
       serviceTask = (async () => {
         await pause(startGraceMs);
         while (serviceRunning) {
-          for (const account of accounts()) {
+          let eligible;
+          try {
+            eligible = new Map(accounts().filter((account) => account.enabled !== false && account.configured !== false)
+              .map((account) => [account.accountId, {account, key: accountKey(account)}]));
+          } catch (error) {
+            // Config resolution failure is never permission to keep an old
+            // fallback alive. Retry later without retaining stale authority.
+            eligible = new Map();
+            ctx.logger?.error?.(`Room presence account resolution failed${roomErrorDiagnostic(error)}`);
+          }
+          for (const [id, entry] of fallbackRuntimes) {
+            if (activeChannels.has(id) || eligible.get(id)?.key !== entry.key) await stopFallback(id);
+          }
+          for (const {account, key} of eligible.values()) {
+            if (!serviceRunning) break;
             if (activeChannels.has(account.accountId) || fallbackRuntimes.has(account.accountId)) continue;
-            const runtime = makeClient({
-              accountId: account.accountId,
-              stateFile: account.stateFile,
-              baseUrl: "",
-            });
             try {
-              const session = await runtime.initialize();
-              if (activeChannels.has(account.accountId) || !serviceRunning) {
-                await runtime.close().catch(() => {});
-                continue;
-              }
-              fallbackRuntimes.set(account.accountId, runtime);
-              ctx.logger?.warn?.(`[${account.accountId}] Native channel did not register; Room presence fallback established (${session.sessionId})`);
+              const runtime = makeClient(account);
+              const entry = {runtime, key, abort: new AbortController()};
+              // Register before initialization: disable/native takeover can
+              // cancel a pending initialization, without blocking reconcile.
+              fallbackRuntimes.set(account.accountId, entry);
+              entry.task = (async () => {
+                try {
+                  const session = await runtime.initialize(entry.abort.signal);
+                  if (fallbackRuntimes.get(account.accountId) !== entry) return;
+                  const current = accounts().find((candidate) => candidate.accountId === account.accountId);
+                  if (!serviceRunning || activeChannels.has(account.accountId) || !current || current.enabled === false || current.configured === false || accountKey(current) !== key) {
+                    await stopFallback(account.accountId);
+                    return;
+                  }
+                  ctx.logger?.warn?.(`[${account.accountId}] Native channel did not register; Room presence fallback established (${session.sessionId})`);
+                } catch (error) {
+                  const cancelled = entry.abort.signal.aborted;
+                  if (fallbackRuntimes.get(account.accountId) === entry) await stopFallback(account.accountId);
+                  if (!cancelled) ctx.logger?.error?.(`[${account.accountId}] Room presence fallback failed${roomErrorDiagnostic(error)}`);
+                }
+              })();
             } catch (error) {
-              await runtime.close().catch(() => {});
               ctx.logger?.error?.(`[${account.accountId}] Room presence fallback failed${roomErrorDiagnostic(error)}`);
             }
           }
@@ -86,7 +99,9 @@ export function registerPresenceFallback(api, {
     stop: async () => {
       serviceRunning = false;
       wakeStop?.();
+      const tasks = [...fallbackRuntimes.values()].map((entry) => entry.task);
       await Promise.all([...fallbackRuntimes.keys()].map(stopFallback));
+      await Promise.all(tasks);
       await serviceTask?.catch(() => {});
       serviceTask = null;
       wakeStop = null;

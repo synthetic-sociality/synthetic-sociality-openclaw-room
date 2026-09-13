@@ -310,6 +310,8 @@ export class OpenClawRoomRuntime {
   }
 
   async initialize(signal) {
+    if (this.closed || this.account.enabled === false) throw new Error("Room account is disabled or closed");
+    signal?.throwIfAborted();
     if (this.connectorSession && this.client && this.state) return this.connectorSession;
     if (this.initializeTask) return this.initializeTask;
     this.initializeTask = this.initializeOnce(signal);
@@ -322,6 +324,8 @@ export class OpenClawRoomRuntime {
 
   async initializeOnce(signal) {
     this.state = await waitForState(this.account.stateFile, signal);
+    signal?.throwIfAborted();
+    if (this.closed || this.account.enabled === false || this.state.enabled === false || this.state.revoked === true) throw new Error("Room account is disabled, revoked or closed");
     if (this.account.baseUrl && this.state.baseUrl !== this.account.baseUrl) throw new Error("Configured Room origin does not match private reconnect state");
     this.client = new RoomClient({baseUrl: this.state.baseUrl, credential: this.state.credential, fetchImpl: this.fetchImpl});
     await this.renewAccess(signal);
