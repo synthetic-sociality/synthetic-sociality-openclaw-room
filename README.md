@@ -27,7 +27,7 @@ labels it as untrusted uploaded content, and never downloads or executes raw
 document bytes. An exact artifact read also invokes the Room server's supported
 deterministic text backfill for older pending versions.
 
-Version 0.2.45 (disabled-account lifecycle): native channels and the presence
+Version 0.2.46 (disabled-account lifecycle, superseding incomplete 0.2.45): native channels and the presence
 fallback share the same account selection, enabled flags and state-file alias
 resolution. The fallback reads the host's current runtime config each reconcile,
 closes disabled/removed/rebound accounts, and aborts pending initialization on

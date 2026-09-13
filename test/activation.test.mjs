@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import {mkdtemp, mkdir, rm, writeFile} from "node:fs/promises";
+import {mkdtemp, mkdir, readFile, rm, writeFile} from "node:fs/promises";
 import {tmpdir} from "node:os";
 import {join} from "node:path";
 import {activateRoomChannel, healManagedRoomChannel, resolveOpenClawBinary} from "../src/activation.js";
@@ -105,3 +105,30 @@ test("prefers an explicit OpenClaw binary and supports Homebrew hosts", () => {
   assert.equal(resolveOpenClawBinary({env: {OPENCLAW_BIN: "/custom/openclaw"}, exists: () => false}), "/custom/openclaw");
   assert.equal(resolveOpenClawBinary({env: {}, exists: (value) => value === "/opt/homebrew/bin/openclaw"}), "/opt/homebrew/bin/openclaw");
 });
+
+for (const scenario of ["disabled-default", "disabled-state", "revoked-state", "selected-other-default", "disabled-alias", "enabled-alias", "unfinished-pairing"]) {
+  test(`startup recovery respects administrative identity: ${scenario}`, async (t) => {
+    const stateRoot = await mkdtemp(join(tmpdir(), "openclaw-room-recovery-"));
+    t.after(() => rm(stateRoot, {recursive: true, force: true}));
+    const stateFile = join(stateRoot, "synthetic-sociality-room", "accounts", "default.json");
+    await mkdir(join(stateRoot, "synthetic-sociality-room", "accounts"), {recursive: true});
+    const state = {baseUrl: "https://room.example/api"};
+    const current = {};
+    if (scenario === "disabled-default") current.enabled = false;
+    if (scenario === "disabled-state") state.enabled = false;
+    if (scenario === "revoked-state") state.revoked = true;
+    if (scenario === "selected-other-default") current.stateFile = join(stateRoot, "selected.json");
+    if (scenario.endsWith("alias")) current.accounts = {fixture: {enabled: scenario === "enabled-alias", stateFile}};
+    const configFile = join(stateRoot, "openclaw.json");
+    await writeFile(stateFile, JSON.stringify(state));
+    await writeFile(configFile, JSON.stringify({channels: {"synthetic-sociality-room": current}}));
+    const before = await Promise.all([readFile(configFile), readFile(stateFile)]);
+    let activated = 0, restarted = 0;
+    const healed = await healManagedRoomChannel({stateRoot, activate: async () => { activated++; }, restart: () => { restarted++; }});
+    const expected = scenario === "unfinished-pairing";
+    assert.equal(healed, expected);
+    assert.equal(activated, Number(expected));
+    assert.equal(restarted, Number(expected));
+    assert.deepEqual(await Promise.all([readFile(configFile), readFile(stateFile)]), before);
+  });
+}

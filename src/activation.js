@@ -1,7 +1,7 @@
 import {execFile, spawn} from "node:child_process";
 import {existsSync} from "node:fs";
 import {readFile} from "node:fs/promises";
-import {join} from "node:path";
+import {join, resolve} from "node:path";
 import {openClawStateDirectory} from "./state.js";
 
 const CHANNEL_ID = "synthetic-sociality-room";
@@ -57,6 +57,13 @@ export async function healManagedRoomChannel({home, stateRoot = home ? join(home
     throw error;
   }
   const current = config?.channels?.[CHANNEL_ID] ?? {};
+  // Recovery of an unfinished first pairing is not administrative enablement.
+  // Never resurrect disabled/revoked state, overwrite another selected default,
+  // or reactivate a file already owned by an explicitly configured account.
+  if (current.enabled === false || state.enabled === false || state.revoked === true) return false;
+  if (current.stateFile && resolve(current.stateFile) !== resolve(stateFile)) return false;
+  if (Object.values(current.accounts ?? {}).some((account) =>
+    account?.stateFile && resolve(account.stateFile) === resolve(stateFile))) return false;
   if (current.enabled !== false && current.baseUrl === state.baseUrl && current.stateFile === stateFile) return false;
   await activate({baseUrl: state.baseUrl, stateFile});
   restart();
