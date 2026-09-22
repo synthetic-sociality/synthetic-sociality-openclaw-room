@@ -226,7 +226,17 @@ function repairIntentBoundToState(deliveryKey, intent, state) {
   if (!["v1", "v2"].includes(intent.messagePayloadDialect)) return false;
   if (!intent.identity || intent.identity.roomId !== state.roomId || !String(intent.identity.sourceEventId ?? "")) return false;
   if (intent.receipt && intent.receipt.eventId !== intent.canonicalMessage.id) return false;
-  if (!validCycleIdentity(intent.identity.cycle) && !String(intent.turn?.turnId ?? "")) return false;
+  // An open-Room delivery (ADR 0089) carries neither a cycle nor a speaking
+  // turn: it is posted directly and has no lifecycle call to reconcile. Accept
+  // exactly that shape on v2 state so a duplicate delivery of the same source
+  // returns the canonical receipt instead of failing closed. Legacy v1 states
+  // without cycle or turn stay rejected.
+  const openDelivery = !intent.identity.cycle && !String(intent.turn?.turnId ?? "");
+  if (openDelivery) {
+    if (intent.version !== 2 || intent.lifecycleState !== "not_required" || intent.lifecycleRequest) return false;
+  } else if (!validCycleIdentity(intent.identity.cycle) && !String(intent.turn?.turnId ?? "")) {
+    return false;
+  }
   if (intent.identity.cycle) {
     const request = intent.lifecycleRequest;
     if (!request || request.kind !== "cycle"

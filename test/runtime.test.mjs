@@ -1940,3 +1940,47 @@ test("the Room client preserves the reply cap refusal code", () => {
   assert.equal(error.code, "reply_cap_reached");
   assert.equal(error.retryable, false);
 });
+
+// ADR 0089: a human "summarize now" still uses one coordinator cycle in an open Room.
+test("open-room summarize starts one coordinator cycle", async () => {
+  const runtime = new OpenClawRoomRuntime({accountId: "default", stateFile: "/unused", baseUrl: "https://room.example/api"});
+  runtime.state = {roomId: "room-1", membershipId: "member-1"};
+  const starts = [];
+  runtime.client = {
+    roomPolicy: async () => ({policy: {coordinationMode: "open", summaryCoordinatorMembershipId: "member-1"}}),
+    roomState: async () => ({activeEpoch: {id: "epoch-1"}, roster: ["member-1", "member-2"].map(membershipId => ({
+      membershipId, displayName: membershipId, status: "active", role: "participant_agent",
+    }))}),
+    startDiscussionCycle: async (_state, request) => { starts.push(request); return {id: "summary-cycle"}; },
+  };
+  const event = {id: "summarize-1", type: "human.command", actorId: "owner", actorRole: "human_owner",
+    payload: {command: {command: "summarize", idempotencyKey: "sum-1"}}};
+  assert.equal(isAssignedEvent(event, "member-1"), true);
+  assert.equal(await runtime.prepareCycleAttempt(event), false);
+  assert.equal(starts.length, 1);
+  assert.deepEqual(starts[0].roster.map(({membershipId}) => membershipId), ["member-1"]);
+  assert.equal(starts[0].sourceEventId, "summarize-1");
+});
+
+// A duplicate delivery of the same open-mode source posts exactly once.
+test("duplicate open-mode delivery reuses the canonical receipt without reposting", async () => {
+  const runtime = new OpenClawRoomRuntime({accountId: "default", stateFile: "/unused", baseUrl: "https://room.example/api"});
+  runtime.state = {roomId: "room-1", membershipId: "member-1", clientInstanceId: "client-1", messagePayloadDialect: "v2", cursor: 0};
+  runtime.persistState = async () => {};
+  let posts = 0;
+  runtime.client = {
+    roomState: async () => ({activeEpoch: {id: "epoch-1"}, headSeq: 3, roster: []}),
+    roomPolicy: async () => ({policy: {coordinationMode: "open"}}),
+    postMessage: async () => {
+      posts += 1;
+      return {id: "canonical-1", seq: 4, ts: "2026-09-22T10:00:00Z"};
+    },
+  };
+  const request = {roomId: "room-1", text: "One open reply", replyToId: "src-1", idempotencyKey: "src-1:final", sourceEventId: "src-1"};
+  const first = await runtime.postAndFinishOnce(request);
+  const second = await runtime.postAndFinishOnce(request);
+  assert.equal(first.eventId, "canonical-1");
+  assert.deepEqual(second, first);
+  assert.equal(posts, 1);
+  assert.equal(runtime.state.deliveryIntents["src-1:final"].deliveryState, "posted");
+});
