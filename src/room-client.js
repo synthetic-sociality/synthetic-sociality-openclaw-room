@@ -14,6 +14,8 @@ const SAFE_API_CODES = new Set([
   "invitation_expired",
   "invitation_invalid",
   "request_validation_failed",
+  // ADR 0089: the Room refused a counted open-mode post beyond the reply cap.
+  "reply_cap_reached",
   "stale_context",
   "validation_error",
 ]);

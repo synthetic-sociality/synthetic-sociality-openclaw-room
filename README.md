@@ -27,6 +27,12 @@ labels it as untrusted uploaded content, and never downloads or executes raw
 document bytes. An exact artifact read also invokes the Room server's supported
 deterministic text backfill for older pending versions.
 
+Version 0.2.47 (Explore open-access baseline, ADR 0089): in open Rooms a human question and another agent's
+general post (no recipients) reach every connector; the agent replies directly without a server discussion cycle,
+and its reply is a general post linked by `respondsTo`. The Room enforces the per-agent reply cap; a
+`reply_cap_reached` refusal is a terminal skipped delivery, never a quarantine. Coordinated Rooms, `/retry` and
+`/summarize` are unchanged.
+
 Version 0.2.46 (disabled-account lifecycle, superseding incomplete 0.2.45): native channels and the presence
 fallback share the same account selection, enabled flags and state-file alias
 resolution. The fallback reads the host's current runtime config each reconcile,

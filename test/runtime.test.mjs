@@ -446,11 +446,12 @@ test("durable cursor acknowledgement does not emit presentation acknowledgement"
   assert.equal(presentationCalls, 0);
 });
 
-test("human source starts one server-owned cycle but only its ready event claims the attempt", async () => {
+test("coordinated human source starts one server-owned cycle but only its ready event claims the attempt", async () => {
   const runtime = new OpenClawRoomRuntime({accountId: "default", stateFile: "/unused", baseUrl: "https://room.example/api"});
   runtime.state = {roomId: "room-1", membershipId: "aura-member"};
   const starts = [];
   runtime.client = {
+    roomPolicy: async () => ({policy: {coordinationMode: "coordinated"}}),
     roomState: async () => ({
       activeEpoch: {id: "epoch-1"},
       roster: [
@@ -506,7 +507,7 @@ test("explicit owner retry targets only the non-summary agent and never calls a 
   assert.equal(isAssignedEvent({...event, payload: {command: {...event.payload.command, resolvedTargetMembershipIds: ["first", "second"]}}}, "second"), false);
 });
 
-test("eligible agent contribution seeds once while a cycle-bound contribution continues its cycle", async () => {
+test("open-room agent contribution replies directly while a cycle-bound contribution continues its cycle", async () => {
   const runtime = new OpenClawRoomRuntime({accountId: "default", stateFile: "/unused", baseUrl: "https://room.example/api"});
   runtime.state = {roomId: "room-1", membershipId: "reader-member"};
   const starts = [];
@@ -527,12 +528,13 @@ test("eligible agent contribution seeds once while a cycle-bound contribution co
       return {attempt: {id: `attempt-${claims.length}`, round: claims.length}, cycle: {id: cycleId}};
     },
   };
+  // ADR 0089: in an open Room an addressed peer replies directly, no cycle.
   const seeded = await runtime.prepareCycleAttempt({
     id: "agent-source", type: "message.posted", actorId: "author-member", actorRole: "participant_agent",
     payload: {body: "A new peer claim", resolvedRecipientMembershipIds: ["reader-member"]},
   });
-  assert.equal(seeded, false);
-  assert.deepEqual(starts[0].roster.map(({membershipId}) => membershipId), ["author-member", "reader-member"]);
+  assert.equal(seeded, null);
+  assert.equal(starts.length, 0);
   const continued = await runtime.prepareCycleAttempt({
     id: "agent-cycle-contribution", type: "message.posted", actorId: "author-member", actorRole: "participant_agent",
     payload: {body: "A bounded follow-up", cycleId: "cycle-existing", resolvedRecipientMembershipIds: ["reader-member"]},
@@ -543,7 +545,7 @@ test("eligible agent contribution seeds once while a cycle-bound contribution co
     payload: {cycleId: "cycle-existing", membershipId: "reader-member", sourceEventId: "agent-cycle-contribution"},
   });
   assert.equal(ready.cycle.id, "cycle-existing");
-  assert.equal(starts.length, 1);
+  assert.equal(starts.length, 0);
   assert.deepEqual(claims, ["cycle-existing"]);
 });
 
@@ -1873,4 +1875,68 @@ test("a later turn fetches the epoch start event once when it lies outside the t
   assert.match(first, /Reviewed handover/);
   assert.match(second, /Reviewed handover/);
   assert.deepEqual(reads, [49, 40, 49]);
+});
+
+// ADR 0089: open Rooms give agents equal access without a server-chosen order.
+test("open-room human and general agent posts reply directly without a cycle", async () => {
+  const runtime = new OpenClawRoomRuntime({accountId: "default", stateFile: "/unused", baseUrl: "https://room.example/api"});
+  runtime.state = {roomId: "room-1", membershipId: "reader-member"};
+  const starts = [];
+  runtime.client = {
+    roomPolicy: async () => ({policy: {coordinationMode: "open", agentFollowUpEnabled: true}}),
+    startDiscussionCycle: async (_state, request) => { starts.push(request); return {id: "unexpected"}; },
+  };
+  assert.equal(await runtime.prepareCycleAttempt({
+    id: "human-open", type: "message.posted", actorId: "human-1", actorRole: "human_owner", payload: {body: "Debate this"},
+  }), null);
+  const general = {id: "agent-general", type: "message.posted", actorId: "author-member", actorRole: "participant_agent",
+    payload: {body: "My view for everyone", resolvedRecipientMembershipIds: [], recipientSelectors: []}};
+  assert.equal(isAssignedEvent(general, "reader-member"), true);
+  assert.equal(isAssignedEvent(general, "author-member"), false);
+  assert.equal(await runtime.prepareCycleAttempt(general), null);
+  const addressedElsewhere = {...general, id: "agent-other", payload: {body: "Other?", resolvedRecipientMembershipIds: ["other-member"]}};
+  assert.equal(isAssignedEvent(addressedElsewhere, "reader-member"), false);
+  const cycleBound = {...general, id: "agent-cycle", payload: {body: "bounded", cycleId: "cycle-1", resolvedRecipientMembershipIds: []}};
+  assert.equal(isAssignedEvent(cycleBound, "reader-member"), false);
+  assert.equal(starts.length, 0);
+});
+
+test("coordinated rooms and disabled peer replies keep agent posts from starting replies", async () => {
+  for (const policy of [{coordinationMode: "coordinated", agentFollowUpEnabled: true}, {coordinationMode: "open", agentFollowUpEnabled: false}]) {
+    const runtime = new OpenClawRoomRuntime({accountId: "default", stateFile: "/unused", baseUrl: "https://room.example/api"});
+    runtime.state = {roomId: "room-1", membershipId: "reader-member"};
+    runtime.client = {
+      roomPolicy: async () => ({policy}),
+      startDiscussionCycle: async () => { throw new Error("must not start a cycle"); },
+    };
+    assert.equal(await runtime.prepareCycleAttempt({
+      id: "agent-general", type: "message.posted", actorId: "author-member", actorRole: "participant_agent",
+      payload: {body: "My view", resolvedRecipientMembershipIds: []},
+    }), false);
+  }
+});
+
+test("reply cap refusal is a terminal skipped delivery, never quarantined or reposted", async () => {
+  const runtime = new OpenClawRoomRuntime({accountId: "default", stateFile: "/unused", baseUrl: "https://room.example/api"});
+  runtime.state = {roomId: "room-1", membershipId: "reader-member", clientInstanceId: "client-1", messagePayloadDialect: "v2", cursor: 0};
+  runtime.persistState = async () => {};
+  let posts = 0;
+  runtime.client = {
+    roomState: async () => ({activeEpoch: {id: "epoch-1"}, headSeq: 7, roster: []}),
+    roomPolicy: async () => ({policy: {coordinationMode: "open"}}),
+    postMessage: async () => { posts += 1; throw new RoomAPIError(409, {code: "reply_cap_reached", retryable: false}); },
+  };
+  const request = {roomId: "room-1", text: "One more reply", replyToId: "src-1", idempotencyKey: "src-1:final", sourceEventId: "src-1"};
+  assert.deepEqual(await runtime.postAndFinishOnce(request), {skipped: true, reason: "reply_cap_reached"});
+  const intent = runtime.state.deliveryIntents["src-1:final"];
+  assert.equal(intent.deliveryState, "skipped");
+  assert.notEqual(intent.status, "quarantined");
+  assert.deepEqual(await runtime.postAndFinishOnce(request), {skipped: true, reason: "reply_cap_reached"});
+  assert.equal(posts, 1);
+});
+
+test("the Room client preserves the reply cap refusal code", () => {
+  const error = new RoomAPIError(409, {code: "reply_cap_reached", retryable: false});
+  assert.equal(error.code, "reply_cap_reached");
+  assert.equal(error.retryable, false);
 });

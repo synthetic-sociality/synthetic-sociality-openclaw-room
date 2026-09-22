@@ -595,10 +595,19 @@ export class OpenClawRoomRuntime {
   async prepareCycleAttempt(event, signal) {
     const payload = eventPayload(event.payload);
     const agentSeed = isAgentCycleSeed(event);
-    if (agentSeed) {
+    if (event.type === "message.posted" && !String(payload.cycleId ?? "").trim()) {
       const response = await this.client.roomPolicy(this.state, signal);
       const policy = response?.policy && typeof response.policy === "object" ? response.policy : response;
-      if (String(policy?.coordinationMode ?? "open") !== "open" || policy?.agentFollowUpEnabled === false) return false;
+      const open = String(policy?.coordinationMode ?? "open") === "open";
+      if (isAgentMessage(event)) {
+        // Open Rooms: agents answer when ready and may reply to one another,
+        // without a server-chosen order (ADR 0089). The server enforces the
+        // per-agent reply cap. Coordinated Rooms keep explicit routing.
+        if (!open || policy?.agentFollowUpEnabled === false) return false;
+        if (!agentSeed && !isGeneralAgentPost(payload)) return false;
+        return null;
+      }
+      if (open && isHumanCycleSource(event)) return null;
     }
     if (isHumanCycleSource(event) || agentSeed) {
       const cycle = await this.ensureDiscussionCycle(event, signal);
@@ -946,6 +955,7 @@ export class OpenClawRoomRuntime {
       if (intent.deliveryState === "quarantined" || intent.status === "quarantined") {
         throw new Error("OpenClaw Room delivery is quarantined for operator recovery");
       }
+      if (intent.deliveryState === "skipped") return {skipped: true, reason: String(intent.skippedReason || "skipped")};
     } else {
       const payloadDialect = this.state.messagePayloadDialect ?? "v1";
       if (!["v1", "v2"].includes(payloadDialect)) throw new Error("Room message payload dialect was not negotiated");
@@ -1056,6 +1066,16 @@ export class OpenClawRoomRuntime {
       try {
         message = await this.client.postMessage(this.state, intent.post, signal);
       } catch (error) {
+        if (error instanceof RoomAPIError && error.code === "reply_cap_reached") {
+          // The Room refused this counted open-mode post (ADR 0089). This is a
+          // legitimate terminal outcome without a post, not an unsafe retry.
+          intent.deliveryState = "skipped";
+          intent.status = "skipped";
+          intent.lifecycleState = "not_required";
+          intent.skippedReason = "reply_cap_reached";
+          await this.persistState();
+          return {skipped: true, reason: "reply_cap_reached"};
+        }
         if (error instanceof RoomAPIError && !error.retryable) {
           intent.deliveryState = "quarantined";
           intent.status = "quarantined";
@@ -1524,10 +1544,14 @@ export function isAssignedMessage(event, membershipId) {
   if (actorRole === "room_master" || actorRole === "admin") return true;
   // The server-resolved membership list is authoritative for selectors such
   // as display_name. Reading it also keeps platform adapters independent from
-  // the selector syntax used by the sender while preserving explicit routing:
-  // unaddressed agent speech must never wake every connector implicitly.
+  // the selector syntax used by the sender. A general agent post (no
+  // recipients, no cycle) is addressed to the whole Room (ADR 0089); whether
+  // it may start a reply is decided against the Room policy before any model
+  // work, so coordinated rooms keep explicit routing.
   if (Array.isArray(payload.resolvedRecipientMembershipIds)) {
-    return payload.resolvedRecipientMembershipIds.map(String).includes(String(membershipId));
+    const resolved = payload.resolvedRecipientMembershipIds.map(String);
+    if (resolved.length === 0) return isGeneralAgentPost(payload);
+    return resolved.includes(String(membershipId));
   }
   const selectors = payload.recipientSelectors ?? [];
   return selectors.some((selector) => selector.membershipId === membershipId || selector.kind === "everyone");
@@ -1571,6 +1595,15 @@ function isExplicitExecutionRetry(event) {
     && command?.arguments?.retryUnavailable === true
     && Array.isArray(command.resolvedTargetMembershipIds) && command.resolvedTargetMembershipIds.length === 1
     && (!command.targetSelectors || command.targetSelectors.length === 0);
+}
+
+function isGeneralAgentPost(payload) {
+  const selectors = Array.isArray(payload.recipientSelectors) ? payload.recipientSelectors : [];
+  return !String(payload.cycleId ?? "").trim() && selectors.length === 0;
+}
+
+function isAgentMessage(event) {
+  return event?.type === "message.posted" && ["participant_agent", "room_master"].includes(String(event?.actorRole ?? ""));
 }
 
 function isAgentCycleSeed(event) {

@@ -51,6 +51,7 @@ export function createRoomChannel({makeClient}) {
           resolveRecipientMentions: true,
           signal: ctx.signal,
         });
+        if (sent.skipped) throw new Error(`Room did not accept the post: ${sent.reason}`);
         return {messageId: sent.eventId, receipt: receipt(sent.eventId, sent.sentAt)};
       },
     },
@@ -111,6 +112,7 @@ export function createRoomChannel({makeClient}) {
             let cycleSettled = false;
             let visibleReplySent = false;
             let operationalFallbackSuppressed = false;
+            let skipReason = "";
             // A handler that throws never reached a deliberate decision either.
             let handlerCompleted = false;
             ctx.setStatus({...ctx.getStatus(), running: true, connected: true, lastInboundAt: Date.now(), lastError: null});
@@ -202,6 +204,10 @@ export function createRoomChannel({makeClient}) {
                           cycleSettled = true;
                           return {visibleReplySent: false};
                         }
+                        if (sent.skipped) {
+                          skipReason = sent.reason;
+                          return {visibleReplySent: false};
+                        }
                         cycleSettled = Boolean(event.cycleAttempt);
                         visibleReplySent = true;
                         return {messageIds: [sent.eventId], receipt: receipt(sent.eventId, sent.sentAt), visibleReplySent: true};
@@ -223,7 +229,7 @@ export function createRoomChannel({makeClient}) {
               }
             }
             if (!visibleReplySent) {
-              await client.recordSkipped(event.id, operationalFallbackSuppressed ? "gateway_operational_error" : "model_no_visible_reply");
+              await client.recordSkipped(event.id, skipReason || (operationalFallbackSuppressed ? "gateway_operational_error" : "model_no_visible_reply"));
             }
             await client.ack(event.id);
           }
