@@ -25,13 +25,23 @@ function managedAccount(accountId) {
   } catch { return null; }
 }
 
+// A revoked account is retired, not merely failing. Reporting it as not
+// enabled makes the host treat it as unmanaged: it is neither started nor
+// revived by the health monitor. Administrative disables stay in the config.
+function stateRetired(stateFile) {
+  if (!stateFile || !existsSync(stateFile)) return false;
+  try {
+    return JSON.parse(readFileSync(stateFile, "utf8"))?.revoked === true;
+  } catch { return false; }
+}
+
 export function resolveRoomAccount(cfg, accountId = "default", {managedResolver = managedAccount} = {}) {
   const section = cfg?.channels?.[ROOM_CHANNEL_ID] ?? {};
   const raw = resolveAccountConfig(section, accountId);
   const selected = resolveAccountSelection({accountId, raw, managed: managedResolver(accountId), defaultStateFile: join(defaultStateDirectory(), "default.json")});
   return {
     accountId,
-    enabled: raw.enabled !== false,
+    enabled: raw.enabled !== false && !stateRetired(selected.stateFile),
     configured: accountId === "default" || selected.managed !== null || (typeof raw.baseUrl === "string" && typeof raw.stateFile === "string"),
     baseUrl: selected.baseUrl,
     stateFile: selected.stateFile,

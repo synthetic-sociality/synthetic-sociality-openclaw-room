@@ -338,21 +338,29 @@ export class OpenClawRoomRuntime {
     if (this.closed || this.account.enabled === false || this.state.enabled === false || this.state.revoked === true) throw new Error("Room account is disabled, revoked or closed");
     if (this.account.baseUrl && this.state.baseUrl !== this.account.baseUrl) throw new Error("Configured Room origin does not match private reconnect state");
     this.client = new RoomClient({baseUrl: this.state.baseUrl, credential: this.state.credential, fetchImpl: this.fetchImpl});
-    await this.renewAccess(signal);
-    while (!this.closed) {
-      try {
-        await this.registerConnector(signal);
-        break;
-      } catch (error) {
-        if (!this.waitForRenewal || !(error instanceof RoomAPIError) || error.code !== "credential_expired") throw error;
-        // Keep this enabled account's renewal-only maintenance alive even if
-        // the host would otherwise exhaust its account restart budget. Never
-        // infer expiry from generic auth failure, nor register a revoked base.
-        const maintenanceSignal = signal ? AbortSignal.any([signal, this.heartbeatAbort.signal]) : this.heartbeatAbort.signal;
-        await this.renewalWait(30_000, maintenanceSignal);
-        this.lastRenewalCheck = 0;
-        await this.renewAccess(maintenanceSignal);
+    try {
+      await this.renewAccess(signal);
+      while (!this.closed) {
+        try {
+          await this.registerConnector(signal);
+          break;
+        } catch (error) {
+          if (!this.waitForRenewal || !(error instanceof RoomAPIError) || error.code !== "credential_expired") throw error;
+          // Keep this enabled account's renewal-only maintenance alive even if
+          // the host would otherwise exhaust its account restart budget. Never
+          // infer expiry from generic auth failure, nor register a revoked base.
+          const maintenanceSignal = signal ? AbortSignal.any([signal, this.heartbeatAbort.signal]) : this.heartbeatAbort.signal;
+          await this.renewalWait(30_000, maintenanceSignal);
+          this.lastRenewalCheck = 0;
+          await this.renewAccess(maintenanceSignal);
+        }
       }
+    } catch (error) {
+      // Revocation is final, unlike expiry: the Room removed this membership or
+      // replaced its credential. Record it so neither this runtime nor the host
+      // starts the account again; otherwise every restart is refused forever.
+      if (error instanceof RoomAPIError && error.code === "credential_revoked") await this.retireRevokedAccount();
+      throw error;
     }
     if (this.closed) throw new Error("Room account closed during credential maintenance");
     await this.repairPendingLifecycles(signal);
@@ -394,6 +402,16 @@ export class OpenClawRoomRuntime {
     const task = this.bindingOperation.catch(() => {}).then(operation);
     this.bindingOperation = task;
     return task;
+  }
+
+  async retireRevokedAccount() {
+    if (this.state.revoked === true) return;
+    this.state.revoked = true;
+    this.state.revokedReason = "credential_revoked";
+    this.state.revokedAt = new Date().toISOString();
+    await saveState(this.account.stateFile, this.state);
+    // The host's own log only ever said "stopped"; name the cause once.
+    this.logger?.warn?.("Room credential revoked by the Room; account retired and will not be restarted");
   }
 
   async renewAccess(signal) {
