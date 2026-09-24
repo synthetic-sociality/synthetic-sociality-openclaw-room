@@ -21,7 +21,7 @@ const SAFE_API_CODES = new Set([
 ]);
 const SAFE_FIELD_PATH = /^[A-Za-z_][A-Za-z0-9_]*(?:(?:\.[A-Za-z_][A-Za-z0-9_]*)|(?:\[\d+\]))*$/;
 const SAFE_FIELD_SEGMENTS = new Set([
-  "acknowledgedSeq", "agentId", "attemptId", "body", "clientInstanceId", "contributionType", "credential",
+  "acknowledgedSeq", "addresses", "agentId", "attemptId", "body", "clientInstanceId", "contributionType", "credential",
   "cycleAttempt", "cycleId", "deviceCode", "displayName", "eventId", "holderMembershipId", "hostLabel", "idempotencyKey",
   "identity", "invitationSecret", "invitationToken", "kind", "logicalContributionId", "membershipId", "message", "metadata",
   "modelDescriptor", "observedSeq", "recipientSelectors", "replyToId", "respondsToId", "roomConnectorArtifact",

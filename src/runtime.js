@@ -64,6 +64,37 @@ function validCanonicalMessage(message) {
   );
 }
 
+// A reply may begin with the number of the one post it answers. The connector
+// reads the marker, removes it, and records that post as `addresses`; the Room
+// then shows the reply as answering that post rather than what woke the agent.
+export const REPLY_MARKER_GUIDANCE = "To answer one specific post, begin your reply with ↪ and its number, for example ↪ #437. Leave it out for a general reply.";
+const REPLY_MARKER = /^[ \t]*↪[ \t]*#(\d{1,12})[ \t]*(.*)$/u;
+
+// Only the first line is read, and only the exact form "↪ #<number>". The
+// marker is removed whether or not it names a known post: it is reply syntax,
+// never Room text. Text after it on the same line stays as the first line.
+export function parseReplyMarker(body) {
+  const text = String(body ?? "");
+  const newline = text.indexOf("\n");
+  const first = newline === -1 ? text : text.slice(0, newline);
+  const rest = newline === -1 ? "" : text.slice(newline + 1);
+  const match = REPLY_MARKER.exec(first);
+  if (!match) return {number: null, body: text};
+  const remainder = match[2].trim();
+  return {number: Number(match[1]), body: (remainder ? `${remainder}${newline === -1 ? "" : "\n"}${rest}` : rest).replace(/^\n+/u, "")};
+}
+
+// Never hand the model a role identifier as a name: it repeats it. Agents in
+// OpenClaw Rooms wrote "participant_agent 5" because every transcript line was
+// labelled with the actor's role whenever the payload carried no display name.
+function transcriptActorName(state, item, payload) {
+  const roster = Array.isArray(state?.roster) ? state.roster : [];
+  const member = roster.find((entry) => String(entry?.membershipId ?? "") !== "" && String(entry.membershipId) === String(item?.actorId ?? ""));
+  const named = String(member?.displayName ?? payload.actorDisplayName ?? payload.displayName ?? "").trim();
+  if (named) return named;
+  return ["participant_agent", "room_master", "observer"].includes(String(item?.actorRole ?? "")) ? "Room agent" : "Room participant";
+}
+
 function validFrozenPost(intent) {
   const post = intent?.post;
   const identity = intent?.identity;
@@ -81,6 +112,7 @@ function validFrozenPost(intent) {
   if (identity.sourceEpochId && post.observedEpochId !== identity.sourceEpochId) return false;
   if (intent.messagePayloadDialect === "v2" ? post.logicalContributionId !== intent.logicalContributionId : post.logicalContributionId !== undefined) return false;
   if (identity.replyToId ? JSON.stringify(post.respondsTo) !== JSON.stringify([identity.replyToId]) : post.respondsTo !== undefined) return false;
+  if (intent.addresses ? post.addresses !== intent.addresses : post.addresses !== undefined) return false;
   const expectedRecipientSelectors = identity.nextRecipient
     ? [{kind: "membership", membershipId: identity.nextRecipient}]
     : identity.recipientSelectors;
@@ -587,6 +619,7 @@ export class OpenClawRoomRuntime {
     if (fetchedEpoch.id !== sourceEpoch.id || fetchedEpoch.startsAtSeq !== sourceEpoch.startsAtSeq) {
       throw new Error("Room active epoch advanced while loading model context");
     }
+    this.rememberPostNumbers([...(Array.isArray(page?.events) ? page.events : []), event]);
     const roomContext = canonicalRoomContext(state, page?.events, event?.id, policy, sourceEpoch.startsAtSeq);
     const handoverContext = await this.epochHandoverContext(event, sourceEpoch, page?.events, signal);
     const library = await this.client.listArtifacts(this.state, signal);
@@ -908,6 +941,20 @@ export class OpenClawRoomRuntime {
     if (this.pendingEvent && (this.pendingEvent.seq <= authoritative || this.pendingEvent.id === event.id)) this.pendingEvent = null;
   }
 
+  postNumberIndex() {
+    this.postNumbers ??= new Map();
+    return this.postNumbers;
+  }
+
+  rememberPostNumbers(events) {
+    const known = this.postNumberIndex();
+    for (const item of events) {
+      if (Number.isSafeInteger(item?.seq) && item.seq > 0 && item?.id) known.set(item.seq, String(item.id));
+    }
+    // Numbers are canonical and never reassigned; keep the window bounded.
+    for (const seq of [...known.keys()].sort((a, b) => a - b).slice(0, Math.max(0, known.size - 2000))) known.delete(seq);
+  }
+
   async postAndFinish(request) {
     return this.withBindingOperation(() => {
       if (this.state.credentialRotation) throw new Error("Room access renewal is pending; outbound delivery paused");
@@ -917,7 +964,9 @@ export class OpenClawRoomRuntime {
 
   async postAndFinishOnce({roomId, text, replyToId, idempotencyKey, signal, sourceEventId, sourceEpochId = "", cycleAttempt = null, resolveRecipientMentions = false}) {
     if (roomId !== this.state.roomId) throw new Error("Outbound Room does not match connector membership");
-    const body = String(text ?? "").trim();
+    const raw = String(text ?? "").trim();
+    const marker = parseReplyMarker(raw);
+    let body = marker.body.trim();
     if (!body) throw new Error("OpenClaw produced an empty Room response");
     const deliveryKey = String(idempotencyKey ?? "").trim();
     if (!deliveryKey) throw new Error("OpenClaw Room delivery has no durable idempotency key");
@@ -943,6 +992,9 @@ export class OpenClawRoomRuntime {
     }
     this.state.deliveryIntents ??= {};
     let intent = this.state.deliveryIntents[deliveryKey];
+    // An intent frozen before markers existed keeps its original body: a replay
+    // must send exactly what was frozen, never a newly stripped variant of it.
+    if (intent && raw !== body && intent.identity?.body === raw) requestedIdentity.body = body = raw;
     if (intent) {
       const frozenRequestedIdentity = {
         roomId: intent.identity?.roomId, body: intent.identity?.body,
@@ -987,12 +1039,17 @@ export class OpenClawRoomRuntime {
     } else {
       const payloadDialect = this.state.messagePayloadDialect ?? "v1";
       if (!["v1", "v2"].includes(payloadDialect)) throw new Error("Room message payload dialect was not negotiated");
+      // Resolved once, here, and frozen: the identity above is re-derived from
+      // the text on every attempt, and a post number known now may not be known
+      // after a restart. Only events this connector read from this Room resolve.
+      const addresses = marker.number === null ? "" : (this.postNumberIndex().get(marker.number) ?? "");
       intent = {
         version: 2,
         status: "selected",
         deliveryState: "selected",
         lifecycleState: "not_started",
         identity: {...requestedIdentity},
+        ...(addresses ? {addresses} : {}),
         binding: {
           roomId: this.state.roomId,
           membershipId: this.state.membershipId,
@@ -1068,6 +1125,7 @@ export class OpenClawRoomRuntime {
         ...(intent.identity.topicId ? {topicId: intent.identity.topicId} : {}),
         ...(intent.identity.postObservedEpochId ? {observedEpochId: intent.identity.postObservedEpochId} : {}),
         ...(intent.identity.replyToId ? {respondsTo: [intent.identity.replyToId]} : {}),
+        ...(intent.addresses ? {addresses: intent.addresses} : {}),
         ...(intent.identity.nextRecipient
           ? {recipientSelectors: [{kind: "membership", membershipId: intent.identity.nextRecipient}]}
           : intent.identity.recipientSelectors?.length ? {recipientSelectors: intent.identity.recipientSelectors} : {}),
@@ -2007,8 +2065,9 @@ export function canonicalRoomContext(state, events, currentEventId = "", policy 
     .map((item) => {
       const payload = eventPayload(item.payload);
       const body = String(payload.body ?? payload.text ?? "").trim();
-      const actor = String(payload.actorDisplayName ?? payload.displayName ?? item.actorRole ?? "Room participant").trim();
-      return body ? `${actor}: ${body}` : "";
+      const actor = transcriptActorName(state, item, payload);
+      const number = Number.isSafeInteger(item.seq) && item.seq > 0 ? `#${item.seq} ` : "";
+      return body ? `${number}${actor}: ${body}` : "";
     })
     .filter(Boolean)
     .slice(-16);
@@ -2028,6 +2087,7 @@ export function canonicalRoomContext(state, events, currentEventId = "", policy 
       ...policyGuidance,
       "[/Active Room guidance]",
     ] : []),
+    REPLY_MARKER_GUIDANCE,
     ...(transcript.length ? ["Recent canonical transcript:", ...transcript] : ["Recent canonical transcript: no earlier messages in the available window."]),
     "[/Canonical Room context]",
   ];
