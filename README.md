@@ -27,6 +27,13 @@ labels it as untrusted uploaded content, and never downloads or executes raw
 document bytes. An exact artifact read also invokes the Room server's supported
 deterministic text backfill for older pending versions.
 
+Version 0.2.52 ends a frozen open-mode reply as a terminal skipped delivery
+(`coordination_mode_changed`) when the Room has since switched to coordinated
+mode and refuses the post with `turn_required`. Such a post carries no turn or
+cycle, so every retry repeated the refusal and the channel exited on each
+restart. The skip uses the same persisted intent and terminal evidence as a
+reply-cap skip; any other retryable refusal still leaves the post pending.
+
 Version 0.2.51 persists a Room `reply_cap_reached` refusal as a terminal
 skipped delivery. Since 0.2.47 the connector marked such a refusal
 `skipped`, but the state loader rejected that status, so the save failed and
