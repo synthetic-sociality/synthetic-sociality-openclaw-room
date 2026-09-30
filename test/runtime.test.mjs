@@ -2580,6 +2580,48 @@ for (const [label, body] of [
   });
 }
 
+// turn_required is terminal only for a turnless, cycleless post. A frozen post
+// that carries a turn stays pending and the refusal is rethrown.
+test("a frozen reply that carries a turn refused with turn_required stays delivery_pending", async () => {
+  const sourceId = "src-turn";
+  const stateFile = await savePendingReplyCapState(sourceId);
+  const fixture = await loadState(stateFile);
+  const frozen = fixture.deliveryIntents[`${sourceId}:final`];
+  frozen.identity.coordinationMode = "coordinated";
+  frozen.turnRequest = {observedSeq: 12, idempotencyKey: frozen.requestIdempotencyKey, topicId: "topic-1"};
+  frozen.turn = {turnId: "turn-1"};
+  frozen.post.turnId = "turn-1";
+  await saveState(stateFile, fixture);
+  const event = {id: sourceId, seq: 11, type: "message.posted", actorRole: "human_owner", payload: {body: "prompt"}};
+  let posts = 0;
+  const runtime = new OpenClawRoomRuntime({accountId: "fixture", stateFile, baseUrl: "https://fixture.invalid/api"});
+  runtime.state = await loadState(stateFile);
+  runtime.client = {
+    roomState: async () => ({activeEpoch: {id: "epoch-1"}, headSeq: 12, roster: []}),
+    publishActivity: async () => ({acceptedStreamSeq: 1}),
+    requestTurn: async () => { throw new Error("a frozen turn must not request another"); },
+    postMessage: async (_state, post) => {
+      posts += 1;
+      assert.equal(post.turnId, "turn-1");
+      throw new RoomAPIError(409, {code: "turn_required", retryable: true});
+    },
+  };
+  await assert.rejects(
+    runtime.recoverPendingDelivery(event, new AbortController().signal),
+    (error) => error instanceof RoomAPIError && error.code === "turn_required",
+  );
+  assert.equal(posts, 1);
+  const saved = await loadState(stateFile);
+  const intent = saved.deliveryIntents[`${sourceId}:final`];
+  assert.equal(intent.status, "delivery_pending");
+  assert.equal(intent.deliveryState, "delivery_pending");
+  assert.equal(intent.deliveryErrorCode, "turn_required");
+  assert.equal(intent.skippedReason, undefined);
+  assert.equal(intent.skippedSourceSeq, undefined);
+  assert.deepEqual(intent.turn, {turnId: "turn-1"});
+  assert.deepEqual(saved.terminalEvidence, {});
+});
+
 // A skip saved just before an epoch rotation whose acknowledgement did not land
 // comes back as a historical source. It is already terminal: acknowledge it,
 // never supersede, throw, or repost.
