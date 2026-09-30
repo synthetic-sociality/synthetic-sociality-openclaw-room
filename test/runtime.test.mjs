@@ -2365,10 +2365,9 @@ test("duplicate open-mode delivery reuses the canonical receipt without repostin
 // A frozen open-mode post is a normal pending delivery. reply_cap_reached is a
 // normal refusal. Recovery must persist that skip through the real save/load
 // path, record terminal evidence, and never repost it.
-test("reply-cap recovery persists a skipped frozen delivery and does not repost after restart", async () => {
+async function savePendingReplyCapState(sourceId) {
   const directory = await mkdtemp(join(tmpdir(), "openclaw-room-reply-cap-"));
   const stateFile = join(directory, "state.json");
-  const sourceId = "src-cap";
   const body = "redacted frozen reply";
   const messageKey = "fixture-message-key";
   const intent = {
@@ -2421,6 +2420,12 @@ test("reply-cap recovery persists a skipped frozen delivery and does not repost 
     deliveryIntents: {[`${sourceId}:final`]: intent},
     terminalEvidence: {},
   });
+  return stateFile;
+}
+
+test("reply-cap recovery persists a skipped frozen delivery and does not repost after restart", async () => {
+  const sourceId = "src-cap";
+  const stateFile = await savePendingReplyCapState(sourceId);
   const event = {id: sourceId, seq: 11, type: "message.posted", actorRole: "human_owner", payload: {body: "prompt"}};
   let posts = 0;
   const runtime = new OpenClawRoomRuntime({accountId: "fixture", stateFile, baseUrl: "https://fixture.invalid/api"});
@@ -2489,4 +2494,84 @@ test("reply-cap recovery persists a skipped frozen delivery and does not repost 
     ...saved,
     deliveryIntents: {[`${sourceId}:final`]: {...skipped, status: "not-a-status", deliveryState: "skipped"}},
   }), /Room delivery intent status is invalid/);
+});
+
+// A skip saved just before an epoch rotation whose acknowledgement did not land
+// comes back as a historical source. It is already terminal: acknowledge it,
+// never supersede, throw, or repost.
+test("an unacknowledged reply-cap skip survives an epoch rotation and restart", async () => {
+  const sourceId = "src-cap-rotated";
+  const stateFile = await savePendingReplyCapState(sourceId);
+  const event = {id: sourceId, seq: 11, type: "message.posted", actorRole: "human_owner", payload: {body: "prompt"}};
+  let posts = 0;
+  const runtime = new OpenClawRoomRuntime({accountId: "fixture", stateFile, baseUrl: "https://fixture.invalid/api"});
+  runtime.state = await loadState(stateFile);
+  runtime.client = {
+    roomState: async () => ({activeEpoch: {id: "epoch-1"}, headSeq: 12, roster: []}),
+    publishActivity: async () => ({acceptedStreamSeq: 1}),
+    postMessage: async () => { posts += 1; throw new RoomAPIError(409, {code: "reply_cap_reached", retryable: false}); },
+    acknowledge: async () => { throw new Error("acknowledgement lost"); },
+  };
+  assert.equal(await runtime.recoverPendingDelivery(event, new AbortController().signal), true);
+  runtime.pendingEvent = event;
+  await assert.rejects(runtime.ackEvent(event), /acknowledgement lost/);
+
+  const saved = await loadState(stateFile);
+  assert.equal(saved.cursor, 10);
+  assert.equal(saved.terminalEvidence["11"].status, "skipped");
+  const restarted = new OpenClawRoomRuntime({accountId: "fixture", stateFile, baseUrl: "https://fixture.invalid/api"});
+  restarted.state = saved;
+  let acknowledged = 0;
+  restarted.client = {
+    postMessage: async () => { posts += 1; throw new Error("restart must not repost"); },
+    acknowledge: async (_state, seq) => { acknowledged += 1; return {acknowledgedSeq: seq}; },
+  };
+  restarted.assertHistoricalIntentSafety(event);
+  const evidence = await restarted.supersedeHistoricalEvent(event, "epoch-0");
+  assert.equal(evidence.status, "skipped");
+  assert.equal(restarted.state.deliveryIntents[`${sourceId}:final`].status, "skipped");
+  restarted.pendingEvent = event;
+  await restarted.ackEvent(event);
+  assert.equal(acknowledged, 1);
+  assert.equal(posts, 1);
+  const acked = await loadState(stateFile);
+  assert.equal(acked.cursor, 11);
+  assert.equal(acked.deliveryIntents[`${sourceId}:final`].status, "skipped");
+
+  // A skipped intent whose evidence belongs to another sequence stays refused.
+  const mismatched = new OpenClawRoomRuntime({accountId: "fixture", stateFile, baseUrl: "https://fixture.invalid/api"});
+  mismatched.state = structuredClone(saved);
+  mismatched.state.deliveryIntents[`${sourceId}:final`].skippedSourceSeq = 99;
+  await assert.rejects(
+    mismatched.supersedeHistoricalEvent(event, "epoch-0"),
+    /Historical Room delivery intent is not a recognized pending state/,
+  );
+});
+
+// If the skip evidence cannot be written, the in-memory intent must roll back
+// to its pending state so the process can still save and recover.
+test("a refused reply-cap evidence write rolls the intent back to pending", async () => {
+  const runtime = new OpenClawRoomRuntime({accountId: "default", stateFile: "/unused", baseUrl: "https://room.example/api"});
+  runtime.state = {
+    roomId: "room-1", membershipId: "reader-member", clientInstanceId: "client-1", messagePayloadDialect: "v2", cursor: 0,
+    terminalEvidence: {"1": {
+      status: "skipped", sourceEventId: "other-source", sourceSeq: 1,
+      canonicalEventId: "", canonicalSeq: 0, canonicalTs: "", reason: "model_no_visible_reply",
+    }},
+  };
+  runtime.persistState = async () => {};
+  runtime.client = {
+    roomState: async () => ({activeEpoch: {id: "epoch-1"}, headSeq: 7, roster: []}),
+    roomPolicy: async () => ({policy: {coordinationMode: "open"}}),
+    postMessage: async () => { throw new RoomAPIError(409, {code: "reply_cap_reached", retryable: false}); },
+  };
+  runtime.pendingEvent = {id: "src-1", seq: 1};
+  const request = {roomId: "room-1", text: "One more reply", replyToId: "src-1", idempotencyKey: "src-1:final", sourceEventId: "src-1"};
+  await assert.rejects(runtime.postAndFinishOnce(request), /already bound to a different source event/);
+  const intent = runtime.state.deliveryIntents["src-1:final"];
+  assert.equal(intent.status, "delivery_pending");
+  assert.equal(intent.skippedReason, undefined);
+  assert.equal(intent.skippedSourceSeq, undefined);
+  assert.equal(runtime.state.terminalEvidence["1"].sourceEventId, "other-source");
+  validateState(fullFixtureState(runtime.state));
 });

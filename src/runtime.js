@@ -832,6 +832,14 @@ export class OpenClawRoomRuntime {
       if (intent.deliveryState === "posted" && validCanonicalMessage(intent.canonicalMessage)) {
         throw new Error("Canonical posted evidence must be recovered before historical handling");
       }
+      // A skip saved before an epoch rotation, whose acknowledgement did not
+      // land, is already terminal: keep its evidence and let the caller ack it.
+      if (
+        intent.deliveryState === "skipped"
+        && existing?.status === "skipped"
+        && intent.skippedSourceSeq === event.seq
+        && existing.reason === intent.skippedReason
+      ) return existing;
       if (!["selected", "delivery_pending"].includes(intent.deliveryState)) {
         throw new Error("Historical Room delivery intent is not a recognized pending state");
       }
@@ -1179,15 +1187,29 @@ export class OpenClawRoomRuntime {
           if (bound && (!source || source.id !== intent.identity.sourceEventId || !Number.isSafeInteger(source.seq) || source.seq < 1)) {
             throw new Error("Reply-cap skip requires the bound pending source event");
           }
-          intent.deliveryState = "skipped";
-          intent.status = "skipped";
-          intent.lifecycleState = "not_required";
-          intent.skippedReason = "reply_cap_reached";
-          if (bound) {
-            intent.skippedSourceSeq = source.seq;
-            await this.recordTerminalEvidence(source, "skipped", {reason: "reply_cap_reached"});
-          } else {
-            await this.persistState();
+          const previousIntent = structuredClone(intent);
+          const previousTerminalEvidence = this.state.terminalEvidence === undefined
+            ? undefined : structuredClone(this.state.terminalEvidence);
+          try {
+            intent.deliveryState = "skipped";
+            intent.status = "skipped";
+            intent.lifecycleState = "not_required";
+            intent.skippedReason = "reply_cap_reached";
+            if (bound) {
+              intent.skippedSourceSeq = source.seq;
+              const evidence = await this.recordTerminalEvidence(source, "skipped", {reason: "reply_cap_reached"});
+              if (evidence?.status !== "skipped" || evidence.reason !== "reply_cap_reached") {
+                throw new Error("Reply-cap skip conflicts with existing terminal evidence");
+              }
+            } else {
+              await this.persistState();
+            }
+          } catch (persistError) {
+            for (const key of Object.keys(intent)) delete intent[key];
+            Object.assign(intent, previousIntent);
+            if (previousTerminalEvidence === undefined) delete this.state.terminalEvidence;
+            else this.state.terminalEvidence = previousTerminalEvidence;
+            throw persistError;
           }
           return {skipped: true, reason: "reply_cap_reached"};
         }
