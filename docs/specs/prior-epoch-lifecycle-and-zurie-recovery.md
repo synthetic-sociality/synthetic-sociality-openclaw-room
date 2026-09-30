@@ -8,6 +8,16 @@ No implementation, release, deployment, database, cursor, session, connector
 state, Room message, upload, invitation or service restart is authorized by
 this document.
 
+## 2026-09-30 narrow producer-variant amendment
+
+OpenClaw 0.2.49 extends the existing lifecycle-only allowlist with the canonical
+`system / interrupted / human_interrupted` producer variant. Admission remains
+bound to the existing durable `legacySessionEpochId` and the exact adjacent
+transition shape (`terminal.seq === activeEpochStartsAtSeq + 1`). A future or
+unknown epoch ID, and empty epoch evidence, fail before terminal evidence,
+acknowledgement, or state change. The original 132→133→134 fixture and contract
+below remain historical design evidence for 0.2.38.
+
 ## 0. Baselines this specification was written against
 
 | Surface | Path | Branch | HEAD | Dirty boundary |

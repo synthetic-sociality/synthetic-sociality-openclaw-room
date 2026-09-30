@@ -18,6 +18,8 @@ const JOINED_CODING_EPOCH_FIXTURE_HASHES = Object.freeze({
   838: "b258ffca5aa364f2b7ce8cab6bca888cd86bcca30e5fa9c93706898668f4bacb",
   839: "0f67bce1fe6977a3b4dc15ca5fd073f714a4ce42e00d06427ee9dc944d3d0ec6",
   840: "c5facd66eecdf9d7b21ecdc4e3f567b6999aeeea925f3c37cb881a7965917b1f",
+  "839.future-epoch": "2fb55cf7623d82239a75e36e57aad7e93c353f6b80067f88120024547da0c79c",
+  "839.empty-epoch": "1b2b0bd7712cce9069d0658114c9e12a5ec5f015970299a931dbf0efc8c81ce0",
 });
 
 test("disabled account refuses initialization before any state read or network call", async () => {
@@ -1373,7 +1375,7 @@ test("accepts exactly the lifecycle-only terminal state, reason, and role table"
   ];
   for (const event of accepted) {
     assert.equal(isLifecycleOnlyCycleTerminal(event), true);
-    assert.equal(eventEpochId(event, "epoch-new", 10), "epoch-old");
+    assert.equal(eventEpochId(event, "epoch-new", 10, "epoch-old"), "epoch-old");
   }
 
   const rejected = [
@@ -1411,16 +1413,18 @@ test("epoch evidence is shared, exact, and contradiction-safe", () => {
   }), {message: "Room event contains contradictory epoch evidence"});
 });
 
-test("boundary classification depends only on sequence and epoch evidence", () => {
-  const event = {seq: 10, type: "message.posted", payload: {epochId: "epoch-old"}};
-  assert.equal(isBoundaryEvent({...event, seq: 9}, "epoch-new", 10), false);
-  assert.equal(isBoundaryEvent({...event, payload: {epochId: "epoch-new"}}, "epoch-new", 10), false);
-  assert.equal(isBoundaryEvent(event, "epoch-new", 10), true);
-  assert.equal(isBoundaryEvent({...event, payload: {}}, "epoch-new", 10), false);
+test("boundary classification requires exact adjacent transition and durable prior epoch evidence", () => {
+  const event = {seq: 11, type: "message.posted", payload: {epochId: "epoch-old"}};
+  assert.equal(isBoundaryEvent({...event, seq: 9}, "epoch-new", 10, "epoch-old"), false);
+  assert.equal(isBoundaryEvent({...event, payload: {epochId: "epoch-new"}}, "epoch-new", 10, "epoch-old"), false);
+  assert.equal(isBoundaryEvent(event, "epoch-new", 10, "epoch-old"), true);
+  assert.equal(isBoundaryEvent(event, "epoch-new", 10, "future-epoch"), false);
+  assert.equal(isBoundaryEvent({...event, seq: 12}, "epoch-new", 10, "epoch-old"), false);
+  assert.equal(isBoundaryEvent({...event, payload: {}}, "epoch-new", 10, "epoch-old"), false);
   assert.throws(() => isBoundaryEvent({
     ...event, type: "discussion.cycle_terminal",
     payload: {epochId: "epoch-old", summaryHandoff: {epochId: "epoch-other"}},
-  }, "epoch-new", 10), {message: "Room event contains contradictory epoch evidence"});
+  }, "epoch-new", 10, "epoch-old"), {message: "Room event contains contradictory epoch evidence"});
 });
 
 test("fixture 132-134 acknowledges the timed-out terminal as lifecycle-only", async () => {
@@ -1622,6 +1626,51 @@ test("old-epoch conversational, malformed, contradictory, and unknown events rem
     assert.deepEqual(counters, zeroEpochTransitionSideEffects(), label);
     assert.deepEqual(await readFile(stateFile), before, label);
   }
+});
+
+async function assertRejectedEpochFixture(fixture) {
+  const event = await loadJoinedCodingEpochFixture(fixture);
+  const directory = await mkdtemp(join(tmpdir(), `openclaw-room-${fixture}-reject-`));
+  const stateFile = join(directory, "default.json");
+  await saveState(stateFile, {
+    version: 1, baseUrl: "https://room.example/api", roomId: "bjqiu9u7dwqptlq",
+    membershipId: "1iy2lgr5uyg7cj4", credential: "fixture-only", clientInstanceId: "client-fixture",
+    cursor: 838, messagePayloadDialect: "v2", deliveryIntents: {}, terminalEvidence: {},
+    epochSessionRoutingInitialized: true, legacySessionEpochId: "ssftrri7y8uioxl",
+  });
+  const beforeBytes = await readFile(stateFile);
+  const counters = zeroEpochTransitionSideEffects();
+  const acknowledgements = [];
+  const controller = new AbortController();
+  const runtime = new OpenClawRoomRuntime({accountId: "fixture", stateFile, baseUrl: "https://room.example/api"});
+  runtime.state = await loadState(stateFile);
+  const beforeState = structuredClone(runtime.state);
+  attachEpochTransitionFixture(runtime, [event], counters, async (_state, seq) => {
+    acknowledgements.push(seq);
+    controller.abort();
+    return {acknowledgedSeq: seq};
+  });
+
+  await assert.rejects(
+    runtime.assignedTurns(controller.signal).next(),
+    /epoch|prior/i,
+    fixture,
+  );
+  assert.deepEqual(acknowledgements, [], fixture);
+  assert.deepEqual(counters, zeroEpochTransitionSideEffects(), fixture);
+  assert.deepEqual(runtime.state, beforeState, `${fixture}: in-memory state must not change`);
+  assert.deepEqual(await readFile(stateFile), beforeBytes, `${fixture}: durable state must not change`);
+  assert.deepEqual(runtime.state.terminalEvidence, {}, fixture);
+  assert.deepEqual(runtime.state.deliveryIntents, {}, fixture);
+  assert.equal(runtime.state.cursor, 838, fixture);
+}
+
+test("839.future-epoch lifecycle terminal fails before evidence acknowledgement or state change", async () => {
+  await assertRejectedEpochFixture("839.future-epoch");
+});
+
+test("839.empty-epoch lifecycle terminal fails before evidence acknowledgement or state change", async () => {
+  await assertRejectedEpochFixture("839.empty-epoch");
 });
 
 test("contradictory fixture terminal fails before evidence or acknowledgement", async () => {

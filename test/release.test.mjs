@@ -46,6 +46,7 @@ test("declares the compatibility and install metadata required by ClawHub", asyn
   const conformance = JSON.parse(await readFile(join(packageRoot, "conformance.json"), "utf8"));
   assert.equal(packageJson.private, undefined);
   assert.equal(packageJson.name, "@synthetic-sociality/openclaw-room");
+  assert.equal(packageJson.version, "0.2.49");
   assert.equal(packageJson.version, pluginManifest.version);
   assert.equal(packageJson.version, conformance.adapterVersion);
   assert.equal(packageJson.version, ROOM_CONNECTOR_PROVENANCE.version);
@@ -57,6 +58,14 @@ test("declares the compatibility and install metadata required by ClawHub", asyn
   assert.equal(
     conformance.epochSessionFixtures.prior_epoch_system_interruption,
     "fixture 838-840 durably ignores the reviewed prior-epoch terminal and continues after restart",
+  );
+  assert.equal(
+    conformance.epochSessionFixtures.future_epoch_terminal_rejection,
+    "839.future-epoch lifecycle terminal fails before evidence acknowledgement or state change",
+  );
+  assert.equal(
+    conformance.epochSessionFixtures.empty_epoch_terminal_rejection,
+    "839.empty-epoch lifecycle terminal fails before evidence acknowledgement or state change",
   );
   assert.equal(ROOM_CONNECTOR_PROVENANCE.sourceCommit, "unbuilt");
   assert.equal(ROOM_CONNECTOR_PROVENANCE.artifactIdentity, "unbuilt");

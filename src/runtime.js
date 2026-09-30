@@ -512,7 +512,12 @@ export class OpenClawRoomRuntime {
           continue;
         }
         const historical = event.seq < pageEpoch.startsAtSeq;
-        const canonicalEventEpochId = eventEpochId(event, pageActiveEpochId, pageEpoch.startsAtSeq);
+        const canonicalEventEpochId = eventEpochId(
+          event,
+          pageActiveEpochId,
+          pageEpoch.startsAtSeq,
+          this.state.legacySessionEpochId,
+        );
         if (historical) this.assertHistoricalIntentSafety(event);
         const existingTerminalEvidence = this.terminalEvidenceFor(event);
         if (await this.recoverPostedEvidence(event)) {
@@ -540,7 +545,7 @@ export class OpenClawRoomRuntime {
           continue;
         }
         if (isLifecycleOnlyCycleTerminal(event)
-            && isBoundaryEvent(event, pageActiveEpochId, pageEpoch.startsAtSeq)) {
+            && isBoundaryEvent(event, pageActiveEpochId, pageEpoch.startsAtSeq, this.state.legacySessionEpochId)) {
           await this.recordTerminalEvidence(event, "ignored", {reason: "prior_epoch_lifecycle"});
           await this.ackEvent(event);
           scanCursor = event.seq;
@@ -1776,23 +1781,36 @@ export function isLifecycleOnlyCycleTerminal(event) {
   ].join("\u0000"));
 }
 
-export function isBoundaryEvent(event, pageActiveEpochId, pageActiveEpochStartsAtSeq) {
+export function isBoundaryEvent(event, pageActiveEpochId, pageActiveEpochStartsAtSeq, durablePriorEpochId = "") {
   const payloadEpochId = epochEvidence(event);
+  const priorEpochId = exactOptionalEpochId(durablePriorEpochId, "Room durable prior epoch");
   return Number.isSafeInteger(event?.seq)
     && Number.isSafeInteger(pageActiveEpochStartsAtSeq)
     && pageActiveEpochStartsAtSeq > 0
-    && event.seq >= pageActiveEpochStartsAtSeq
+    // Both reviewed canonical producers close the superseded cycle immediately
+    // after discussion.started. Combined with the durable legacy-session epoch,
+    // this proves the mismatch is the immediately preceding epoch rather than an
+    // arbitrary unknown or future identifier.
+    && event.seq === pageActiveEpochStartsAtSeq + 1
     && Boolean(payloadEpochId)
     && Boolean(pageActiveEpochId)
-    && payloadEpochId !== pageActiveEpochId;
+    && Boolean(priorEpochId)
+    && priorEpochId !== pageActiveEpochId
+    && payloadEpochId === priorEpochId;
 }
 
-export function eventEpochId(event, pageActiveEpochId = "", pageActiveEpochStartsAtSeq = 0) {
+export function eventEpochId(event, pageActiveEpochId = "", pageActiveEpochStartsAtSeq = 0, durablePriorEpochId = "") {
   const payloadEpochId = epochEvidence(event);
   const historical = Number.isSafeInteger(event?.seq) && Number.isSafeInteger(pageActiveEpochStartsAtSeq)
     && pageActiveEpochStartsAtSeq > 0 && event.seq < pageActiveEpochStartsAtSeq;
+  const lifecycleTerminal = isLifecycleOnlyCycleTerminal(event);
+  if (!historical && lifecycleTerminal && Number.isSafeInteger(event?.seq)
+      && event.seq >= pageActiveEpochStartsAtSeq && !payloadEpochId) {
+    throw new Error("Room prior-epoch lifecycle terminal requires exact epoch evidence");
+  }
   if (!historical && payloadEpochId && pageActiveEpochId && payloadEpochId !== pageActiveEpochId
-    && !isLifecycleOnlyCycleTerminal(event)) {
+    && !(lifecycleTerminal
+      && isBoundaryEvent(event, pageActiveEpochId, pageActiveEpochStartsAtSeq, durablePriorEpochId))) {
     throw new Error("Room event epoch evidence contradicts the authoritative active epoch boundary");
   }
   return payloadEpochId || (historical ? "" : exactEpochId(pageActiveEpochId, "Room page active epoch"));

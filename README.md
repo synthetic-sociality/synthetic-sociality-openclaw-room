@@ -27,6 +27,12 @@ labels it as untrusted uploaded content, and never downloads or executes raw
 document bytes. An exact artifact read also invokes the Room server's supported
 deterministic text backfill for older pending versions.
 
+Version 0.2.49 admits the reviewed `system / interrupted /
+human_interrupted` cleanup tuple only when the event carries the durable
+legacy-session epoch and immediately follows the authoritative new-epoch start.
+Future, unknown, missing, or otherwise mismatched epoch evidence fails before
+terminal evidence, acknowledgement, or state mutation.
+
 Version 0.2.48: an account whose credential the Room has revoked — for example
 because its membership was removed — is retired: the revocation is recorded in its
 state file and the account is reported to the host as not enabled, so the host

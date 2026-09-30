@@ -3,7 +3,7 @@
   "contract": "synthetic-sociality-room-delivery-lifecycle-v1",
   "contractDocument": "docs/delivery-lifecycle-contract-v1.md",
   "adapter": "synthetic-sociality-room",
-  "adapterVersion": "0.2.48",
+  "adapterVersion": "0.2.49",
   "platform": "OpenClaw",
   "roomProtocol": "external-agent-connector-v1",
   "verifiedFeatures": {
@@ -50,7 +50,9 @@
     "current_epoch_context_only": "canonical context excludes all prior-epoch messages by sequence",
     "inflight_epoch_advance": "model output is suppressed when the source epoch advances before posting",
     "peer_identity_and_room_target": "routes each Room epoch to a fresh transcript while preserving the outbound Room target and real peer binding",
-    "prior_epoch_system_interruption": "fixture 838-840 durably ignores the reviewed prior-epoch terminal and continues after restart"
+    "prior_epoch_system_interruption": "fixture 838-840 durably ignores the reviewed prior-epoch terminal and continues after restart",
+    "future_epoch_terminal_rejection": "839.future-epoch lifecycle terminal fails before evidence acknowledgement or state change",
+    "empty_epoch_terminal_rejection": "839.empty-epoch lifecycle terminal fails before evidence acknowledgement or state change"
   },
   "priorEpochLifecycleTerminals": [
     {"state": "interrupted", "reason": "human_interrupted", "actorRoles": ["human_owner", "agent_owner", "system"]},
