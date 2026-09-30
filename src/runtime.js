@@ -1759,6 +1759,7 @@ export function epochEvidence(event) {
 const PRIOR_EPOCH_LIFECYCLE_TERMINALS = new Set([
   "human_owner\u0000interrupted\u0000human_interrupted",
   "agent_owner\u0000interrupted\u0000human_interrupted",
+  "system\u0000interrupted\u0000human_interrupted",
   "system\u0000timed_out\u0000cycle_deadline_reached",
   "system\u0000interrupted\u0000coordination_mode_changed",
   "system\u0000interrupted\u0000epoch_superseded",

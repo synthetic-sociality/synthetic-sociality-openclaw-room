@@ -1,0 +1,1 @@
+{"roomId":"bjqiu9u7dwqptlq","seq":840,"id":"zwvepi1rjrhr38t","type":"discussion.cycle_started","eventVersion":1,"actorId":"room_coordinator","actorRole":"system","ts":"2026-09-29T21:00:00.200Z","payload":{"cycleId":"new-cycle","epochId":"circlnbi28xnwc0","generation":1,"state":"active"},"refs":[],"hashAlg":"sha256-canonical-v1","prevHash":"fixture-seq-839"}

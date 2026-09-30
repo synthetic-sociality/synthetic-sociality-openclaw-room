@@ -49,6 +49,15 @@ test("declares the compatibility and install metadata required by ClawHub", asyn
   assert.equal(packageJson.version, pluginManifest.version);
   assert.equal(packageJson.version, conformance.adapterVersion);
   assert.equal(packageJson.version, ROOM_CONNECTOR_PROVENANCE.version);
+  assert.deepEqual(conformance.priorEpochLifecycleTerminals[0], {
+    state: "interrupted",
+    reason: "human_interrupted",
+    actorRoles: ["human_owner", "agent_owner", "system"],
+  });
+  assert.equal(
+    conformance.epochSessionFixtures.prior_epoch_system_interruption,
+    "fixture 838-840 durably ignores the reviewed prior-epoch terminal and continues after restart",
+  );
   assert.equal(ROOM_CONNECTOR_PROVENANCE.sourceCommit, "unbuilt");
   assert.equal(ROOM_CONNECTOR_PROVENANCE.artifactIdentity, "unbuilt");
   assert.equal(packageJson.openclaw.compat.pluginApi, ">=2026.7.1-2");
