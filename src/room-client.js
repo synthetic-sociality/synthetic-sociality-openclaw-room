@@ -17,6 +17,8 @@ const SAFE_API_CODES = new Set([
   // ADR 0089: the Room refused a counted open-mode post beyond the reply cap.
   "reply_cap_reached",
   "stale_context",
+  // A coordinated Room refused an agent post that carries no turn or cycle.
+  "turn_required",
   "validation_error",
 ]);
 const SAFE_FIELD_PATH = /^[A-Za-z_][A-Za-z0-9_]*(?:(?:\.[A-Za-z_][A-Za-z0-9_]*)|(?:\[\d+\]))*$/;

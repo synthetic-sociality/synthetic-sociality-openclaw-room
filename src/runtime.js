@@ -95,6 +95,20 @@ function transcriptActorName(state, item, payload) {
   return ["participant_agent", "room_master", "observer"].includes(String(item?.actorRole ?? "")) ? "Room agent" : "Room participant";
 }
 
+// A Room refusal that can never succeed for this frozen post is a terminal
+// skip. turn_required is terminal only for a post frozen in open mode with no
+// turn or cycle: the Room became coordinated, and a retry repeats the refusal.
+function terminalRefusalReason(error, intent) {
+  if (!(error instanceof RoomAPIError)) return "";
+  if (error.code === "reply_cap_reached") return "reply_cap_reached";
+  if (error.code === "turn_required"
+    && !intent.identity.cycle && !intent.turn
+    && intent.post.turnId === undefined && intent.post.cycleId === undefined) {
+    return "coordination_mode_changed";
+  }
+  return "";
+}
+
 function validFrozenPost(intent) {
   const post = intent?.post;
   const identity = intent?.identity;
@@ -1175,8 +1189,10 @@ export class OpenClawRoomRuntime {
       try {
         message = await this.client.postMessage(this.state, intent.post, signal);
       } catch (error) {
-        if (error instanceof RoomAPIError && error.code === "reply_cap_reached") {
-          // A counted open-mode refusal is a normal terminal skip. Persist the
+        const skipReason = terminalRefusalReason(error, intent);
+        if (skipReason) {
+          // A counted open-mode refusal, or a turnless open-mode post refused
+          // by a now-coordinated Room, is a normal terminal skip. Persist the
           // intent and the source evidence together; a status the loader
           // rejects, or a skip without evidence, crashes recovery and retries
           // the same post. The intent keeps its source sequence because
@@ -1185,7 +1201,7 @@ export class OpenClawRoomRuntime {
           const bound = Boolean(intent.identity.sourceEventId);
           const source = this.pendingEvent;
           if (bound && (!source || source.id !== intent.identity.sourceEventId || !Number.isSafeInteger(source.seq) || source.seq < 1)) {
-            throw new Error("Reply-cap skip requires the bound pending source event");
+            throw new Error("Terminal Room refusal skip requires the bound pending source event");
           }
           const previousIntent = structuredClone(intent);
           const previousTerminalEvidence = this.state.terminalEvidence === undefined
@@ -1194,12 +1210,12 @@ export class OpenClawRoomRuntime {
             intent.deliveryState = "skipped";
             intent.status = "skipped";
             intent.lifecycleState = "not_required";
-            intent.skippedReason = "reply_cap_reached";
+            intent.skippedReason = skipReason;
             if (bound) {
               intent.skippedSourceSeq = source.seq;
-              const evidence = await this.recordTerminalEvidence(source, "skipped", {reason: "reply_cap_reached"});
-              if (evidence?.status !== "skipped" || evidence.reason !== "reply_cap_reached") {
-                throw new Error("Reply-cap skip conflicts with existing terminal evidence");
+              const evidence = await this.recordTerminalEvidence(source, "skipped", {reason: skipReason});
+              if (evidence?.status !== "skipped" || evidence.reason !== skipReason) {
+                throw new Error("Terminal Room refusal skip conflicts with existing terminal evidence");
               }
             } else {
               await this.persistState();
@@ -1211,7 +1227,7 @@ export class OpenClawRoomRuntime {
             else this.state.terminalEvidence = previousTerminalEvidence;
             throw persistError;
           }
-          return {skipped: true, reason: "reply_cap_reached"};
+          return {skipped: true, reason: skipReason};
         }
         if (error instanceof RoomAPIError && !error.retryable) {
           intent.deliveryState = "quarantined";
