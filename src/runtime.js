@@ -512,11 +512,21 @@ export class OpenClawRoomRuntime {
           continue;
         }
         const historical = event.seq < pageEpoch.startsAtSeq;
+        const payloadEpochId = epochEvidence(event);
+        let canonicalPriorEpochId = "";
+        if (!historical && payloadEpochId && payloadEpochId !== pageActiveEpochId
+            && isLifecycleOnlyCycleTerminal(event)) {
+          if (!isCanonicalCycleTransitionTerminal(event, this.state.roomId)) {
+            throw new Error("Room prior-epoch lifecycle terminal lacks canonical cycle-transition evidence");
+          }
+          const epochCatalog = await this.client.listEpochs(this.state, signal);
+          canonicalPriorEpochId = priorEpochIdFromCatalog(epochCatalog, pageEpoch);
+        }
         const canonicalEventEpochId = eventEpochId(
           event,
           pageActiveEpochId,
           pageEpoch.startsAtSeq,
-          this.state.legacySessionEpochId,
+          canonicalPriorEpochId,
         );
         if (historical) this.assertHistoricalIntentSafety(event);
         const existingTerminalEvidence = this.terminalEvidenceFor(event);
@@ -545,7 +555,7 @@ export class OpenClawRoomRuntime {
           continue;
         }
         if (isLifecycleOnlyCycleTerminal(event)
-            && isBoundaryEvent(event, pageActiveEpochId, pageEpoch.startsAtSeq, this.state.legacySessionEpochId)) {
+            && isBoundaryEvent(event, pageActiveEpochId, pageEpoch.startsAtSeq, canonicalPriorEpochId)) {
           await this.recordTerminalEvidence(event, "ignored", {reason: "prior_epoch_lifecycle"});
           await this.ackEvent(event);
           scanCursor = event.seq;
@@ -1781,16 +1791,66 @@ export function isLifecycleOnlyCycleTerminal(event) {
   ].join("\u0000"));
 }
 
-export function isBoundaryEvent(event, pageActiveEpochId, pageActiveEpochStartsAtSeq, durablePriorEpochId = "") {
+function isCanonicalCycleTransitionTerminal(event, roomId) {
+  const payload = eventPayload(event?.payload);
+  const exactSystemInterruption = event?.actorRole === "system"
+    && payload.state === "interrupted"
+    && payload.reason === "human_interrupted";
+  if (!exactSystemInterruption) return true;
+  return event?.roomId === roomId
+    && event?.eventVersion === 1
+    && event?.actorId === "room_coordinator"
+    && Number.isSafeInteger(payload.generation)
+    && payload.generation > 0
+    && Array.isArray(event?.refs)
+    && event.refs.length > 0
+    && event.refs.every((ref) => typeof ref === "string" && Boolean(ref.trim()));
+}
+
+export function priorEpochIdFromCatalog(catalog, pageEpoch) {
+  if (!catalog || !Array.isArray(catalog.epochs) || catalog.epochs.length < 2 || catalog.epochs.length > 10_000) {
+    throw new Error("Room epoch catalog cannot prove the immediately prior epoch");
+  }
+  const byId = new Map();
+  const byOrdinal = new Map();
+  for (const item of catalog.epochs) {
+    const id = exactEpochId(item?.id, "Room epoch catalog id");
+    const ordinal = item?.ordinal;
+    const status = item?.status;
+    if (!Number.isSafeInteger(ordinal) || ordinal < 1 || !["active", "closed"].includes(status)
+        || byId.has(id) || byOrdinal.has(ordinal)) {
+      throw new Error("Room epoch catalog is malformed or contradictory");
+    }
+    if (item.startsAtSeq !== undefined
+        && (!Number.isSafeInteger(item.startsAtSeq) || item.startsAtSeq < 1)) {
+      throw new Error("Room epoch catalog is malformed or contradictory");
+    }
+    const epoch = {id, ordinal, status, startsAtSeq: item.startsAtSeq};
+    byId.set(id, epoch);
+    byOrdinal.set(ordinal, epoch);
+  }
+  const active = byId.get(pageEpoch?.id);
+  if (!active || active.status !== "active" || active.startsAtSeq !== pageEpoch?.startsAtSeq
+      || Math.max(...byOrdinal.keys()) !== active.ordinal) {
+    throw new Error("Room epoch catalog contradicts the authoritative active epoch boundary");
+  }
+  const prior = byOrdinal.get(active.ordinal - 1);
+  if (!prior || prior.status !== "closed"
+      || (prior.startsAtSeq !== undefined && prior.startsAtSeq >= active.startsAtSeq)) {
+    throw new Error("Room epoch catalog cannot prove the immediately prior epoch");
+  }
+  return prior.id;
+}
+
+export function isBoundaryEvent(event, pageActiveEpochId, pageActiveEpochStartsAtSeq, canonicalPriorEpochId = "") {
   const payloadEpochId = epochEvidence(event);
-  const priorEpochId = exactOptionalEpochId(durablePriorEpochId, "Room durable prior epoch");
+  const priorEpochId = exactOptionalEpochId(canonicalPriorEpochId, "Room canonical prior epoch");
   return Number.isSafeInteger(event?.seq)
     && Number.isSafeInteger(pageActiveEpochStartsAtSeq)
     && pageActiveEpochStartsAtSeq > 0
-    // Both reviewed canonical producers close the superseded cycle immediately
-    // after discussion.started. Combined with the durable legacy-session epoch,
-    // this proves the mismatch is the immediately preceding epoch rather than an
-    // arbitrary unknown or future identifier.
+    // Reviewed canonical producers close the superseded cycle immediately after
+    // discussion.started. The authenticated epoch catalog, not mutable local
+    // routing state, proves which opaque epoch immediately preceded the active one.
     && event.seq === pageActiveEpochStartsAtSeq + 1
     && Boolean(payloadEpochId)
     && Boolean(pageActiveEpochId)
@@ -1799,7 +1859,7 @@ export function isBoundaryEvent(event, pageActiveEpochId, pageActiveEpochStartsA
     && payloadEpochId === priorEpochId;
 }
 
-export function eventEpochId(event, pageActiveEpochId = "", pageActiveEpochStartsAtSeq = 0, durablePriorEpochId = "") {
+export function eventEpochId(event, pageActiveEpochId = "", pageActiveEpochStartsAtSeq = 0, canonicalPriorEpochId = "") {
   const payloadEpochId = epochEvidence(event);
   const historical = Number.isSafeInteger(event?.seq) && Number.isSafeInteger(pageActiveEpochStartsAtSeq)
     && pageActiveEpochStartsAtSeq > 0 && event.seq < pageActiveEpochStartsAtSeq;
@@ -1810,7 +1870,7 @@ export function eventEpochId(event, pageActiveEpochId = "", pageActiveEpochStart
   }
   if (!historical && payloadEpochId && pageActiveEpochId && payloadEpochId !== pageActiveEpochId
     && !(lifecycleTerminal
-      && isBoundaryEvent(event, pageActiveEpochId, pageActiveEpochStartsAtSeq, durablePriorEpochId))) {
+      && isBoundaryEvent(event, pageActiveEpochId, pageActiveEpochStartsAtSeq, canonicalPriorEpochId))) {
     throw new Error("Room event epoch evidence contradicts the authoritative active epoch boundary");
   }
   return payloadEpochId || (historical ? "" : exactEpochId(pageActiveEpochId, "Room page active epoch"));

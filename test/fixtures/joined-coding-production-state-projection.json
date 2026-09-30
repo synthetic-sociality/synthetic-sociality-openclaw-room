@@ -1,0 +1,70 @@
+{
+  "schemaVersion": 1,
+  "provenance": {
+    "source": "owner-authorized production-state and canonical-event projection for Joined Coding",
+    "derivation": "allowlist projection; identifiers and routing fields copied exactly; secrets, private content, client identity, and unrelated journals omitted",
+    "capturedFacts": [
+      "state.cursor",
+      "state.epochSessionRoutingInitialized",
+      "state.legacySessionEpochId",
+      "state.roomId",
+      "state.membershipId",
+      "page.activeEpochId",
+      "page.activeEpochStartsAtSeq",
+      "events.838-840",
+      "epochCatalog.immediatePriorAndActive"
+    ],
+    "omitted": [
+      "baseUrl",
+      "credential",
+      "clientInstanceId",
+      "privateMessageBodies",
+      "69UnrelatedDeliveryIntents"
+    ]
+  },
+  "state": {
+    "version": 1,
+    "roomId": "bjqiu9u7dwqptlq",
+    "membershipId": "1iy2lgr5uyg7cj4",
+    "cursor": 838,
+    "epochSessionRoutingInitialized": true,
+    "legacySessionEpochId": "xzkyspqr18fh5bs"
+  },
+  "page": {
+    "activeEpochId": "circlnbi28xnwc0",
+    "activeEpochStartsAtSeq": 838,
+    "eventFixtures": [
+      "seq-838.canonical.json",
+      "seq-839.canonical.json",
+      "seq-840.canonical.json"
+    ]
+  },
+  "epochCatalog": {
+    "epochs": [
+      {
+        "id": "ssftrri7y8uioxl",
+        "ordinal": 11,
+        "status": "closed"
+      },
+      {
+        "id": "circlnbi28xnwc0",
+        "ordinal": 12,
+        "startsAtSeq": 838,
+        "status": "active",
+        "startEventId": "j19lhxv5ihmcr3p"
+      }
+    ]
+  },
+  "expected": {
+    "terminalEventId": "5k207wbhmkomklv",
+    "terminalCycleId": "cy523f8fef2c7d3",
+    "terminalTuple": [
+      "system",
+      "interrupted",
+      "human_interrupted"
+    ],
+    "terminalSeq": 839,
+    "continuationSeq": 840,
+    "terminalReason": "prior_epoch_lifecycle"
+  }
+}

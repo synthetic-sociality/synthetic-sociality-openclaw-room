@@ -56,6 +56,18 @@ async function loadJoinedCodingEpochFixture(seq) {
   return JSON.parse(canonical.toString("utf8"));
 }
 
+async function loadJoinedCodingProductionProjection() {
+  const bytes = await readFile(new URL("./fixtures/joined-coding-production-state-projection.json", import.meta.url));
+  const fixture = JSON.parse(bytes.toString("utf8"));
+  assert.equal(fixture.schemaVersion, 1);
+  for (const forbidden of ["baseUrl", "credential", "clientInstanceId", "deliveryIntents"]) {
+    assert.equal(Object.hasOwn(fixture.state, forbidden), false, `production projection must omit ${forbidden}`);
+  }
+  assert.equal(JSON.stringify(fixture).includes("privateMessageBodies"), true);
+  assert.equal(JSON.stringify(fixture).includes('"body"'), false);
+  return fixture;
+}
+
 test("derives stable epoch-scoped conversations and rotates them between epochs", () => {
   assert.match(epochConversationId("room-1", "epoch-1"), /^room-1:epoch:[a-f0-9]{32}$/);
   assert.equal(epochConversationId("room-1", "epoch-1"), epochConversationId("room-1", "epoch-1"));
@@ -1446,6 +1458,10 @@ test("fixture 132-134 acknowledges the timed-out terminal as lifecycle-only", as
     readEvents: async () => ({
       activeEpochId: "dqb8eamems9yi2e", activeEpochStartsAtSeq: 133, events,
     }),
+    listEpochs: async () => ({epochs: [
+      {id: "qjw1tu1jfnm1wsp", ordinal: 1, startsAtSeq: 1, status: "closed"},
+      {id: "dqb8eamems9yi2e", ordinal: 2, startsAtSeq: 133, status: "active"},
+    ]}),
     acknowledge: async (_state, seq) => {
       acknowledgements.push(seq);
       if (seq === 134) controller.abort();
@@ -1498,6 +1514,10 @@ function attachEpochTransitionFixture(runtime, events, counters, acknowledge, si
         events,
       };
     },
+    listEpochs: async () => ({epochs: [
+      {id: "ssftrri7y8uioxl", ordinal: 11, status: "closed"},
+      {id: "circlnbi28xnwc0", ordinal: 12, startsAtSeq: 838, status: "active"},
+    ]}),
     acknowledge,
     roomPolicy: async () => { counters.coordination += 1; throw new Error("room policy must not be read"); },
     roomState: async () => { counters.coordination += 1; throw new Error("room state must not be read"); },
@@ -1519,6 +1539,85 @@ function attachEpochTransitionFixture(runtime, events, counters, acknowledge, si
 function zeroEpochTransitionSideEffects() {
   return {model: 0, post: 0, fallback: 0, claim: 0, turn: 0, activity: 0, coordination: 0};
 }
+
+test("redacted production-state projection proves seq839 durably before ack and continues after restart", async () => {
+  const fixture = await loadJoinedCodingProductionProjection();
+  const events = await Promise.all([838, 839, 840].map(loadJoinedCodingEpochFixture));
+  assert.deepEqual(events.map((event) => event.seq), [838, 839, 840]);
+  assert.deepEqual([
+    events[1].actorRole,
+    events[1].payload.state,
+    events[1].payload.reason,
+  ], fixture.expected.terminalTuple);
+  assert.equal(events[1].payload.cycleId, fixture.expected.terminalCycleId);
+  assert.equal(events[1].payload.epochId, fixture.epochCatalog.epochs[0].id);
+  assert.equal(events[0].payload.epoch.id, fixture.page.activeEpochId);
+  assert.equal(events[0].payload.epoch.startsAtSeq, fixture.page.activeEpochStartsAtSeq);
+
+  const directory = await mkdtemp(join(tmpdir(), "openclaw-room-production-projection-"));
+  const stateFile = join(directory, "state.json");
+  await saveState(stateFile, {
+    ...fixture.state,
+    baseUrl: "https://fixture.invalid/api",
+    credential: "fixture-only",
+    clientInstanceId: "fixture-only",
+    messagePayloadDialect: "v2",
+    deliveryIntents: {},
+    terminalEvidence: {},
+  });
+  const loaded = await loadState(stateFile);
+  assert.equal(loaded.legacySessionEpochId, "xzkyspqr18fh5bs", "fixture must retain the real mismatched legacy routing epoch");
+
+  const firstCounters = zeroEpochTransitionSideEffects();
+  const firstTrace = [];
+  const first = new OpenClawRoomRuntime({accountId: "fixture", stateFile, baseUrl: "https://fixture.invalid/api"});
+  first.state = loaded;
+  attachEpochTransitionFixture(first, events.slice(1), firstCounters, async (_state, seq) => {
+    firstTrace.push(["acknowledge", seq]);
+    if (seq === fixture.expected.terminalSeq) throw new Error("fixture interruption after durable terminal evidence");
+    return {acknowledgedSeq: seq};
+  });
+  first.client.listEpochs = async () => {
+    firstTrace.push(["listEpochs"]);
+    return structuredClone(fixture.epochCatalog);
+  };
+  await assert.rejects(first.assignedTurns(new AbortController().signal).next(), /fixture interruption after durable terminal evidence/);
+  assert.deepEqual(firstTrace, [["listEpochs"], ["acknowledge", 839]]);
+  assert.deepEqual(firstCounters, zeroEpochTransitionSideEffects());
+
+  const interrupted = await loadState(stateFile);
+  assert.equal(interrupted.cursor, 838);
+  assert.equal(interrupted.legacySessionEpochId, "xzkyspqr18fh5bs");
+  assert.deepEqual(interrupted.terminalEvidence["839"], {
+    status: "ignored", sourceEventId: fixture.expected.terminalEventId, sourceSeq: 839,
+    canonicalEventId: "", canonicalSeq: 0, canonicalTs: "", reason: fixture.expected.terminalReason,
+  });
+
+  const restartCounters = zeroEpochTransitionSideEffects();
+  const restartTrace = [];
+  const restartController = new AbortController();
+  const restarted = new OpenClawRoomRuntime({accountId: "fixture", stateFile, baseUrl: "https://fixture.invalid/api"});
+  restarted.state = interrupted;
+  attachEpochTransitionFixture(restarted, events.slice(1), restartCounters, async (_state, seq) => {
+    restartTrace.push(["acknowledge", seq]);
+    if (seq === fixture.expected.continuationSeq) restartController.abort();
+    return {acknowledgedSeq: seq};
+  });
+  restarted.client.listEpochs = async () => {
+    restartTrace.push(["listEpochs"]);
+    return structuredClone(fixture.epochCatalog);
+  };
+  const result = await restarted.assignedTurns(restartController.signal).next();
+  assert.equal(result.done, true);
+  assert.deepEqual(restartTrace, [["listEpochs"], ["acknowledge", 839], ["acknowledge", 840]]);
+  assert.deepEqual(restartCounters, zeroEpochTransitionSideEffects());
+
+  const complete = await loadState(stateFile);
+  assert.equal(complete.cursor, 840);
+  assert.equal(complete.legacySessionEpochId, "xzkyspqr18fh5bs");
+  assert.deepEqual(complete.terminalEvidence, {});
+  assert.deepEqual(complete.deliveryIntents, {});
+});
 
 test("fixture 838-840 durably ignores the reviewed prior-epoch terminal and continues after restart", async () => {
   const events = await Promise.all([838, 839, 840].map(loadJoinedCodingEpochFixture));
@@ -1599,6 +1698,9 @@ test("old-epoch conversational, malformed, contradictory, and unknown events rem
     ["terminal without cycle", {...terminal, payload: {...terminal.payload, cycleId: ""}}],
     ["unknown reason", {...terminal, payload: {...terminal.payload, reason: "arbitrary_reason"}}],
     ["unknown actor role", {...terminal, actorRole: "room_master"}],
+    ["system terminal from non-coordinator", {...terminal, actorId: "not-the-coordinator"}],
+    ["system terminal without canonical refs", {...terminal, refs: []}],
+    ["system terminal with invalid generation", {...terminal, payload: {...terminal.payload, generation: 0}}],
     ["malformed epoch", {...terminal, payload: {...terminal.payload, epochId: 7}}],
     ["contradictory epoch", {...terminal, payload: {...terminal.payload, summaryHandoff: {epochId: "circlnbi28xnwc0"}}}],
   ];
@@ -1667,6 +1769,42 @@ async function assertRejectedEpochFixture(fixture) {
 
 test("839.future-epoch lifecycle terminal fails before evidence acknowledgement or state change", async () => {
   await assertRejectedEpochFixture("839.future-epoch");
+});
+
+test("older-than-immediate-prior lifecycle terminal fails before evidence acknowledgement or state change", async () => {
+  const terminal = await loadJoinedCodingEpochFixture(839);
+  const event = structuredClone(terminal);
+  event.id = "older-epoch-negative";
+  event.payload.epochId = "older-epoch";
+  const directory = await mkdtemp(join(tmpdir(), "openclaw-room-older-epoch-reject-"));
+  const stateFile = join(directory, "state.json");
+  await saveState(stateFile, {
+    version: 1, baseUrl: "https://fixture.invalid/api", roomId: "bjqiu9u7dwqptlq",
+    membershipId: "1iy2lgr5uyg7cj4", credential: "fixture-only", clientInstanceId: "fixture-only",
+    cursor: 838, messagePayloadDialect: "v2", deliveryIntents: {}, terminalEvidence: {},
+    epochSessionRoutingInitialized: true, legacySessionEpochId: "older-epoch",
+  });
+  const before = await readFile(stateFile);
+  const counters = zeroEpochTransitionSideEffects();
+  const acknowledgements = [];
+  const runtime = new OpenClawRoomRuntime({accountId: "fixture", stateFile, baseUrl: "https://fixture.invalid/api"});
+  runtime.state = await loadState(stateFile);
+  attachEpochTransitionFixture(runtime, [event], counters, async (_state, seq) => {
+    acknowledgements.push(seq);
+    return {acknowledgedSeq: seq};
+  });
+  runtime.client.listEpochs = async () => ({epochs: [
+    {id: "older-epoch", ordinal: 10, status: "closed"},
+    {id: "ssftrri7y8uioxl", ordinal: 11, status: "closed"},
+    {id: "circlnbi28xnwc0", ordinal: 12, startsAtSeq: 838, status: "active"},
+  ]});
+
+  await assert.rejects(runtime.assignedTurns(new AbortController().signal).next(), {
+    message: "Room event epoch evidence contradicts the authoritative active epoch boundary",
+  });
+  assert.deepEqual(acknowledgements, []);
+  assert.deepEqual(counters, zeroEpochTransitionSideEffects());
+  assert.deepEqual(await readFile(stateFile), before);
 });
 
 test("839.empty-epoch lifecycle terminal fails before evidence acknowledgement or state change", async () => {

@@ -8,7 +8,19 @@ No implementation, release, deployment, database, cursor, session, connector
 state, Room message, upload, invitation or service restart is authorized by
 this document.
 
-## 2026-09-30 narrow producer-variant amendment
+## 2026-09-30 production-state replay correction
+
+OpenClaw 0.2.50 replaces 0.2.49's incorrect use of the mutable
+`legacySessionEpochId` as lifecycle authority. A mismatch is admitted only when
+the authenticated epoch catalog proves the payload epoch is ordinally adjacent
+to the active page epoch, the terminal is exactly at
+`activeEpochStartsAtSeq + 1`, and the canonical cycle-terminal structure is
+complete. The redacted production projection retains cursor 838 and the actual
+unrelated legacy routing epoch so the regression cannot seed the equality it
+expects. Future, older, empty, malformed, unknown, contradictory, and
+conversational events remain fail-closed.
+
+## 2026-09-30 narrow producer-variant amendment (0.2.49, superseded proof)
 
 OpenClaw 0.2.49 extends the existing lifecycle-only allowlist with the canonical
 `system / interrupted / human_interrupted` producer variant. Admission remains

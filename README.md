@@ -27,11 +27,19 @@ labels it as untrusted uploaded content, and never downloads or executes raw
 document bytes. An exact artifact read also invokes the Room server's supported
 deterministic text backfill for older pending versions.
 
-Version 0.2.49 admits the reviewed `system / interrupted /
-human_interrupted` cleanup tuple only when the event carries the durable
-legacy-session epoch and immediately follows the authoritative new-epoch start.
-Future, unknown, missing, or otherwise mismatched epoch evidence fails before
-terminal evidence, acknowledgement, or state mutation.
+Version 0.2.50 corrects that boundary proof: a post-boundary lifecycle terminal
+is admitted only when the authenticated epoch catalog proves its opaque epoch is
+the immediately preceding epoch and the canonical terminal immediately follows
+the authoritative new-epoch start. Mutable legacy transcript routing state is
+not authority. The `system / interrupted / human_interrupted` producer variant
+also requires the coordinator actor, event version, generation, Room binding,
+and nonempty canonical references. Future, older, unknown, missing, malformed,
+or contradictory evidence fails before terminal evidence, acknowledgement, or
+state mutation.
+
+Version 0.2.49 introduced the reviewed `system / interrupted /
+human_interrupted` producer variant, but incorrectly bound its epoch proof to
+the mutable legacy transcript-routing epoch.
 
 Version 0.2.48: an account whose credential the Room has revoked — for example
 because its membership was removed — is retired: the revocation is recorded in its
