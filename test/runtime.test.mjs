@@ -2258,6 +2258,8 @@ test("coordinated rooms and disabled peer replies keep agent posts from starting
   }
 });
 
+const fullFixtureState = (state) => ({version: 1, baseUrl: "https://room.example/api", credential: "fixture-only", ...state});
+
 test("reply cap refusal is a terminal skipped delivery, never quarantined or reposted", async () => {
   const runtime = new OpenClawRoomRuntime({accountId: "default", stateFile: "/unused", baseUrl: "https://room.example/api"});
   runtime.state = {roomId: "room-1", membershipId: "reader-member", clientInstanceId: "client-1", messagePayloadDialect: "v2", cursor: 0};
@@ -2269,10 +2271,43 @@ test("reply cap refusal is a terminal skipped delivery, never quarantined or rep
     postMessage: async () => { posts += 1; throw new RoomAPIError(409, {code: "reply_cap_reached", retryable: false}); },
   };
   const request = {roomId: "room-1", text: "One more reply", replyToId: "src-1", idempotencyKey: "src-1:final", sourceEventId: "src-1"};
+  // Production binds the source before any sourced post (live turn or recovery).
+  runtime.pendingEvent = {id: "src-1", seq: 1};
   assert.deepEqual(await runtime.postAndFinishOnce(request), {skipped: true, reason: "reply_cap_reached"});
   const intent = runtime.state.deliveryIntents["src-1:final"];
   assert.equal(intent.deliveryState, "skipped");
   assert.notEqual(intent.status, "quarantined");
+  assert.deepEqual(await runtime.postAndFinishOnce(request), {skipped: true, reason: "reply_cap_reached"});
+  assert.equal(posts, 1);
+  validateState(fullFixtureState(runtime.state));
+
+  // A sourced skip without its bound source fails closed and stays pending.
+  const unboundRuntime = new OpenClawRoomRuntime({accountId: "default", stateFile: "/unused", baseUrl: "https://room.example/api"});
+  unboundRuntime.state = {roomId: "room-1", membershipId: "reader-member", clientInstanceId: "client-1", messagePayloadDialect: "v2", cursor: 0};
+  unboundRuntime.persistState = async () => {};
+  unboundRuntime.client = runtime.client;
+  await assert.rejects(unboundRuntime.postAndFinishOnce(request), /Reply-cap skip requires the bound pending source event/);
+  assert.equal(unboundRuntime.state.deliveryIntents["src-1:final"].status, "delivery_pending");
+});
+
+test("outbound reply cap refusal persists a skip without source evidence", async () => {
+  const runtime = new OpenClawRoomRuntime({accountId: "default", stateFile: "/unused", baseUrl: "https://room.example/api"});
+  runtime.state = {roomId: "room-1", membershipId: "reader-member", clientInstanceId: "client-1", messagePayloadDialect: "v2", cursor: 0};
+  let saves = 0;
+  runtime.persistState = async () => { saves += 1; validateState(fullFixtureState(runtime.state)); };
+  let posts = 0;
+  runtime.client = {
+    roomState: async () => ({activeEpoch: {id: "epoch-1"}, headSeq: 7, roster: []}),
+    roomPolicy: async () => ({policy: {coordinationMode: "open"}}),
+    postMessage: async () => { posts += 1; throw new RoomAPIError(409, {code: "reply_cap_reached", retryable: false}); },
+  };
+  const request = {roomId: "room-1", text: "Outbound note", idempotencyKey: "outbound-1"};
+  assert.deepEqual(await runtime.postAndFinishOnce(request), {skipped: true, reason: "reply_cap_reached"});
+  const intent = runtime.state.deliveryIntents["outbound-1"];
+  assert.equal(intent.status, "skipped");
+  assert.equal(intent.skippedSourceSeq, undefined);
+  assert.deepEqual(runtime.state.terminalEvidence ?? {}, {});
+  assert.ok(saves > 0);
   assert.deepEqual(await runtime.postAndFinishOnce(request), {skipped: true, reason: "reply_cap_reached"});
   assert.equal(posts, 1);
 });
@@ -2325,4 +2360,133 @@ test("duplicate open-mode delivery reuses the canonical receipt without repostin
   assert.deepEqual(second, first);
   assert.equal(posts, 1);
   assert.equal(runtime.state.deliveryIntents["src-1:final"].deliveryState, "posted");
+});
+
+// A frozen open-mode post is a normal pending delivery. reply_cap_reached is a
+// normal refusal. Recovery must persist that skip through the real save/load
+// path, record terminal evidence, and never repost it.
+test("reply-cap recovery persists a skipped frozen delivery and does not repost after restart", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "openclaw-room-reply-cap-"));
+  const stateFile = join(directory, "state.json");
+  const sourceId = "src-cap";
+  const body = "redacted frozen reply";
+  const messageKey = "fixture-message-key";
+  const intent = {
+    version: 2,
+    status: "delivery_pending",
+    deliveryState: "delivery_pending",
+    lifecycleState: "not_started",
+    messagePayloadDialect: "v1",
+    logicalContributionId: "fixture-logical",
+    messageIdempotencyKey: messageKey,
+    requestIdempotencyKey: "fixture-request",
+    finishIdempotencyKey: "fixture-finish",
+    binding: {roomId: "room-1", membershipId: "member-1", clientInstanceId: "client-1"},
+    identity: {
+      roomId: "room-1",
+      body,
+      coordinationMode: "open",
+      cycle: null,
+      sourceEventId: sourceId,
+      sourceEpochId: "epoch-1",
+      postObservedEpochId: "epoch-1",
+      postObservedSeq: 12,
+      initialObservedSeq: 12,
+      initialEpochId: "epoch-1",
+      replyToId: "human-1",
+      topicId: "topic-1",
+      nextRecipient: "",
+      recipientSelectors: [],
+      resolveRecipientMentions: false,
+    },
+    post: {
+      body,
+      contributionType: "claim",
+      idempotencyKey: messageKey,
+      observedEpochId: "epoch-1",
+      observedSeq: 12,
+      respondsTo: ["human-1"],
+      topicId: "topic-1",
+    },
+  };
+  await saveState(stateFile, {
+    version: 1,
+    baseUrl: "https://fixture.invalid/api",
+    roomId: "room-1",
+    membershipId: "member-1",
+    credential: "fixture-only",
+    clientInstanceId: "client-1",
+    cursor: 10,
+    messagePayloadDialect: "v1",
+    deliveryIntents: {[`${sourceId}:final`]: intent},
+    terminalEvidence: {},
+  });
+  const event = {id: sourceId, seq: 11, type: "message.posted", actorRole: "human_owner", payload: {body: "prompt"}};
+  let posts = 0;
+  const runtime = new OpenClawRoomRuntime({accountId: "fixture", stateFile, baseUrl: "https://fixture.invalid/api"});
+  runtime.state = await loadState(stateFile);
+  runtime.client = {
+    roomState: async () => ({activeEpoch: {id: "epoch-1"}, headSeq: 12, roster: []}),
+    publishActivity: async () => ({acceptedStreamSeq: 1}),
+    postMessage: async () => {
+      posts += 1;
+      throw new RoomAPIError(409, {code: "reply_cap_reached", retryable: false});
+    },
+  };
+  assert.equal(await runtime.recoverPendingDelivery(event, new AbortController().signal), true);
+  assert.equal(posts, 1);
+  const saved = await loadState(stateFile);
+  const skipped = saved.deliveryIntents[`${sourceId}:final`];
+  assert.equal(skipped.status, "skipped");
+  assert.equal(skipped.deliveryState, "skipped");
+  assert.equal(skipped.skippedReason, "reply_cap_reached");
+  assert.equal(skipped.skippedSourceSeq, 11);
+  assert.equal(skipped.canonicalMessage, undefined);
+  assert.deepEqual(saved.terminalEvidence["11"], {
+    status: "skipped",
+    sourceEventId: sourceId,
+    sourceSeq: 11,
+    canonicalEventId: "",
+    canonicalSeq: 0,
+    canonicalTs: "",
+    reason: "reply_cap_reached",
+  });
+
+  // Acknowledgement prunes the evidence at the cursor; the skipped intent must
+  // still save and load, or recovery crashes after the server acknowledged.
+  let acknowledged = 0;
+  runtime.client.acknowledge = async (_state, seq) => { acknowledged += 1; return {acknowledgedSeq: seq}; };
+  runtime.pendingEvent = event;
+  await runtime.ackEvent(event);
+  assert.equal(acknowledged, 1);
+  const acked = await loadState(stateFile);
+  assert.equal(acked.cursor, 11);
+  assert.deepEqual(acked.terminalEvidence, {});
+  assert.equal(acked.deliveryIntents[`${sourceId}:final`].status, "skipped");
+
+  const restarted = new OpenClawRoomRuntime({accountId: "fixture", stateFile, baseUrl: "https://fixture.invalid/api"});
+  restarted.state = acked;
+  restarted.client = {
+    publishActivity: async () => { throw new Error("restart must not publish activity"); },
+    postMessage: async () => { posts += 1; throw new Error("restart must not repost"); },
+    roomState: async () => { throw new Error("restart must not read room state"); },
+  };
+  assert.equal(await restarted.recoverPendingDelivery(event, new AbortController().signal), false);
+  assert.equal(posts, 1);
+  assert.throws(() => validateState({
+    ...saved,
+    terminalEvidence: {},
+  }), /Room skipped delivery requires matching terminal evidence/);
+  assert.throws(() => validateState({
+    ...saved,
+    deliveryIntents: {[`${sourceId}:final`]: {...skipped, skippedSourceSeq: undefined}},
+  }), /Room skipped delivery requires its source sequence/);
+  assert.throws(() => validateState({
+    ...saved,
+    terminalEvidence: {"11": {...saved.terminalEvidence["11"], sourceEventId: "other-source"}},
+  }), /Room skipped delivery requires matching terminal evidence/);
+  assert.throws(() => validateState({
+    ...saved,
+    deliveryIntents: {[`${sourceId}:final`]: {...skipped, status: "not-a-status", deliveryState: "skipped"}},
+  }), /Room delivery intent status is invalid/);
 });

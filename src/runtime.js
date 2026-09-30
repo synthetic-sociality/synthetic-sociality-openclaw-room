@@ -1168,13 +1168,27 @@ export class OpenClawRoomRuntime {
         message = await this.client.postMessage(this.state, intent.post, signal);
       } catch (error) {
         if (error instanceof RoomAPIError && error.code === "reply_cap_reached") {
-          // The Room refused this counted open-mode post (ADR 0089). This is a
-          // legitimate terminal outcome without a post, not an unsafe retry.
+          // A counted open-mode refusal is a normal terminal skip. Persist the
+          // intent and the source evidence together; a status the loader
+          // rejects, or a skip without evidence, crashes recovery and retries
+          // the same post. The intent keeps its source sequence because
+          // acknowledgement later prunes the evidence below the cursor. An
+          // outbound send has no Room source and records only the reason.
+          const bound = Boolean(intent.identity.sourceEventId);
+          const source = this.pendingEvent;
+          if (bound && (!source || source.id !== intent.identity.sourceEventId || !Number.isSafeInteger(source.seq) || source.seq < 1)) {
+            throw new Error("Reply-cap skip requires the bound pending source event");
+          }
           intent.deliveryState = "skipped";
           intent.status = "skipped";
           intent.lifecycleState = "not_required";
           intent.skippedReason = "reply_cap_reached";
-          await this.persistState();
+          if (bound) {
+            intent.skippedSourceSeq = source.seq;
+            await this.recordTerminalEvidence(source, "skipped", {reason: "reply_cap_reached"});
+          } else {
+            await this.persistState();
+          }
           return {skipped: true, reason: "reply_cap_reached"};
         }
         if (error instanceof RoomAPIError && !error.retryable) {

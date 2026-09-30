@@ -206,7 +206,7 @@ function validateDeliveryIntent(key, intent, state) {
   if (!key || !intent || typeof intent !== "object" || ![1, 2].includes(intent.version)) {
     throw new Error("Room delivery intent version is invalid");
   }
-  if (!["selected", "preparing", "delivery_pending", "lifecycle_pending", "posted", "quarantined", "lifecycle_blocked", "superseded"].includes(intent.status)) {
+  if (!["selected", "preparing", "delivery_pending", "lifecycle_pending", "posted", "quarantined", "lifecycle_blocked", "superseded", "skipped"].includes(intent.status)) {
     throw new Error("Room delivery intent status is invalid");
   }
   if (!["v1", "v2"].includes(intent.messagePayloadDialect)) throw new Error("Room delivery intent dialect is invalid");
@@ -262,7 +262,7 @@ function validateDeliveryIntent(key, intent, state) {
   if (intent.receipt !== undefined && (
     !intent.canonicalMessage || intent.receipt?.eventId !== intent.canonicalMessage.id
   )) throw new Error("Room delivery receipt does not match its canonical event");
-  if (intent.deliveryState !== undefined && !["selected", "delivery_pending", "posted", "quarantined", "superseded"].includes(intent.deliveryState)) {
+  if (intent.deliveryState !== undefined && !["selected", "delivery_pending", "posted", "quarantined", "superseded", "skipped"].includes(intent.deliveryState)) {
     throw new Error("Room delivery state is invalid");
   }
   if (intent.version === 2) {
@@ -274,9 +274,30 @@ function validateDeliveryIntent(key, intent, state) {
       quarantined: "quarantined",
       lifecycle_blocked: "posted",
       superseded: "superseded",
+      skipped: "skipped",
     }[intent.status];
     if (!expectedDeliveryState || intent.deliveryState !== expectedDeliveryState) {
       throw new Error("Room delivery status and delivery state are inconsistent");
+    }
+  }
+  if (intent.status === "skipped") {
+    if (typeof intent.skippedReason !== "string" || !intent.skippedReason.trim()) {
+      throw new Error("Room skipped delivery requires a reason");
+    }
+    // An outbound send has no Room source, so it has no sequence or evidence.
+    if (!identity.sourceEventId) {
+      if (intent.skippedSourceSeq !== undefined) throw new Error("Room outbound skipped delivery cannot carry a source sequence");
+    } else if (!Number.isSafeInteger(intent.skippedSourceSeq) || intent.skippedSourceSeq < 1) {
+      throw new Error("Room skipped delivery requires its source sequence");
+    // Acknowledgement prunes evidence at or below the cursor; above it the
+    // skip is not yet acknowledged and must carry its matching evidence.
+    } else if (intent.skippedSourceSeq > state.cursor) {
+      const evidence = state.terminalEvidence?.[String(intent.skippedSourceSeq)];
+      if (
+        evidence?.sourceEventId !== identity.sourceEventId
+        || evidence.status !== "skipped"
+        || evidence.reason !== intent.skippedReason
+      ) throw new Error("Room skipped delivery requires matching terminal evidence");
     }
   }
   if (intent.deliveryState === "posted" && (
