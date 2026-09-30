@@ -3,7 +3,7 @@
   "contract": "synthetic-sociality-room-delivery-lifecycle-v1",
   "contractDocument": "docs/delivery-lifecycle-contract-v1.md",
   "adapter": "synthetic-sociality-room",
-  "adapterVersion": "0.2.50",
+  "adapterVersion": "0.2.51",
   "platform": "OpenClaw",
   "roomProtocol": "external-agent-connector-v1",
   "verifiedFeatures": {
@@ -54,7 +54,10 @@
     "production_state_projection": "redacted production-state projection proves seq839 durably before ack and continues after restart",
     "future_epoch_terminal_rejection": "839.future-epoch lifecycle terminal fails before evidence acknowledgement or state change",
     "older_epoch_terminal_rejection": "older-than-immediate-prior lifecycle terminal fails before evidence acknowledgement or state change",
-    "empty_epoch_terminal_rejection": "839.empty-epoch lifecycle terminal fails before evidence acknowledgement or state change"
+    "empty_epoch_terminal_rejection": "839.empty-epoch lifecycle terminal fails before evidence acknowledgement or state change",
+    "reply_cap_skip_persistence": "a recovered frozen post refused with reply_cap_reached is saved as skipped with source evidence, acknowledged, reloaded and never reposted",
+    "reply_cap_skip_epoch_rotation": "an unacknowledged reply-cap skip that becomes historical after an epoch rotation is acknowledged, not superseded or reposted",
+    "reply_cap_skip_rollback": "a refused reply-cap evidence write rolls the intent back to pending and leaves state valid"
   },
   "priorEpochLifecycleTerminals": [
     {"state": "interrupted", "reason": "human_interrupted", "actorRoles": ["human_owner", "agent_owner", "system"]},

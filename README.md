@@ -27,6 +27,13 @@ labels it as untrusted uploaded content, and never downloads or executes raw
 document bytes. An exact artifact read also invokes the Room server's supported
 deterministic text backfill for older pending versions.
 
+Version 0.2.51 persists a Room `reply_cap_reached` refusal as a terminal
+skipped delivery. Since 0.2.47 the connector marked such a refusal
+`skipped`, but the state loader rejected that status, so the save failed and
+every restart retried the same post. A sourced skip now records its source
+sequence and terminal evidence in one write, survives acknowledgement and an
+epoch rotation, and rolls back if the evidence cannot be written.
+
 Version 0.2.50 corrects that boundary proof: a post-boundary lifecycle terminal
 is admitted only when the authenticated epoch catalog proves its opaque epoch is
 the immediately preceding epoch and the canonical terminal immediately follows
