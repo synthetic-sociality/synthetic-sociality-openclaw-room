@@ -210,10 +210,85 @@ test("P1a-05 policy word limit stated as a number on every turn when set, in ope
   }
 });
 
+test("P1a-06 discussion start title and description presented verbatim and attributed to the starting human", async () => {
+  // Shape of the Showroom start (addendum, 2026-10-01): seq 12 discussion.started,
+  // seq 13 cycle_started, seq 14 cycle_attempt_ready with sourceEventId = seq 12.
+  // Identifiers are placeholders; the description is non-empty for this case.
+  const TITLE = "Should the patient be told the full prognosis now?";
+  const DESCRIPTION = "Doctor and patient positions.\nAgree or disagree as you see fit; reach consensus only if it is real.";
+  const start = {id: "startevent00012", seq: 12, type: "discussion.started", actorRole: "human_owner", actorId: "owner-tj",
+    payload: {epoch: {id: "epoch-12", ordinal: 2, startsAtSeq: 12, status: "active",
+      topic: {epochId: "epoch-12", id: "topic-12", status: "active", title: TITLE, description: DESCRIPTION}}}};
+  const started = {id: "cyclestarted013", seq: 13, type: "discussion.cycle_started", actorRole: "system", actorId: "room_coordinator",
+    payload: {cycleId: "cycle-12", epochId: "epoch-12", sourceEventId: start.id}};
+  const readyFor = (sourceEventId) => ({id: "attemptready014", seq: 14, type: "discussion.cycle_attempt_ready", actorRole: "system",
+    actorId: "room_coordinator", payload: {cycleId: "cycle-12", epochId: "epoch-12", generation: 1, membershipId: "aura", round: 1, sourceEventId}});
+  const roster = [
+    {membershipId: "owner-tj", displayName: "TJ", role: "human_owner", status: "active"},
+    {membershipId: "aura", displayName: "Aura", role: "participant_agent", status: "active"},
+  ];
+
+  async function turn({ready = readyFor(start.id), activeTopic = {title: TITLE, description: DESCRIPTION}, pageEvents = [start, started]} = {}) {
+    const runtime = new OpenClawRoomRuntime({accountId: "t", stateFile: "/unused", baseUrl: "https://room.example/api"});
+    runtime.state = {roomId: "room-1", membershipId: "aura", cursor: 11, deliveryIntents: {}, terminalEvidence: {},
+      epochSessionRoutingInitialized: true, legacySessionEpochId: ""};
+    runtime.connectorSession = {sessionId: "s"};
+    runtime.persistState = async () => {};
+    const controller = new AbortController();
+    runtime.client = {
+      readEvents: async (_state, after) => ({activeEpochId: "epoch-12", activeEpochStartsAtSeq: 12,
+        events: after >= 13 ? [ready] : pageEvents.filter((item) => item.seq > after)}),
+      roomState: async () => ({headSeq: 14, activeEpoch: {id: "epoch-12", startsAtSeq: 12}, activeTopic, roster, rules: []}),
+      roomPolicy: async () => ({policy: {coordinationMode: "coordinated"}}),
+      listArtifacts: async () => ({items: []}),
+      claimDiscussionAttempt: async () => ({attempt: {id: "attempt-14", round: 1},
+        cycle: {id: "cycle-12", generation: 1, totalTurns: 0, budgets: {totalTurns: 4, perAgentTurns: 2}}}),
+      acknowledge: async (_state, seq) => ({acknowledgedSeq: seq}),
+    };
+    runtime.state.cursor = 13;
+    runtime.renewAccess = async () => false;
+    runtime.maintainPresence = async () => {};
+    runtime.markContextAcknowledged = async () => {};
+    runtime.startAttemptLease = () => null;
+    const turns = runtime.assignedTurns(controller.signal);
+    const {value} = await turns.next();
+    controller.abort();
+    await turns.return();
+    return value;
+  }
+
+  const block = `[Discussion started by TJ]\n${TITLE}\n\n${DESCRIPTION}\n[/Discussion started by TJ]`;
+  const value = await turn();
+  assert.equal(value.text.split(block).length - 1, 1, value.text);
+  assert.equal(value.senderName, "TJ");
+  assert.equal(value.senderId, "owner-tj");
+  assert.equal(value.senderKind, "human");
+  assert.doesNotMatch(value.text, /Room participant|Continue the autonomous discussion/);
+  assert.ok(value.text.includes(`Current discussion: ${TITLE}\n${DESCRIPTION}\n`), "context renders the description under Current discussion");
+  // The Room's own words may say anything; nothing connector-authored is added around them.
+  assert.deepEqual(denied(connectorAuthored(value.text, [DESCRIPTION, TITLE])), []);
+
+  // Without a description on /state, the start event's own description is used.
+  const fromStart = await turn({activeTopic: {title: TITLE}});
+  assert.ok(fromStart.text.includes(`Current discussion: ${TITLE}\n${DESCRIPTION}\n`));
+
+  // A title-only start (the observed Showroom case) presents the title alone.
+  const titleOnly = await turn({activeTopic: {title: TITLE}, pageEvents: [{...start, payload: {epoch: {...start.payload.epoch,
+    topic: {...start.payload.epoch.topic, description: ""}}}}, started]});
+  assert.ok(titleOnly.text.includes(`[Discussion started by TJ]\n${TITLE}\n[/Discussion started by TJ]`), titleOnly.text);
+
+  // Another source, or an unresolvable start, gets no substitute text.
+  for (const other of [await turn({ready: readyFor("some-message-id")}), await turn({pageEvents: [started]})]) {
+    assert.doesNotMatch(other.text, /Discussion started by/);
+    assert.doesNotMatch(other.text, /Continue the autonomous discussion/);
+    assert.equal(other.senderName, "system");
+  }
+});
+
 test("conformance P1a case names resolve to tests in this file", async () => {
   const source = await readFile(new URL(import.meta.url), "utf8");
   const cases = Object.entries(conformance.parityP1aCases ?? {});
-  assert.equal(cases.length, 5);
+  assert.equal(cases.length, 6);
   for (const [id, name] of cases) {
     assert.ok(name.startsWith(`${id} `), id);
     assert.ok(source.includes(`test(${JSON.stringify(name)},`), name);

@@ -671,6 +671,7 @@ export class OpenClawRoomRuntime {
         }
         this.pendingEvent = event;
         this.contextPolicyWordLimit = 0;
+        this.contextDiscussionStart = null;
         const sharedContext = await this.sharedRoomContext(event, pageEpoch, signal);
         const normalized = normalizeEvent(
           event,
@@ -680,6 +681,7 @@ export class OpenClawRoomRuntime {
           pageActiveEpochId,
           this.state.legacySessionEpochId,
           this.contextPolicyWordLimit,
+          this.contextDiscussionStart,
         );
         // The model runs while the consumer holds this yield; keep its claimed
         // attempt alive until a terminal outcome is recorded or it returns.
@@ -907,8 +909,12 @@ export class OpenClawRoomRuntime {
       throw new Error("Room active epoch advanced while loading model context");
     }
     this.rememberPostNumbers([...(Array.isArray(page?.events) ? page.events : []), event]);
-    const roomContext = canonicalRoomContext(state, page?.events, event?.id, policy, sourceEpoch.startsAtSeq);
     const handoverContext = await this.epochHandoverContext(event, sourceEpoch, page?.events, signal);
+    const startEvent = await this.epochStartEvent(event, sourceEpoch, page?.events, signal);
+    // Delivery contract P1a-5: a cycle seeded by the discussion start presents
+    // that start, verbatim and attributed, as the current-turn input.
+    this.contextDiscussionStart = discussionStartInput(event, startEvent, state);
+    const roomContext = canonicalRoomContext(state, page?.events, event?.id, policy, sourceEpoch.startsAtSeq, startEvent);
     const library = await this.client.listArtifacts(this.state, signal);
     const artifactContext = await sourceArtifactContext(
       event,
@@ -929,15 +935,24 @@ export class OpenClawRoomRuntime {
     // accumulated host history.
     this.handoverContexts ??= new Map();
     if (this.handoverContexts.has(sourceEpoch.id)) return this.handoverContexts.get(sourceEpoch.id);
+    const startEvent = await this.epochStartEvent(event, sourceEpoch, pageEvents, signal);
+    const rendered = discussionHandoverContext(startEvent);
+    this.handoverContexts.set(sourceEpoch.id, rendered);
+    return rendered;
+  }
+
+  // The epoch's own discussion.started event, read at most once per epoch.
+  async epochStartEvent(event, sourceEpoch, pageEvents, signal) {
+    this.epochStartEvents ??= new Map();
+    if (this.epochStartEvents.has(sourceEpoch.id)) return this.epochStartEvents.get(sourceEpoch.id);
     const isStart = (item) => item?.type === "discussion.started" && Number(item?.seq) === Number(sourceEpoch.startsAtSeq);
     let startEvent = isStart(event) ? event : (Array.isArray(pageEvents) ? pageEvents.find(isStart) : undefined);
     if (!startEvent && Number(sourceEpoch.startsAtSeq) >= 1) {
       const startPage = await this.client.readEvents(this.state, Number(sourceEpoch.startsAtSeq) - 1, {wait: 0, signal});
       startEvent = (startPage?.events ?? []).find(isStart);
     }
-    const rendered = discussionHandoverContext(startEvent);
-    this.handoverContexts.set(sourceEpoch.id, rendered);
-    return rendered;
+    this.epochStartEvents.set(sourceEpoch.id, startEvent ?? null);
+    return startEvent ?? null;
   }
 
   async prepareCycleAttempt(event, signal) {
@@ -2317,6 +2332,7 @@ export function normalizeEvent(
   pageActiveEpochId = "",
   legacySessionEpochId = "",
   policyWordLimit = 0,
+  discussionStart = null,
 ) {
   const payload = eventPayload(event.payload);
   const actorRole = String(event.actorRole ?? "");
@@ -2334,10 +2350,11 @@ export function normalizeEvent(
     conversationId: epochId === exactOptionalEpochId(legacySessionEpochId, "Room legacy session epoch")
       ? roomId
       : epochConversationId(roomId, epochId),
-    senderId: event.actorId,
-    senderName: payload.actorDisplayName || payload.displayName || event.actorRole || "Room participant",
-    senderKind: actorRole === "human" || actorRole.startsWith("human_") ? "human" : "agent",
-    text: cyclePrompt(event, payload, cycleAttempt, sharedContext, policyWordLimit),
+    senderId: discussionStart ? discussionStart.authorId : event.actorId,
+    senderName: discussionStart ? discussionStart.authorName
+      : payload.actorDisplayName || payload.displayName || event.actorRole || "Room participant",
+    senderKind: discussionStart || actorRole === "human" || actorRole.startsWith("human_") ? "human" : "agent",
+    text: cyclePrompt(event, payload, cycleAttempt, sharedContext, policyWordLimit, discussionStart),
     occurredAt: Date.parse(event.ts) || Date.now(),
     raw: event,
     cycleAttempt,
@@ -2384,7 +2401,31 @@ export function roomTurnFacts({phase = "", cycleAttempt = null, policyWordLimit 
   return ["[Room turn facts]", ...lines, "[/Room turn facts]"].join("\n");
 }
 
-function cyclePrompt(event, payload, cycleAttempt, sharedContext = "", policyWordLimit = 0) {
+// Delivery contract P1a-5: the start of a discussion, as the starting human
+// wrote it. Only when the cycle attempt's source is that exact start event.
+export function discussionStartInput(event, startEvent, state = {}) {
+  if (event?.type !== "discussion.cycle_attempt_ready" || startEvent?.type !== "discussion.started") return null;
+  if (String(eventPayload(event.payload).sourceEventId ?? "") !== String(startEvent.id ?? "") || !startEvent.id) return null;
+  const payload = eventPayload(startEvent.payload);
+  const topic = payload.epoch?.topic ?? payload.topic ?? {};
+  const roster = Array.isArray(state?.roster) ? state.roster : [];
+  const member = roster.find((entry) => String(entry?.membershipId ?? "") !== "" && String(entry.membershipId) === String(startEvent.actorId ?? ""));
+  const named = String(member?.displayName ?? payload.actorDisplayName ?? payload.displayName ?? "").trim();
+  const role = String(startEvent.actorRole ?? "");
+  return {
+    title: String(topic.title ?? "").trim(),
+    description: String(topic.description ?? "").trim(),
+    authorId: String(startEvent.actorId ?? ""),
+    authorName: named || (role === "agent_owner" ? "Agent owner" : "Room owner"),
+  };
+}
+
+function discussionStartBlock(start) {
+  const body = [start.title, start.description].filter(Boolean).join("\n\n");
+  return body ? `[Discussion started by ${start.authorName}]\n${body}\n[/Discussion started by ${start.authorName}]` : "";
+}
+
+function cyclePrompt(event, payload, cycleAttempt, sharedContext = "", policyWordLimit = 0, discussionStart = null) {
   const context = String(sharedContext ?? "").trim();
   const preface = context ? [context, ROOM_HISTORY_INSTRUCTION] : [];
   if (event.type === "discussion.cycle_attempt_ready") {
@@ -2392,6 +2433,7 @@ function cyclePrompt(event, payload, cycleAttempt, sharedContext = "", policyWor
     return [
       ...preface,
       roomTurnFacts({phase, cycleAttempt, policyWordLimit}),
+      ...(discussionStart ? [discussionStartBlock(discussionStart)] : []),
       roomSupplied("Room phase instruction — server-provided", payload.phaseInstruction),
     ].filter(Boolean).join("\n\n");
   }
@@ -2579,11 +2621,13 @@ function singleLine(value) {
   return String(value ?? "").split(/\s+/u).filter(Boolean).join(" ").slice(0, 500);
 }
 
-export function canonicalRoomContext(state, events, currentEventId = "", policy = {}, startsAtSeq = 0) {
+export function canonicalRoomContext(state, events, currentEventId = "", policy = {}, startsAtSeq = 0, startEvent = null) {
   const policyView = policy?.policy && typeof policy.policy === "object" ? policy.policy : policy;
   const title = String(state?.title ?? "").trim();
   const purpose = String(state?.purpose ?? "").trim();
-  const topic = String(state?.activeTopic?.title ?? "").trim();
+  const startTopic = eventPayload(startEvent?.payload).epoch?.topic ?? {};
+  const topic = String(state?.activeTopic?.title ?? startTopic.title ?? "").trim();
+  const topicDescription = String(state?.activeTopic?.description ?? startTopic.description ?? "").trim();
   const savedGuidance = (Array.isArray(state?.rules) ? state.rules : [])
     .filter((rule) => String(rule?.enforcement ?? "") === "guidance")
     .map((rule) => String(rule?.text ?? "").trim())
@@ -2621,6 +2665,7 @@ export function canonicalRoomContext(state, events, currentEventId = "", policy 
     ...(title ? [`Room: ${title}`] : []),
     ...(purpose ? [`Purpose: ${purpose}`] : []),
     ...(topic ? [`Current discussion: ${topic}`] : []),
+    ...(topic && topicDescription ? [topicDescription] : []),
     ...((openExchangePreamble || guidance || policyGuidance.length) ? [
       "[Active Room guidance — owner-controlled behavioral guidance]",
       ...(openExchangePreamble ? [

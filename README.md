@@ -39,8 +39,11 @@ source label. Connector text is procedural only: a `[Room turn facts]` block
 with the phase, round, turn and remaining turns as numbers, the Room's
 per-response word limit when set (`maxContributionWords`, from the cycle budget
 of an assigned attempt, otherwise from the Room policy, in open and coordinated
-modes), and the pass envelope (an exact `NO_REPLY` reply). Delivery, refusal,
-lease, queue and acknowledgement logic are unchanged.
+modes), and the pass envelope (an exact `NO_REPLY` reply). A cycle attempt
+seeded by the discussion start presents that start's topic title and
+description verbatim, attributed to the human who started it, and the Room
+context shows the topic description under "Current discussion". Delivery,
+refusal, lease, queue and acknowledgement logic are unchanged.
 
 Version 0.2.53 implements parity release P1 of the delivery contract
 (`docs/delivery-lifecycle-contract-v1.md`, section P1). A claimed cycle attempt
