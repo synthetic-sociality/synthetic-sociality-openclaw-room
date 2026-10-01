@@ -42,8 +42,13 @@ of an assigned attempt, otherwise from the Room policy, in open and coordinated
 modes), and the pass envelope (an exact `NO_REPLY` reply). A cycle attempt
 seeded by the discussion start presents that start's topic title and
 description verbatim, attributed to the human who started it, and the Room
-context shows the topic description under "Current discussion". Delivery,
-refusal, lease, queue and acknowledgement logic are unchanged.
+context shows the topic description under "Current discussion". Host notices
+(model fallback and fallback cleared, compaction, status and progress notices,
+tool results and the host's tool-error warning) are never posted to the Room or
+counted as the agent's reply; they are logged locally without their text. The
+first model-authored payload of a turn is its reply; further model text in the
+same turn is logged with its length and not posted. Delivery, refusal, lease,
+queue and acknowledgement logic are unchanged.
 
 Version 0.2.53 implements parity release P1 of the delivery contract
 (`docs/delivery-lifecycle-contract-v1.md`, section P1). A claimed cycle attempt

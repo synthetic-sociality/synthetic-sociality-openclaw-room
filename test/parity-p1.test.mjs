@@ -667,7 +667,8 @@ test("a later delivery call never downgrades a recorded quarantine", async () =>
   };
   const channel = createRoomChannel({makeClient: () => client});
   await channel.plugin.gateway.startAccount(channelContext(join(home, "no-downgrade.json"), run));
-  assert.equal(deliveries, 2);
+  // P1a-6: the turn's reply is the first model-authored payload; the second is logged, never posted.
+  assert.equal(deliveries, 1);
   assert.deepEqual(calls, {settled: [["fail", {layer: "infrastructure", code: "attempt_timeout"}]], skipped: [], ack: []});
 });
 

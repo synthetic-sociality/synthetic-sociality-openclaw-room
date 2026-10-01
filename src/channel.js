@@ -31,6 +31,38 @@ export function isOpenClawOperationalFallback(payload) {
   return payload?.isError === true && OPENCLAW_OPERATIONAL_FALLBACKS.has(payload.text);
 }
 
+// The host's own reply-payload helpers (plugin-sdk/reply-payload). Absent only
+// when the exact host peer is not installed, as in unit tests.
+let hostReplyPayload = {};
+try {
+  hostReplyPayload = await import("openclaw/plugin-sdk/reply-payload");
+} catch {
+  hostReplyPayload = {};
+}
+
+// Delivery contract P1a-6: payloads the host generates itself are never a Room
+// contribution. Markers as defined by OpenClaw 2026.7.1-2 (dist):
+// - isFallbackNotice: model fallback and fallback-cleared notices
+//   (agent-runner.runtime-DtdxZiBX.js:7643-7646, 7662-7669);
+// - isCompactionNotice: compaction notices (agent-runner.runtime-DtdxZiBX.js:713-734);
+// - isStatusNotice: plan and command status notices (dispatch-DnzGTpPs.js:1851-1854,
+//   commands-handlers.runtime-CunY89Nu.js:1425-1428, 1513-1516);
+//   the host groups these three as isReplyPayloadStatusNotice (reply-payload-BK_jICQ3.js:108-110);
+// - channelData.openclawProgressKind "fast-mode-auto": progress notices
+//   (reply-payload-BK_jICQ3.js:21-24; agent-runner.runtime-DtdxZiBX.js:541);
+// - nonTerminalToolErrorWarning metadata: the host's tool-error warning beside a
+//   reply (payloads-1r4oLFNi.js:467-482), read through the SDK helper;
+// - delivery kind "tool": tool-result and plan-status deliveries (dispatch-DnzGTpPs.js:1843-1860).
+export function hostNoticeKind(payload, info) {
+  if (payload?.isFallbackNotice === true) return "fallback_notice";
+  if (payload?.isCompactionNotice === true) return "compaction_notice";
+  if (payload?.isStatusNotice === true) return "status_notice";
+  if (payload?.channelData?.openclawProgressKind === "fast-mode-auto") return "progress_notice";
+  if (hostReplyPayload.isReplyPayloadNonTerminalToolErrorWarning?.(payload) === true) return "tool_error_warning";
+  if (info?.kind === "tool") return "tool_result";
+  return "";
+}
+
 const receipt = (eventId, sentAt) => ({
   primaryPlatformMessageId: eventId,
   platformMessageIds: [eventId],
@@ -123,6 +155,9 @@ export function createRoomChannel({makeClient}) {
             // posted, skipped, superseded, quarantined, delivery_pending, or
             // failed. A refused reply is never a model that chose silence.
             let deliveryOutcome = "";
+            // The turn's reply is the first model-authored payload (P1a-6).
+            let replyText = null;
+            let replySent = null;
             // A handler that throws never reached a deliberate decision either.
             let handlerCompleted = false;
             ctx.setStatus({...ctx.getStatus(), running: true, connected: true, lastInboundAt: Date.now(), lastError: null});
@@ -192,7 +227,12 @@ export function createRoomChannel({makeClient}) {
                     replyOptions: replyPolicy.replyOptions,
                     delivery: {
                       durable: {to: event.roomId, replyToId: event.respondsToId},
-                      deliver: async (payload) => {
+                      deliver: async (payload, info) => {
+                        const notice = hostNoticeKind(payload, info);
+                        if (notice) {
+                          ctx.log?.info?.(`[${ctx.accountId}] Room host notice not posted kind=${notice} delivery=${info?.kind ?? "-"} source=${event.sourceEventId}`);
+                          return {visibleReplySent: false};
+                        }
                         if (isOpenClawOperationalFallback(payload)) {
                           operationalFallbackSuppressed = true;
                           ctx.log?.error?.(`[${ctx.accountId}] Suppressed OpenClaw operational fallback for Room source ${event.sourceEventId}`);
@@ -200,6 +240,15 @@ export function createRoomChannel({makeClient}) {
                         }
                         const text = payload.text?.trim();
                         if (!text) return {visibleReplySent: false};
+                        if (replyText !== null) {
+                          if (text === replyText && replySent) {
+                            return {messageIds: [replySent.eventId], receipt: receipt(replySent.eventId, replySent.sentAt), visibleReplySent: true};
+                          }
+                          // One Room contribution per turn: further model text is recorded here, never posted silently.
+                          ctx.log?.warn?.(`[${ctx.accountId}] Room reply payload not posted: the turn's reply is already ${deliveryOutcome || "in flight"} delivery=${info?.kind ?? "-"} chars=${text.length} source=${event.sourceEventId}`);
+                          return {visibleReplySent: false};
+                        }
+                        replyText = text;
                         let sent;
                         try {
                           sent = await client.postAndFinish({
@@ -230,6 +279,7 @@ export function createRoomChannel({makeClient}) {
                           return {visibleReplySent: false};
                         }
                         deliveryOutcome = "posted";
+                        replySent = sent;
                         cycleSettled = Boolean(event.cycleAttempt);
                         visibleReplySent = true;
                         return {messageIds: [sent.eventId], receipt: receipt(sent.eventId, sent.sentAt), visibleReplySent: true};

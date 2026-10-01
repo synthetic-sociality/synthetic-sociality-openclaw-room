@@ -5,6 +5,7 @@ import assert from "node:assert/strict";
 import {createHash} from "node:crypto";
 import test from "node:test";
 import {readFile} from "node:fs/promises";
+import {registerHooks} from "node:module";
 import {
   OPEN_EXCHANGE_PREAMBLE_SHA256, OPEN_EXCHANGE_PREAMBLE_VERSION, OpenClawRoomRuntime, REPLY_MARKER_GUIDANCE,
   ROOM_HISTORY_INSTRUCTION, ROOM_PASS_ENVELOPE, canonicalRoomContext, discussionHandoverContext, libraryCatalogContext,
@@ -12,6 +13,22 @@ import {
 } from "../src/runtime.js";
 import {registerRoomCommands} from "../src/commands.js";
 import {registerRoomHistoryTool} from "../src/history.js";
+
+// Host SDK stand-ins; the tool-error warning marker is host-private metadata,
+// so the stand-in reads a test-only field in its place.
+const sdkMocks = {
+  "openclaw/plugin-sdk/channel-core": "export const defineChannelPluginEntry = (entry) => entry;",
+  "openclaw/plugin-sdk/channel-message": "export const defineChannelMessageAdapter = (adapter) => adapter;",
+  "openclaw/plugin-sdk/channel-inbound": "export const buildChannelInboundEventContext = (context) => context;",
+  "openclaw/plugin-sdk/reply-payload": "export const isReplyPayloadNonTerminalToolErrorWarning = (payload) => payload?.testToolErrorWarning === true;",
+};
+registerHooks({
+  resolve(specifier, context, nextResolve) {
+    if (sdkMocks[specifier]) return {url: `data:text/javascript,${encodeURIComponent(sdkMocks[specifier])}`, shortCircuit: true};
+    return nextResolve(specifier, context);
+  },
+});
+const {createRoomChannel} = await import("../src/channel.js");
 
 const conformance = JSON.parse(await readFile(new URL("../conformance.json", import.meta.url), "utf8"));
 // Room-supplied text: the Open Exchange preamble as an owner would save it.
@@ -285,10 +302,88 @@ test("P1a-06 discussion start title and description presented verbatim and attri
   }
 });
 
+test("P1a-07 host fallback notice is never posted; the model reply is", async () => {
+  // The canary sequence (addendum 2): the host's fallback notice, then the model's answer.
+  const NOTICE = "↪️ Model Fallback: openrouter/deepseek/deepseek-v4-flash (selected xai/grok-4.7; format)";
+  const REPLY = "↪ #976 TJE — the unresolved thread that sticks with me is the model's own answer.";
+  async function runTurn(deliveries, {cycleAttempt = null} = {}) {
+    const calls = {posted: [], settled: [], skipped: [], ack: [], logs: [], results: []};
+    const event = {id: "src-1", sourceEventId: "src-1", respondsToId: "src-1", roomId: "room-1", epochId: "epoch-1", conversationId: "c",
+      senderId: "h", senderName: "TJ", senderKind: "human", text: "t", occurredAt: 1, raw: {}, ...(cycleAttempt ? {cycleAttempt} : {})};
+    const client = {
+      initialize: async () => ({sessionId: "s"}),
+      assignedTurns: async function* () { yield event; },
+      markTurnReading: async () => {},
+      postAndFinish: async ({text}) => { calls.posted.push(text); return {eventId: `posted-${calls.posted.length}`, sentAt: 1}; },
+      settleDiscussionAttempt: async (_attempt, action) => calls.settled.push(action),
+      recordSkipped: async (eventId, reason) => calls.skipped.push([eventId, reason]),
+      ack: async (eventId) => calls.ack.push(eventId),
+      close: async () => {},
+    };
+    const channel = createRoomChannel({makeClient: () => client});
+    let status = {};
+    await channel.plugin.gateway.startAccount({
+      account: {accountId: "default", stateFile: `/tmp/p1a-07-${Math.random()}.json`}, accountId: "default",
+      abortSignal: new AbortController().signal, cfg: {},
+      channelRuntime: {
+        inbound: {run: async ({raw, adapter}) => {
+          const turn = adapter.resolveTurn(adapter.ingest(raw));
+          for (const [payload, kind] of deliveries) calls.results.push(await turn.delivery.deliver(payload, {kind}));
+        }},
+        routing: {resolveAgentRoute: () => ({agentId: "main", accountId: "default", sessionKey: "k", mainSessionKey: "m"})},
+        session: {resolveStorePath: () => "/tmp/session-store", recordInboundSession: async () => {}},
+        reply: {dispatchReplyWithBufferedBlockDispatcher: async () => {}},
+      },
+      getStatus: () => status, setStatus: (next) => { status = next; },
+      log: Object.fromEntries(["info", "warn", "error"].map((level) => [level, (line) => calls.logs.push(line)])),
+    });
+    return calls;
+  }
+
+  // The incident: notice first, then the model's answer. Only the answer is posted.
+  const incident = await runTurn([[{text: NOTICE, isFallbackNotice: true}, "final"], [{text: REPLY}, "final"]],
+    {cycleAttempt: {cycle: {id: "c", generation: 1}, attempt: {id: "a"}}});
+  assert.deepEqual(incident.posted, [REPLY]);
+  assert.equal(incident.results[0].visibleReplySent, false);
+  assert.equal(incident.results[1].visibleReplySent, true);
+  assert.deepEqual(incident.settled, [], "the contribution's lifecycle settles it, not a pass");
+  assert.deepEqual(incident.skipped, []);
+  assert.deepEqual(incident.ack, ["src-1"]);
+  assert.ok(incident.logs.some((line) => line.includes("Room host notice not posted kind=fallback_notice")));
+  assert.ok(incident.logs.every((line) => !line.includes(NOTICE) && !line.includes(REPLY)), "logs carry no text");
+
+  // Every host-marked notice is skipped, in any order around the reply.
+  const notices = [
+    [{text: "↪️ Model Fallback cleared", isFallbackNotice: true}, "final"],
+    [{text: "🧹 Compacting context", isCompactionNotice: true}, "final"],
+    [{text: "⚙️ Compaction unavailable (missing session id).", isStatusNotice: true}, "final"],
+    [{text: "⚡ fast mode", channelData: {openclawProgressKind: "fast-mode-auto"}}, "block"],
+    [{text: "🔧 exec ls", isError: false}, "tool"],
+  ];
+  const all = await runTurn([...notices, [{text: REPLY}, "final"], [{text: "⚠️ Tool exec failed", isError: true, testToolErrorWarning: true}, "final"]]);
+  assert.deepEqual(all.posted, [REPLY]);
+  for (const kind of ["fallback_notice", "compaction_notice", "status_notice", "progress_notice", "tool_result", "tool_error_warning"]) {
+    assert.ok(all.logs.some((line) => line.includes(`kind=${kind}`)), kind);
+  }
+
+  // Notices alone are not a reply: the turn records that the model posted nothing.
+  const noticeOnly = await runTurn([[{text: NOTICE, isFallbackNotice: true}, "final"]]);
+  assert.deepEqual(noticeOnly.posted, []);
+  assert.deepEqual(noticeOnly.skipped, [["src-1", "model_no_visible_reply"]]);
+
+  // Several model-authored payloads: the first is the turn's reply; an identical
+  // repeat reuses its receipt; different later text is logged, never posted.
+  const several = await runTurn([[{text: REPLY}, "block"], [{text: REPLY}, "final"], [{text: "A second, different answer."}, "final"]]);
+  assert.deepEqual(several.posted, [REPLY]);
+  assert.equal(several.results[1].visibleReplySent, true);
+  assert.equal(several.results[2].visibleReplySent, false);
+  assert.ok(several.logs.some((line) => /Room reply payload not posted: the turn's reply is already posted delivery=final chars=27 source=src-1/.test(line)), several.logs.join("\n"));
+});
+
 test("conformance P1a case names resolve to tests in this file", async () => {
   const source = await readFile(new URL(import.meta.url), "utf8");
   const cases = Object.entries(conformance.parityP1aCases ?? {});
-  assert.equal(cases.length, 6);
+  assert.equal(cases.length, 7);
   for (const [id, name] of cases) {
     assert.ok(name.startsWith(`${id} `), id);
     assert.ok(source.includes(`test(${JSON.stringify(name)},`), name);
