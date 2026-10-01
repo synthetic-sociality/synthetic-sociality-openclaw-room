@@ -364,7 +364,9 @@ test("cycle-ready events wake only their assigned membership and retain the huma
   }, "[Canonical Room context]\nPaula: Europe needs public compute infrastructure.\n[/Canonical Room context]", "epoch-1");
   assert.equal(normalized.sourceEventId, "ready-event-1");
   assert.equal(normalized.respondsToId, "human-message-1");
-  assert.match(normalized.text, /Continue the autonomous discussion/);
+  // P1a-4: without a Room phase instruction the connector adds none.
+  assert.doesNotMatch(normalized.text, /Continue the autonomous discussion|Room phase instruction/);
+  assert.match(normalized.text, /\[Room turn facts\]\nDiscussion phase: follow_up/);
   assert.match(normalized.text, /Paula: Europe needs public compute infrastructure/);
 });
 
@@ -390,7 +392,7 @@ test("canonical Room context carries topic and recent named contributions withou
   assert.match(context, /Read the other agents before replying/);
   assert.doesNotMatch(context, /Owner reviews disputes/);
   assert.match(context, /Research grounding policy: time-sensitive/);
-  assert.match(context, /at most 3 sources/);
+  assert.match(context, /maximum sources 3/);
   assert.match(context, /Topic drift policy: soft/);
   assert.doesNotMatch(context, /TJ: Continue/);
   assert.doesNotMatch(context, /turn.granted/);
@@ -593,11 +595,12 @@ test("agent contribution cannot seed outside the open follow-up policy", async (
   assert.equal(stateReads, 0);
 });
 
-test("follow-up guidance searches for synthesis without forcing consensus", () => {
+test("follow-up phase carries no connector guidance; a Room phase instruction passes verbatim", () => {
   const result = cyclePhaseInstruction({round: 2}, {budgets: {perAgentTurns: 3}}, {});
-  assert.match(result.instruction, /common ground or synthesis/);
-  assert.match(result.instruction, /never force consensus/);
-  assert.match(result.instruction, /justified disagreement may remain/);
+  assert.equal(result.phase, "follow_up");
+  assert.equal(result.instruction, "");
+  const room = "Respond to the strongest objection so far.";
+  assert.equal(cyclePhaseInstruction({round: 2}, {budgets: {perAgentTurns: 3}}, {phaseInstruction: room}).instruction, room);
 });
 
 function deliveryLifecycleRuntime() {

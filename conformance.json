@@ -23,7 +23,8 @@
     "documentContext": "membership_authorized_exact_version_and_room_library_derived_text",
     "attemptAuthority": "lease_renewed_by_reclaim_while_model_runs_and_reclaimed_before_post",
     "postRefusalClassification": "skipped_superseded_refresh_retryable_or_quarantined",
-    "attemptFailureReporting": "typed_execution_failure_on_every_fail"
+    "attemptFailureReporting": "typed_execution_failure_on_every_fail",
+    "promptAuthority": "room_supplied_guidance_verbatim_with_source_label_connector_text_procedural_only"
   },
   "fixtures": {
     "DLV1-01": "selection persistence failure prevents message submission",
@@ -116,6 +117,13 @@
     "P1-08": "P1-08 send-path quarantine releases the attempt, stops renewal, dispatches next",
     "P1-09": "P1-09 refusal outcomes are logged without body or secrets",
     "P1-10": "P1-10 D4a replay: Zurie events 949–957 produce superseded and a typed settle"
+  },
+  "parityP1aCases": {
+    "P1a-01": "P1a-01 no connector-authored behavioural wording in any prompt",
+    "P1a-02": "P1a-02 Room phaseInstruction and policy guidance passed verbatim with source label",
+    "P1a-03": "P1a-03 without Room instructions only procedural facts are present",
+    "P1a-04": "P1a-04 pass envelope documented technically without usage advice",
+    "P1a-05": "P1a-05 policy word limit stated as a number on every turn when set, in open and coordinated modes"
   },
   "presentationAcknowledgementFixtures": {
     "before_coordination_and_model": "receive-boundary acknowledgement precedes coordination and model dispatch",
