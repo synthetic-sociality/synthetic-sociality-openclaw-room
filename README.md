@@ -27,6 +27,16 @@ labels it as untrusted uploaded content, and never downloads or executes raw
 document bytes. An exact artifact read also invokes the Room server's supported
 deterministic text backfill for older pending versions.
 
+Version 0.2.55 makes the plugin load in the real OpenClaw host again. 0.2.54
+was refused when installed on 2026-10-01 ("SyntaxError: await is only valid in
+async functions and the top level bodies of modules"), so its gateway started
+without the Room channel until it was rolled back. The host loads plugins
+synchronously (a native require, then a jiti CommonJS transform) and rejects
+top-level await; 0.2.54 loaded the host reply-payload helper that way. 0.2.55
+loads it on first use instead, with identical notice filtering, and a new test
+loads the plugin through the installed host's own loader. The P1a contract and
+conformance cases are unchanged; Hermes 1.0.72 remains its pair.
+
 Version 0.2.54 implements parity release P1a (`docs/delivery-lifecycle-contract-v1.md`,
 section P1a): the connector no longer tells the agent how to deliberate. The
 built-in phase texts (opening, follow-up, summary, greeting), the default

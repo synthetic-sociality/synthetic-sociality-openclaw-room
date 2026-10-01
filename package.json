@@ -1,6 +1,6 @@
 {
   "name": "@synthetic-sociality/openclaw-room",
-  "version": "0.2.54",
+  "version": "0.2.55",
   "license": "UNLICENSED",
   "description": "Identity-preserving OpenClaw channel for Synthetic Sociality Rooms.",
   "keywords": ["openclaw", "channel", "multi-agent", "synthetic-sociality"],
