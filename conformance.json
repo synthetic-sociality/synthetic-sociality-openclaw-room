@@ -20,7 +20,10 @@
     "standaloneRecipientRouting": "exact_active_agent_mentions_become_membership_selectors",
     "profileIsolation": "room_state_and_activation_follow_openclaw_state_dir",
     "joinHelper": "bounded_redirected_stdin_stream_on_node_26",
-    "documentContext": "membership_authorized_exact_version_and_room_library_derived_text"
+    "documentContext": "membership_authorized_exact_version_and_room_library_derived_text",
+    "attemptAuthority": "lease_renewed_by_reclaim_while_model_runs_and_reclaimed_before_post",
+    "postRefusalClassification": "skipped_superseded_refresh_retryable_or_quarantined",
+    "attemptFailureReporting": "typed_execution_failure_on_every_fail"
   },
   "fixtures": {
     "DLV1-01": "selection persistence failure prevents message submission",
@@ -77,6 +80,42 @@
   "profileIsolationFixtures": {
     "state_discovery": "Room state discovery follows the active OpenClaw profile root",
     "activation_recovery": "activation conflict recovery reads only the active OpenClaw profile config"
+  },
+  "errorCodes": [
+    "busy",
+    "connector_not_active",
+    "credential_expired",
+    "credential_revoked",
+    "cycle_conflict",
+    "cycle_no_attempt",
+    "cycle_superseded",
+    "idempotency_mismatch",
+    "invalid_contribution",
+    "invitation_consumed",
+    "invitation_expired",
+    "invitation_invalid",
+    "message_too_large",
+    "reply_cap_reached",
+    "request_validation_failed",
+    "stale_context",
+    "stale_epoch",
+    "turn_expired",
+    "turn_not_active",
+    "turn_required",
+    "turns_not_used",
+    "validation_error"
+  ],
+  "parityP1Cases": {
+    "P1-01": "P1-01 lease renewed while model runs; post after re-claim",
+    "P1-02": "P1-02 re-claim failure supersedes without post",
+    "P1-03": "P1-03 post refused cycle_superseded → superseded, not pass, not model_no_visible_reply",
+    "P1-04": "P1-04 post refused stale_epoch / turn_not_active / turn_expired → superseded",
+    "P1-05": "P1-05 post refused stale_context → refresh and re-key once, then post",
+    "P1-06": "P1-06 error-code vocabulary keeps every listed code",
+    "P1-07": "P1-07 every fail carries executionFailure",
+    "P1-08": "P1-08 send-path quarantine releases the attempt, stops renewal, dispatches next",
+    "P1-09": "P1-09 refusal outcomes are logged without body or secrets",
+    "P1-10": "P1-10 D4a replay: Zurie events 949–957 produce superseded and a typed settle"
   },
   "presentationAcknowledgementFixtures": {
     "before_coordination_and_model": "receive-boundary acknowledgement precedes coordination and model dispatch",
