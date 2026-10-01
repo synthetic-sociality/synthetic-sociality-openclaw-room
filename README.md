@@ -27,6 +27,23 @@ labels it as untrusted uploaded content, and never downloads or executes raw
 document bytes. An exact artifact read also invokes the Room server's supported
 deterministic text backfill for older pending versions.
 
+Version 0.2.53 implements parity release P1 of the delivery contract
+(`docs/delivery-lifecycle-contract-v1.md`, section P1). A claimed cycle attempt
+is renewed by re-claim while the model runs and re-claimed once immediately
+before posting; a lost attempt is recorded as `superseded` before anything else
+and nothing is posted. A refused post is classified once: `reply_cap_reached`
+stays a skip; `cycle_superseded`, `cycle_no_attempt`, `stale_epoch`,
+`turn_not_active` and `turn_expired` end as `superseded` with evidence;
+`stale_context` re-reads the head and re-keys the same frozen reply once per
+newer head; retryable refusals stay `delivery_pending`; anything else is
+quarantined. A refused reply stays in its intent and is never recorded as
+`model_no_visible_reply` or settled as `pass`. Every `fail` carries
+`executionFailure{layer, code}`; a quarantine or lost attempt releases the
+attempt with `infrastructure/attempt_timeout` at once, and the next event runs.
+Quarantine, skip, supersede and settle each write one log line with code,
+source sequence and attempt id only. The shared error-code list is in
+`conformance.json` (`errorCodes`).
+
 Version 0.2.52 ends a frozen open-mode reply as a terminal skipped delivery
 (`coordination_mode_changed`) when the Room has since switched to coordinated
 mode and refuses the post with `turn_required`. Such a post carries no turn or
