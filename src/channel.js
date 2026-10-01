@@ -31,13 +31,14 @@ export function isOpenClawOperationalFallback(payload) {
   return payload?.isError === true && OPENCLAW_OPERATIONAL_FALLBACKS.has(payload.text);
 }
 
-// The host's own reply-payload helpers (plugin-sdk/reply-payload). Absent only
-// when the exact host peer is not installed, as in unit tests.
-let hostReplyPayload = {};
-try {
-  hostReplyPayload = await import("openclaw/plugin-sdk/reply-payload");
-} catch {
-  hostReplyPayload = {};
+// The host's own reply-payload helpers (plugin-sdk/reply-payload), loaded once
+// on first use. Absent only when the exact host peer is not installed, as in
+// unit tests. Never a top-level await: the host loads plugins synchronously
+// (native require, then a jiti CommonJS transform), and both reject it (0.2.55).
+let hostReplyPayloadTask = null;
+function hostReplyPayload() {
+  hostReplyPayloadTask ??= import("openclaw/plugin-sdk/reply-payload").catch(() => ({}));
+  return hostReplyPayloadTask;
 }
 
 // Delivery contract P1a-6: payloads the host generates itself are never a Room
@@ -53,12 +54,12 @@ try {
 // - nonTerminalToolErrorWarning metadata: the host's tool-error warning beside a
 //   reply (payloads-1r4oLFNi.js:467-482), read through the SDK helper;
 // - delivery kind "tool": tool-result and plan-status deliveries (dispatch-DnzGTpPs.js:1843-1860).
-export function hostNoticeKind(payload, info) {
+export async function hostNoticeKind(payload, info) {
   if (payload?.isFallbackNotice === true) return "fallback_notice";
   if (payload?.isCompactionNotice === true) return "compaction_notice";
   if (payload?.isStatusNotice === true) return "status_notice";
   if (payload?.channelData?.openclawProgressKind === "fast-mode-auto") return "progress_notice";
-  if (hostReplyPayload.isReplyPayloadNonTerminalToolErrorWarning?.(payload) === true) return "tool_error_warning";
+  if ((await hostReplyPayload()).isReplyPayloadNonTerminalToolErrorWarning?.(payload) === true) return "tool_error_warning";
   if (info?.kind === "tool") return "tool_result";
   return "";
 }
@@ -228,7 +229,7 @@ export function createRoomChannel({makeClient}) {
                     delivery: {
                       durable: {to: event.roomId, replyToId: event.respondsToId},
                       deliver: async (payload, info) => {
-                        const notice = hostNoticeKind(payload, info);
+                        const notice = await hostNoticeKind(payload, info);
                         if (notice) {
                           ctx.log?.info?.(`[${ctx.accountId}] Room host notice not posted kind=${notice} delivery=${info?.kind ?? "-"} source=${event.sourceEventId}`);
                           return {visibleReplySent: false};
