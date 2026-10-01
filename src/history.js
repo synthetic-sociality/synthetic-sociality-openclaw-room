@@ -8,7 +8,7 @@ import {readdirSync} from "node:fs";
 import {join} from "node:path";
 import {defaultStateDirectory, loadState} from "./state.js";
 import {RoomClient} from "./room-client.js";
-import {speakerRoleLabel} from "./speaker.js";
+import {speakerLabel} from "./speaker.js";
 
 export const HISTORY_PAGE_DEFAULT = 20;
 export const HISTORY_PAGE_MAX = 50;
@@ -47,13 +47,7 @@ function eventPayload(value) {
 }
 
 function actorName(state, event) {
-  const payload = eventPayload(event.payload);
-  const projected = String(payload.actorDisplayName ?? payload.displayName ?? "").trim();
-  if (projected) return projected;
-  const actorId = String(event.actorId ?? "");
-  const member = (state?.roster ?? []).find((item) => String(item?.membershipId ?? "") === actorId);
-  if (member?.displayName) return String(member.displayName);
-  return speakerRoleLabel(event);
+  return speakerLabel(state?.roster, event);
 }
 
 // Incrementally scan the append-only event chain for epoch starts and owner

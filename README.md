@@ -43,9 +43,10 @@ has none; otherwise the Room policy, in open and coordinated modes), and the pas
 seeded by the discussion start presents that start's topic title and
 description verbatim, attributed to the human who started it, and the Room
 context shows the topic description under "Current discussion". Speakers are
-named from the roster or their own display name, otherwise truthfully by role
-("Room (system)", "Human participant", "Room agent"), never "Room participant"
-or a role id. Host notices
+labelled by one scheme (contract P1a-7) in the transcript, the current input,
+the host session speaker and the history tool: the roster display name, else
+the payload's display name, else "Room (system)", "Human participant",
+"Room agent" or, for any other or missing role, "Unknown actor". Host notices
 (model fallback and fallback cleared, compaction, status and progress notices,
 tool results and the host's tool-error warning) are never posted to the Room or
 counted as the agent's reply; they are logged locally without their text. The

@@ -5,7 +5,7 @@ import {loadState, saveNewState, saveState} from "./state.js";
 import {activateRoomChannel} from "./activation.js";
 import {ROOM_CONNECTOR_PROVENANCE} from "./release-provenance.js";
 import {renewCredential} from "./credential-renewal.js";
-import {speakerName, speakerRoleLabel} from "./speaker.js";
+import {speakerLabel, speakerName} from "./speaker.js";
 
 export const OPEN_EXCHANGE_PREAMBLE_VERSION = "Open Exchange – Room Behaviour Preamble v1";
 // Delivery contract P1a: the connector holds no behavioural text. A Room may
@@ -74,12 +74,8 @@ export function parseReplyMarker(body) {
 // Never hand the model a role identifier as a name: it repeats it. Agents in
 // OpenClaw Rooms wrote "participant_agent 5" because every transcript line was
 // labelled with the actor's role whenever the payload carried no display name.
-function transcriptActorName(state, item, payload) {
-  const roster = Array.isArray(state?.roster) ? state.roster : [];
-  const member = roster.find((entry) => String(entry?.membershipId ?? "") !== "" && String(entry.membershipId) === String(item?.actorId ?? ""));
-  const named = String(member?.displayName ?? payload.actorDisplayName ?? payload.displayName ?? "").trim();
-  if (named) return named;
-  return speakerRoleLabel(item);
+function transcriptActorName(state, item) {
+  return speakerLabel(state?.roster, item);
 }
 
 // A Room refusal that can never succeed for this frozen post is a terminal
@@ -2357,7 +2353,7 @@ export function normalizeEvent(
       : epochConversationId(roomId, epochId),
     senderId: discussionStart ? discussionStart.authorId : event.actorId,
     senderName: discussionStart ? discussionStart.authorName
-      : String(senderName || payload.actorDisplayName || payload.displayName || "").trim() || speakerRoleLabel(event),
+      : String(senderName ?? "").trim() || speakerLabel([], event),
     senderKind: discussionStart || actorRole === "human" || actorRole.startsWith("human_") ? "human" : "agent",
     text: cyclePrompt(event, payload, cycleAttempt, sharedContext, policyWordLimit, discussionStart),
     occurredAt: Date.parse(event.ts) || Date.now(),
@@ -2415,15 +2411,11 @@ export function discussionStartInput(event, startEvent, state = {}) {
   if (String(eventPayload(event.payload).sourceEventId ?? "") !== String(startEvent.id ?? "") || !startEvent.id) return null;
   const payload = eventPayload(startEvent.payload);
   const topic = payload.epoch?.topic ?? payload.topic ?? {};
-  const roster = Array.isArray(state?.roster) ? state.roster : [];
-  const member = roster.find((entry) => String(entry?.membershipId ?? "") !== "" && String(entry.membershipId) === String(startEvent.actorId ?? ""));
-  const named = String(member?.displayName ?? payload.actorDisplayName ?? payload.displayName ?? "").trim();
-  const role = String(startEvent.actorRole ?? "");
   return {
     title: String(topic.title ?? "").trim(),
     description: String(topic.description ?? "").trim(),
     authorId: String(startEvent.actorId ?? ""),
-    authorName: named || (role === "agent_owner" ? "Agent owner" : "Room owner"),
+    authorName: speakerLabel(state?.roster, startEvent),
   };
 }
 
@@ -2661,7 +2653,7 @@ export function canonicalRoomContext(state, events, currentEventId = "", policy 
     .map((item) => {
       const payload = eventPayload(item.payload);
       const body = String(payload.body ?? payload.text ?? "").trim();
-      const actor = transcriptActorName(state, item, payload);
+      const actor = transcriptActorName(state, item);
       const number = Number.isSafeInteger(item.seq) && item.seq > 0 ? `#${item.seq} ` : "";
       return body ? `${number}${actor}: ${body}` : "";
     })

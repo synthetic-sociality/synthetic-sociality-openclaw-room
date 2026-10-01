@@ -125,7 +125,8 @@
     "P1a-04": "P1a-04 pass envelope documented technically without usage advice",
     "P1a-05": "P1a-05 policy word limit stated as a number on every turn when set, in open and coordinated modes",
     "P1a-06": "P1a-06 discussion start title and description presented verbatim and attributed to the starting human",
-    "P1a-07": "P1a-07 host fallback notice is never posted; the model reply is"
+    "P1a-07": "P1a-07 host fallback notice is never posted; the model reply is",
+    "P1a-08": "P1a-08 speaker labels follow one precedence and four role labels"
   },
   "presentationAcknowledgementFixtures": {
     "before_coordination_and_model": "receive-boundary acknowledgement precedes coordination and model dispatch",

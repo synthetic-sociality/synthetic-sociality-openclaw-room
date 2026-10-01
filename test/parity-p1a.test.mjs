@@ -8,11 +8,12 @@ import {readFile} from "node:fs/promises";
 import {registerHooks} from "node:module";
 import {
   OPEN_EXCHANGE_PREAMBLE_SHA256, OPEN_EXCHANGE_PREAMBLE_VERSION, OpenClawRoomRuntime, REPLY_MARKER_GUIDANCE,
-  ROOM_HISTORY_INSTRUCTION, ROOM_PASS_ENVELOPE, canonicalRoomContext, discussionHandoverContext, libraryCatalogContext,
+  ROOM_HISTORY_INSTRUCTION, ROOM_PASS_ENVELOPE, canonicalRoomContext, discussionHandoverContext, discussionStartInput, libraryCatalogContext,
   normalizeEvent, sourceArtifactContext,
 } from "../src/runtime.js";
 import {registerRoomCommands} from "../src/commands.js";
-import {readRoomHistory, registerRoomHistoryTool} from "../src/history.js";
+import {readRoomHistory, registerRoomHistoryTool, resetHistoryScanCache} from "../src/history.js";
+import {speakerName} from "../src/speaker.js";
 
 // Host SDK stand-ins; the tool-error warning marker is host-private metadata,
 // so the stand-in reads a test-only field in its place.
@@ -467,10 +468,54 @@ test("speaker labels name the real actor and never say Room participant or syste
   assert.doesNotMatch(names, /Room participant|"system"/);
 });
 
+test("P1a-08 speaker labels follow one precedence and four role labels", async () => {
+  const roster = [{membershipId: "m-tj", displayName: "TJ"}, {membershipId: "m-blank", displayName: "  "}];
+  const cases = [
+    ["roster name beats the payload name", {actorId: "m-tj", actorRole: "human_owner", payload: {actorDisplayName: "Tom"}}, "TJ"],
+    ["payload name only", {actorId: "m-unlisted", actorRole: "participant_agent", payload: {displayName: "Paula"}}, "Paula"],
+    ["blank roster name falls through to the payload", {actorId: "m-blank", actorRole: "guest", payload: {actorDisplayName: "Gita"}}, "Gita"],
+    ["system role", {actorId: "x-1", actorRole: "system", payload: {}}, "Room (system)"],
+    ["room coordinator", {actorId: "room_coordinator", actorRole: "", payload: {}}, "Room (system)"],
+    ["system actorId", {actorId: "system", actorRole: "", payload: {}}, "Room (system)"],
+    ["a human", {actorId: "h-1", actorRole: "human_owner", payload: {}}, "Human participant"],
+    ["an agent owner", {actorId: "h-2", actorRole: "agent_owner", payload: {}}, "Human participant"],
+    ["an agent", {actorId: "a-1", actorRole: "participant_agent", payload: {}}, "Room agent"],
+    ["an observer", {actorId: "o-1", actorRole: "observer", payload: {}}, "Room agent"],
+    ["the unknown role guest", {actorId: "g-1", actorRole: "guest", payload: {}}, "Unknown actor"],
+    ["missing role and actorId", {payload: {}}, "Unknown actor"],
+  ];
+  const historyClient = (event) => ({
+    roomState: async () => ({title: "R", headSeq: 2, activeEpoch: {id: "e1", ordinal: 1, startsAtSeq: 1}, roster}),
+    listEpochs: async () => ({epochs: [{id: "e1", ordinal: 1, startsAtSeq: 1, status: "active", topicTitle: "T"}]}),
+    readEvents: async (_session, after) => ({events: [
+      {id: "s1", seq: 1, type: "discussion.started", payload: {epoch: {id: "e1", ordinal: 1, startsAtSeq: 1, topic: {title: "T"}}}},
+      {id: "m2", seq: 2, type: "message.posted", ...event, payload: {...event.payload, body: "b"}},
+    ].filter((item) => item.seq > after), hasMore: false, headSeq: 2}),
+  });
+  for (const [label, actor, expected] of cases) {
+    const message = {id: "m2", seq: 2, type: "message.posted", ...actor, payload: {...actor.payload, body: "b", epochId: "e1"}};
+    // Transcript.
+    const transcript = canonicalRoomContext({roster}, [message], "current", {}, 1);
+    assert.ok(transcript.includes(`#2 ${expected}: b`), `${label} (transcript): ${transcript}`);
+    // Current input: the host session speaker, with the turn's roster name as the runtime supplies it.
+    const fromRoster = speakerName(roster, message);
+    const current = normalizeEvent(message, "room-1", null, "", "e1", "", 0, null, fromRoster);
+    assert.equal(current.senderName, expected, `${label} (current input)`);
+    // Discussion start attribution.
+    const start = {id: "s1", seq: 1, type: "discussion.started", ...actor, payload: {...actor.payload, epoch: {topic: {title: "T"}}}};
+    const readyEvent = {id: "r1", seq: 3, type: "discussion.cycle_attempt_ready", payload: {sourceEventId: "s1"}};
+    assert.equal(discussionStartInput(readyEvent, start, {roster}).authorName, expected, `${label} (discussion start)`);
+    // History tool.
+    resetHistoryScanCache();
+    const history = await readRoomHistory({client: historyClient(actor), session: {roomId: `room-${label}`, credential: "x"}, args: {}, cache: new Map()});
+    assert.ok(JSON.stringify(history.messages).includes(JSON.stringify(expected)), `${label} (history): ${JSON.stringify(history.messages)}`);
+  }
+});
+
 test("conformance P1a case names resolve to tests in this file", async () => {
   const source = await readFile(new URL(import.meta.url), "utf8");
   const cases = Object.entries(conformance.parityP1aCases ?? {});
-  assert.equal(cases.length, 7);
+  assert.equal(cases.length, 8);
   for (const [id, name] of cases) {
     assert.ok(name.startsWith(`${id} `), id);
     assert.ok(source.includes(`test(${JSON.stringify(name)},`), name);
