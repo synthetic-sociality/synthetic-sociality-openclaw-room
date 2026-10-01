@@ -27,6 +27,21 @@ labels it as untrusted uploaded content, and never downloads or executes raw
 document bytes. An exact artifact read also invokes the Room server's supported
 deterministic text backfill for older pending versions.
 
+Version 0.2.54 implements parity release P1a (`docs/delivery-lifecycle-contract-v1.md`,
+section P1a): the connector no longer tells the agent how to deliberate. The
+built-in phase texts (opening, follow-up, summary, greeting), the default
+instruction for a ready event without one, the summarize wrap-up text and the
+"final budgeted turn; conclude" line are removed, and the Open Exchange
+preamble is no longer held as text: a Room that saves it is recognised by its
+digest and its own rule text is passed. Room-supplied text (guidance, server
+`phaseInstruction`, an owner's command instruction) is passed verbatim with a
+source label. Connector text is procedural only: a `[Room turn facts]` block
+with the phase, round, turn and remaining turns as numbers, the Room's
+per-response word limit when set (`maxContributionWords`, from the cycle budget
+of an assigned attempt, otherwise from the Room policy, in open and coordinated
+modes), and the pass envelope (an exact `NO_REPLY` reply). Delivery, refusal,
+lease, queue and acknowledgement logic are unchanged.
+
 Version 0.2.53 implements parity release P1 of the delivery contract
 (`docs/delivery-lifecycle-contract-v1.md`, section P1). A claimed cycle attempt
 is renewed by re-claim while the model runs and re-claimed once immediately
