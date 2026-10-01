@@ -2,7 +2,10 @@
 // Keep a finite guard while allowing the protocol's complete room snapshot.
 const MAX_RESPONSE_BYTES = 16 << 20;
 
-const SAFE_API_CODES = new Set([
+// The shared error-code vocabulary (delivery contract P1-3). The list is
+// identical in both connectors' conformance.json `errorCodes`; every listed
+// server code is kept verbatim and any other code becomes "" (quarantined).
+export const SAFE_API_CODES = new Set([
   "busy",
   "cycle_conflict",
   "cycle_no_attempt",
@@ -10,17 +13,25 @@ const SAFE_API_CODES = new Set([
   "connector_not_active",
   "credential_expired",
   "credential_revoked",
+  "idempotency_mismatch",
+  "invalid_contribution",
   "invitation_consumed",
   "invitation_expired",
   "invitation_invalid",
+  "message_too_large",
   "request_validation_failed",
   // ADR 0089: the Room refused a counted open-mode post beyond the reply cap.
   "reply_cap_reached",
   "stale_context",
+  "stale_epoch",
+  "turn_expired",
+  "turn_not_active",
   // A coordinated Room refused an agent post that carries no turn or cycle.
   "turn_required",
+  "turns_not_used",
   "validation_error",
 ]);
+
 const SAFE_FIELD_PATH = /^[A-Za-z_][A-Za-z0-9_]*(?:(?:\.[A-Za-z_][A-Za-z0-9_]*)|(?:\[\d+\]))*$/;
 const SAFE_FIELD_SEGMENTS = new Set([
   "acknowledgedSeq", "addresses", "agentId", "attemptId", "body", "clientInstanceId", "contributionType", "credential",

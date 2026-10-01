@@ -109,6 +109,68 @@ function terminalRefusalReason(error, intent) {
   return "";
 }
 
+// Delivery contract P1-2: a refusal that proves this attempt or turn can no
+// longer carry the reply. The reply stays in its intent; nothing reposts it.
+const SUPERSEDING_POST_REFUSALS = new Set(["cycle_superseded", "cycle_no_attempt", "stale_epoch", "turn_not_active", "turn_expired"]);
+// One re-key per newer head, at most this many per delivery call (Hermes: 3 posts).
+const STALE_CONTEXT_REFRESHES = 2;
+
+// Classify a refusal of POST /messages that carries no canonical receipt into
+// exactly one outcome. The code decides before the retryable flag: the Room
+// marks stale_context, stale_epoch and turn_expired retryable, but a retry of
+// the same frozen request can never succeed for the last two.
+export function classifyPostRefusal(error, intent) {
+  const skipReason = terminalRefusalReason(error, intent);
+  if (skipReason) return {outcome: "skipped", reason: skipReason};
+  if (!(error instanceof RoomAPIError)) return {outcome: "retryable", reason: ""};
+  if (SUPERSEDING_POST_REFUSALS.has(error.code)) return {outcome: "superseded", reason: error.code};
+  if (error.code === "stale_context") return {outcome: "refresh", reason: error.code};
+  return {outcome: error.retryable ? "retryable" : "quarantined", reason: error.code};
+}
+
+// Delivery contract P1-4: every `fail` names a layer and code the Room accepts
+// (provider, runtime or infrastructure; non-empty code of at most 128 chars).
+export const DEFAULT_EXECUTION_FAILURE = Object.freeze({layer: "runtime", code: "execution_failed"});
+// Releasing an attempt the connector can no longer serve. The Room restores
+// readiness for this code on the agent's next canonical contribution.
+export const RELEASED_ATTEMPT_EXECUTION_FAILURE = Object.freeze({layer: "infrastructure", code: "attempt_timeout"});
+export const OPERATIONAL_FALLBACK_EXECUTION_FAILURE = Object.freeze({layer: "runtime", code: "gateway_operational_error"});
+const RESPONSE_TOO_LARGE_EXECUTION_FAILURE = Object.freeze({layer: "runtime", code: "response_too_large"});
+
+export function executionFailureFor(value) {
+  const layer = String(value?.layer ?? "").trim().toLowerCase();
+  const code = String(value?.code ?? "").trim().toLowerCase();
+  if (!["provider", "runtime", "infrastructure"].includes(layer) || !code || code.length > 128) {
+    return {...DEFAULT_EXECUTION_FAILURE};
+  }
+  return {layer, code};
+}
+
+// Delivery contract P1-1: renew by re-claim at max(1, min(30, remaining/3)) s.
+export function attemptRenewalDelaySeconds(leaseExpiresAt, now = Date.now()) {
+  if (!validCanonicalTimestamp(leaseExpiresAt)) return 30;
+  return Math.max(1, Math.min(30, (Date.parse(leaseExpiresAt) - now) / 3000));
+}
+
+// A renewal is valid only for the exact claimed attempt: same cycle, attempt,
+// generation and holder, with a lease that has not already run out.
+function sameAttemptClaim(refreshed, expected, membershipId, now = Date.now()) {
+  const cycle = refreshed?.cycle;
+  const attempt = refreshed?.attempt;
+  if (!cycle || !attempt || typeof cycle !== "object" || typeof attempt !== "object") return false;
+  if (String(cycle.id ?? "") !== String(expected?.cycle?.id ?? "") || !String(cycle.id ?? "")) return false;
+  if (String(attempt.id ?? "") !== String(expected?.attempt?.id ?? "") || !String(attempt.id ?? "")) return false;
+  if (expected?.cycle?.generation !== undefined && cycle.generation !== expected.cycle.generation) return false;
+  if (attempt.membershipId !== undefined && attempt.membershipId !== membershipId) return false;
+  if (attempt.leaseExpiresAt !== undefined
+      && (!validCanonicalTimestamp(attempt.leaseExpiresAt) || Date.parse(attempt.leaseExpiresAt) <= now)) return false;
+  return true;
+}
+
+function outcomeLogFields({code = "", sourceSeq = "", attemptId = ""} = {}) {
+  return `code=${code || "-"} sourceSeq=${sourceSeq || "-"} attempt=${attemptId || "-"}`;
+}
+
 function validFrozenPost(intent) {
   const post = intent?.post;
   const identity = intent?.identity;
@@ -363,6 +425,9 @@ export class OpenClawRoomRuntime {
     this.pendingActivityFrame = null;
     this.bindingOperation = Promise.resolve();
     this.lastRenewalCheck = 0;
+    // Claimed cycle attempts held alive while their model run is in flight.
+    this.attemptLeases = new Map();
+    this.parkedRetryDelay = 0;
   }
 
   async initialize(signal) {
@@ -562,7 +627,21 @@ export class OpenClawRoomRuntime {
           scanCursor = event.seq;
           continue;
         }
-        if (await this.recoverPendingDelivery(event, signal)) {
+        let replayed;
+        try {
+          replayed = await this.recoverPendingDelivery(event, signal);
+        } catch (error) {
+          if (!this.isParkedDelivery(event)) throw error;
+          // A retryable refusal leaves the exact frozen request parked. Wait
+          // and re-scan from the same frontier instead of stopping the channel.
+          this.logger?.warn?.(`Room delivery parked for retry ${outcomeLogFields({code: error?.code, sourceSeq: event.seq})}`);
+          if (this.pendingEvent?.id === event.id) this.pendingEvent = null;
+          this.parkedRetryDelay = Math.min(60_000, Math.max(2_000, (this.parkedRetryDelay ?? 0) * 2));
+          await sleep(this.parkedRetryDelay, signal);
+          break;
+        }
+        if (replayed) {
+          this.parkedRetryDelay = 0;
           this.pendingEvent = event;
           await this.ackEvent(event);
           scanCursor = event.seq;
@@ -590,13 +669,14 @@ export class OpenClawRoomRuntime {
         const cycleAttempt = await this.prepareCycleAttempt(event, signal);
         if (cycleAttempt === false) {
           await this.recordTerminalEvidence(event, "skipped", {reason: "coordination_handled_without_model"});
+          this.logger?.info?.(`Room delivery skipped ${outcomeLogFields({code: "coordination_handled_without_model", sourceSeq: event.seq})}`);
           await this.ackEvent(event);
           scanCursor = event.seq;
           continue;
         }
         this.pendingEvent = event;
         const sharedContext = await this.sharedRoomContext(event, pageEpoch, signal);
-        yield normalizeEvent(
+        const normalized = normalizeEvent(
           event,
           this.state.roomId,
           cycleAttempt || null,
@@ -604,6 +684,15 @@ export class OpenClawRoomRuntime {
           pageActiveEpochId,
           this.state.legacySessionEpochId,
         );
+        // The model runs while the consumer holds this yield; keep its claimed
+        // attempt alive until a terminal outcome is recorded or it returns.
+        if (normalized.cycleAttempt) this.startAttemptLease(event, normalized.cycleAttempt);
+        try {
+          yield normalized;
+        } finally {
+          await this.stopAttemptLease(event.id);
+          this.attemptLeases.delete(event.id);
+        }
         if (event.seq <= this.state.cursor || this.terminalEvidenceFor(event) || this.isQuarantinedEvent(event)) {
           scanCursor = event.seq;
           if (this.pendingEvent?.id === event.id) this.pendingEvent = null;
@@ -629,6 +718,171 @@ export class OpenClawRoomRuntime {
         || (intent.binding?.roomId === this.state.roomId
           && intent.binding?.membershipId === this.state.membershipId
           && intent.binding?.clientInstanceId === this.state.clientInstanceId)));
+  }
+
+  isParkedDelivery(event) {
+    const intent = this.state.deliveryIntents?.[`${event?.id ?? ""}:final`];
+    return intent?.version === 2 && intent.deliveryState === "delivery_pending" && !intent.canonicalMessage;
+  }
+
+  startAttemptLease(event, cycleAttempt) {
+    if (this.closed || !event?.id || !cycleAttempt?.cycle?.id || !cycleAttempt?.attempt?.id) return null;
+    const previous = this.attemptLeases.get(event.id);
+    if (previous && !previous.stopped) return previous;
+    const lease = {sourceEvent: event, cycleAttempt, timer: null, inflight: null, stopped: false, superseded: false, reason: ""};
+    this.attemptLeases.set(event.id, lease);
+    this.scheduleAttemptRenewal(lease);
+    return lease;
+  }
+
+  scheduleAttemptRenewal(lease) {
+    if (lease.stopped || this.closed) return;
+    const delay = attemptRenewalDelaySeconds(lease.cycleAttempt.attempt?.leaseExpiresAt) * 1000;
+    lease.timer = setTimeout(() => {
+      lease.timer = null;
+      lease.inflight = this.renewAttemptLease(lease)
+        .catch((error) => this.logger?.error?.(`Room attempt renewal failed${roomErrorDiagnostic(error)}`))
+        .finally(() => { lease.inflight = null; });
+    }, delay);
+    lease.timer.unref?.();
+  }
+
+  // One renewal: re-claim the exact attempt. Any failure or mismatch loses it.
+  async renewAttemptLease(lease) {
+    if (lease.stopped) return false;
+    let refreshed = null;
+    let reason = "";
+    try {
+      refreshed = await this.client.claimDiscussionAttempt(this.state, String(lease.cycleAttempt.cycle.id), this.heartbeatAbort.signal);
+    } catch (error) {
+      reason = error instanceof RoomAPIError && error.code ? error.code : "attempt_renewal_failed";
+    }
+    if (lease.stopped || this.closed) return false;
+    if (!reason && !sameAttemptClaim(refreshed, lease.cycleAttempt, this.state.membershipId)) reason = "attempt_superseded";
+    if (reason) {
+      await this.supersedeAttemptLease(lease, reason);
+      return false;
+    }
+    if (refreshed.attempt.leaseExpiresAt !== undefined) lease.cycleAttempt.attempt.leaseExpiresAt = refreshed.attempt.leaseExpiresAt;
+    this.scheduleAttemptRenewal(lease);
+    return true;
+  }
+
+  async stopAttemptLease(sourceEventId) {
+    const lease = this.attemptLeases.get(sourceEventId);
+    if (!lease) return null;
+    lease.stopped = true;
+    if (lease.timer) clearTimeout(lease.timer);
+    lease.timer = null;
+    if (lease.inflight) await lease.inflight;
+    return lease;
+  }
+
+  leaseForAttempt(cycleAttempt) {
+    const attemptId = String(cycleAttempt?.attempt?.id ?? "");
+    for (const lease of this.attemptLeases.values()) {
+      if (lease.cycleAttempt === cycleAttempt || (attemptId && String(lease.cycleAttempt.attempt?.id ?? "") === attemptId)) return lease;
+    }
+    return null;
+  }
+
+  // Lost authority is durable and monotonic: superseded source evidence is
+  // written before anything else, so no restart, replay or later reply posts.
+  async supersedeAttemptLease(lease, reason) {
+    if (lease.superseded) return;
+    lease.superseded = true;
+    lease.stopped = true;
+    lease.reason = reason;
+    if (lease.timer) clearTimeout(lease.timer);
+    lease.timer = null;
+    const event = lease.sourceEvent;
+    if (!this.terminalEvidenceFor(event)) {
+      await this.recordTerminalEvidence(event, "superseded", {reason});
+    }
+    this.logger?.info?.(`Room delivery superseded ${outcomeLogFields({code: reason, sourceSeq: event.seq, attemptId: lease.cycleAttempt.attempt?.id})}`);
+    await this.releaseAttempt(lease.cycleAttempt, RELEASED_ATTEMPT_EXECUTION_FAILURE);
+  }
+
+  // Release an attempt this connector can no longer serve so the Room proceeds
+  // now rather than at its own lease timeout. Errors are logged, never raised.
+  async releaseAttempt(cycleAttempt, executionFailure, signal) {
+    if (!cycleAttempt || cycleAttempt.settled) return null;
+    try {
+      return await this.settleDiscussionAttempt(cycleAttempt, "fail", signal, executionFailure);
+    } catch (error) {
+      this.logger?.warn?.(`Room attempt release failed${roomErrorDiagnostic(error)}`);
+      return null;
+    } finally {
+      cycleAttempt.settled = true;
+    }
+  }
+
+  // Terminal `superseded` for a delivery that never received a receipt. The
+  // reply stays in the intent; intent and source evidence persist together.
+  async supersedeDelivery(intent, reason, cycleAttempt, signal) {
+    const sourceId = intent.identity.sourceEventId;
+    const source = this.pendingEvent;
+    const bound = Boolean(sourceId) && source?.id === sourceId && Number.isSafeInteger(source.seq) && source.seq >= 1;
+    const previousIntent = structuredClone(intent);
+    const previousTerminalEvidence = this.state.terminalEvidence === undefined
+      ? undefined : structuredClone(this.state.terminalEvidence);
+    try {
+      intent.deliveryState = "superseded";
+      intent.status = "superseded";
+      intent.lifecycleState = "not_required";
+      intent.supersededReason = reason;
+      if (bound) {
+        const existing = this.terminalEvidenceFor(source);
+        if (existing?.status === "posted") throw new Error("Superseded Room delivery conflicts with posted terminal evidence");
+        if (!existing || existing.status !== "superseded") {
+          this.state.terminalEvidence ??= {};
+          this.state.terminalEvidence[String(source.seq)] = {
+            status: "superseded", sourceEventId: source.id, sourceSeq: source.seq,
+            canonicalEventId: "", canonicalSeq: 0, canonicalTs: "", reason,
+          };
+        }
+      }
+      await this.persistState();
+    } catch (error) {
+      for (const key of Object.keys(intent)) delete intent[key];
+      Object.assign(intent, previousIntent);
+      if (previousTerminalEvidence === undefined) delete this.state.terminalEvidence;
+      else this.state.terminalEvidence = previousTerminalEvidence;
+      throw error;
+    }
+    this.logger?.info?.(`Room delivery superseded ${outcomeLogFields({code: reason, sourceSeq: bound ? source.seq : "", attemptId: intent.identity.cycle?.attemptId})}`);
+    const attempt = cycleAttempt ?? (intent.identity.cycle ? {
+      cycle: {id: intent.identity.cycle.cycleId, generation: intent.identity.cycle.generation},
+      attempt: {id: intent.identity.cycle.attemptId},
+      settled: false,
+    } : null);
+    await this.releaseAttempt(attempt, RELEASED_ATTEMPT_EXECUTION_FAILURE, signal);
+    return {superseded: true, reason};
+  }
+
+  // A lease lost while the model ran, or a failed re-claim immediately before
+  // posting, supersedes the delivery. Only attempts this process claimed and
+  // kept alive are re-claimed; a refused post covers every other replay.
+  async attemptAuthorityLost(intent, signal) {
+    const cycle = intent.identity.cycle;
+    if (!cycle) return "";
+    const lease = this.attemptLeases.get(intent.identity.sourceEventId);
+    if (!lease || String(lease.cycleAttempt.attempt?.id ?? "") !== cycle.attemptId) return "";
+    await this.stopAttemptLease(intent.identity.sourceEventId);
+    if (lease.superseded) return lease.reason || "attempt_superseded";
+    let reason = "";
+    try {
+      const refreshed = await this.client.claimDiscussionAttempt(this.state, cycle.cycleId, signal);
+      if (!sameAttemptClaim(refreshed, lease.cycleAttempt, this.state.membershipId)) reason = "attempt_superseded";
+      else if (refreshed.attempt.leaseExpiresAt !== undefined) lease.cycleAttempt.attempt.leaseExpiresAt = refreshed.attempt.leaseExpiresAt;
+    } catch (error) {
+      reason = error instanceof RoomAPIError && error.code ? error.code : "attempt_reclaim_failed";
+    }
+    if (reason) {
+      lease.superseded = true;
+      lease.reason = reason;
+    }
+    return reason;
   }
 
   async sharedRoomContext(event, sourceEpoch, signal) {
@@ -767,6 +1021,7 @@ export class OpenClawRoomRuntime {
     if (!pending || pending.id !== eventId) throw new Error("Room skipped outcome is out of order");
     if (!this.terminalEvidenceFor(pending)) {
       await this.recordTerminalEvidence(pending, "skipped", {reason});
+      this.logger?.info?.(`Room delivery skipped ${outcomeLogFields({code: reason, sourceSeq: pending.seq})}`);
     }
   }
 
@@ -783,6 +1038,8 @@ export class OpenClawRoomRuntime {
     }
     const existing = this.terminalEvidenceFor(event);
     if (existing?.status === "posted") return existing;
+    // Lost authority is monotonic: only a canonical receipt outranks it.
+    if (existing?.status === "superseded" && status !== "posted") return existing;
     const occupied = this.state.terminalEvidence?.[String(event.seq)];
     if (occupied && occupied.sourceEventId !== event.id) {
       throw new Error("Room terminal evidence sequence is already bound to a different source event");
@@ -870,6 +1127,7 @@ export class OpenClawRoomRuntime {
     this.state.terminalEvidence ??= {};
     this.state.terminalEvidence[String(event.seq)] = evidence;
     await this.persistState();
+    this.logger?.info?.(`Room delivery superseded ${outcomeLogFields({code: "historical_epoch", sourceSeq: event.seq, attemptId: intent?.identity?.cycle?.attemptId})}`);
     return evidence;
   }
 
@@ -1073,6 +1331,7 @@ export class OpenClawRoomRuntime {
         throw new Error("OpenClaw Room delivery is quarantined for operator recovery");
       }
       if (intent.deliveryState === "skipped") return {skipped: true, reason: String(intent.skippedReason || "skipped")};
+      if (intent.deliveryState === "superseded") return {superseded: true, reason: String(intent.supersededReason || "superseded")};
     } else {
       const payloadDialect = this.state.messagePayloadDialect ?? "v1";
       if (!["v1", "v2"].includes(payloadDialect)) throw new Error("Room message payload dialect was not negotiated");
@@ -1101,6 +1360,16 @@ export class OpenClawRoomRuntime {
       this.state.deliveryIntents[deliveryKey] = intent;
       // Freeze semantic identity and all keys before any connector read/write.
       await this.persistState();
+    }
+    // The attempt was lost while the model ran: keep the frozen reply, post nothing.
+    const heldLease = intent.identity.cycle ? this.attemptLeases.get(intent.identity.sourceEventId) : null;
+    if (heldLease?.superseded && String(heldLease.cycleAttempt.attempt?.id ?? "") === intent.identity.cycle.attemptId) {
+      return this.supersedeDelivery(intent, heldLease.reason || "attempt_superseded", cycleAttempt, signal);
+    }
+    const sourceEvidence = intent.identity.sourceEventId && this.pendingEvent?.id === intent.identity.sourceEventId
+      ? this.terminalEvidenceFor(this.pendingEvent) : null;
+    if (sourceEvidence?.status === "superseded") {
+      return this.supersedeDelivery(intent, sourceEvidence.reason, cycleAttempt, signal);
     }
     if (!intent.identity.coordinationMode) {
       const initialState = await this.client.roomState(this.state, signal);
@@ -1186,64 +1455,102 @@ export class OpenClawRoomRuntime {
     if (intent.deliveryState === "posted" && validCanonicalMessage(intent.canonicalMessage)) {
       message = intent.canonicalMessage;
     } else {
-      try {
-        message = await this.client.postMessage(this.state, intent.post, signal);
-      } catch (error) {
-        const skipReason = terminalRefusalReason(error, intent);
-        if (skipReason) {
-          // A counted open-mode refusal, or a turnless open-mode post refused
-          // by a now-coordinated Room, is a normal terminal skip. Persist the
-          // intent and the source evidence together; a status the loader
-          // rejects, or a skip without evidence, crashes recovery and retries
-          // the same post. The intent keeps its source sequence because
-          // acknowledgement later prunes the evidence below the cursor. An
-          // outbound send has no Room source and records only the reason.
-          const bound = Boolean(intent.identity.sourceEventId);
-          const source = this.pendingEvent;
-          if (bound && (!source || source.id !== intent.identity.sourceEventId || !Number.isSafeInteger(source.seq) || source.seq < 1)) {
-            throw new Error("Terminal Room refusal skip requires the bound pending source event");
-          }
-          const previousIntent = structuredClone(intent);
-          const previousTerminalEvidence = this.state.terminalEvidence === undefined
-            ? undefined : structuredClone(this.state.terminalEvidence);
-          try {
-            intent.deliveryState = "skipped";
-            intent.status = "skipped";
-            intent.lifecycleState = "not_required";
-            intent.skippedReason = skipReason;
-            if (bound) {
-              intent.skippedSourceSeq = source.seq;
-              const evidence = await this.recordTerminalEvidence(source, "skipped", {reason: skipReason});
-              if (evidence?.status !== "skipped" || evidence.reason !== skipReason) {
-                throw new Error("Terminal Room refusal skip conflicts with existing terminal evidence");
-              }
-            } else {
-              await this.persistState();
+      // Delivery contract P1-1: re-claim once immediately before posting.
+      const lostAuthority = await this.attemptAuthorityLost(intent, signal);
+      if (lostAuthority) return this.supersedeDelivery(intent, lostAuthority, cycleAttempt, signal);
+      let refreshes = 0;
+      while (true) {
+        try {
+          message = await this.client.postMessage(this.state, intent.post, signal);
+          break;
+        } catch (error) {
+          const refusal = classifyPostRefusal(error, intent);
+          if (refusal.outcome === "refresh" && refreshes < STALE_CONTEXT_REFRESHES) {
+            const refreshed = await this.rekeyStaleContext(intent, deliveryKey, signal);
+            if (refreshed === "stale_epoch") return this.supersedeDelivery(intent, "stale_epoch", cycleAttempt, signal);
+            if (refreshed === "rekeyed") {
+              refreshes += 1;
+              continue;
             }
-          } catch (persistError) {
-            for (const key of Object.keys(intent)) delete intent[key];
-            Object.assign(intent, previousIntent);
-            if (previousTerminalEvidence === undefined) delete this.state.terminalEvidence;
-            else this.state.terminalEvidence = previousTerminalEvidence;
-            throw persistError;
           }
-          return {skipped: true, reason: skipReason};
+          if (refusal.outcome === "skipped") {
+            const skipReason = refusal.reason;
+            // A counted open-mode refusal, or a turnless open-mode post refused
+            // by a now-coordinated Room, is a normal terminal skip. Persist the
+            // intent and the source evidence together; a status the loader
+            // rejects, or a skip without evidence, crashes recovery and retries
+            // the same post. The intent keeps its source sequence because
+            // acknowledgement later prunes the evidence below the cursor. An
+            // outbound send has no Room source and records only the reason.
+            const bound = Boolean(intent.identity.sourceEventId);
+            const source = this.pendingEvent;
+            if (bound && (!source || source.id !== intent.identity.sourceEventId || !Number.isSafeInteger(source.seq) || source.seq < 1)) {
+              throw new Error("Terminal Room refusal skip requires the bound pending source event");
+            }
+            const previousIntent = structuredClone(intent);
+            const previousTerminalEvidence = this.state.terminalEvidence === undefined
+              ? undefined : structuredClone(this.state.terminalEvidence);
+            try {
+              intent.deliveryState = "skipped";
+              intent.status = "skipped";
+              intent.lifecycleState = "not_required";
+              intent.skippedReason = skipReason;
+              if (bound) {
+                intent.skippedSourceSeq = source.seq;
+                const evidence = await this.recordTerminalEvidence(source, "skipped", {reason: skipReason});
+                if (evidence?.status !== "skipped" || evidence.reason !== skipReason) {
+                  throw new Error("Terminal Room refusal skip conflicts with existing terminal evidence");
+                }
+              } else {
+                await this.persistState();
+              }
+            } catch (persistError) {
+              for (const key of Object.keys(intent)) delete intent[key];
+              Object.assign(intent, previousIntent);
+              if (previousTerminalEvidence === undefined) delete this.state.terminalEvidence;
+              else this.state.terminalEvidence = previousTerminalEvidence;
+              throw persistError;
+            }
+            this.logger?.info?.(`Room delivery skipped ${outcomeLogFields({code: skipReason, sourceSeq: bound ? source.seq : "", attemptId: intent.identity.cycle?.attemptId})}`);
+            return {skipped: true, reason: skipReason};
+          }
+          if (refusal.outcome === "superseded") return this.supersedeDelivery(intent, refusal.reason, cycleAttempt, signal);
+          const quarantined = refusal.outcome === "quarantined"
+            || (refusal.outcome === "refresh" && !(error instanceof RoomAPIError && error.retryable));
+          intent.deliveryState = quarantined ? "quarantined" : "delivery_pending";
+          intent.status = intent.deliveryState;
+          intent.lifecycleState = "not_started";
+          intent.deliveryErrorCode = error instanceof RoomAPIError ? error.code : "";
+          intent.deliveryError = String(error?.message ?? error).slice(0, 1000);
+          await this.persistState();
+          const fields = outcomeLogFields({
+            code: intent.deliveryErrorCode,
+            sourceSeq: this.pendingEvent?.id === intent.identity.sourceEventId ? this.pendingEvent.seq : "",
+            attemptId: intent.identity.cycle?.attemptId,
+          });
+          if (quarantined) {
+            this.logger?.warn?.(`Room delivery quarantined ${fields}`);
+            // Delivery contract P1-6 / UF-08: a send-path quarantine releases
+            // the attempt now; the scan then isolates the source and moves on.
+            const attempt = cycleAttempt ?? (intent.identity.cycle ? {
+              cycle: {id: intent.identity.cycle.cycleId, generation: intent.identity.cycle.generation},
+              attempt: {id: intent.identity.cycle.attemptId},
+              settled: false,
+            } : null);
+            await this.releaseAttempt(attempt, intent.deliveryErrorCode === "message_too_large"
+              ? RESPONSE_TOO_LARGE_EXECUTION_FAILURE : RELEASED_ATTEMPT_EXECUTION_FAILURE, signal);
+          } else {
+            this.logger?.warn?.(`Room delivery parked for retry ${fields}`);
+          }
+          if (error && typeof error === "object") error.roomDeliveryOutcome = intent.deliveryState;
+          throw error;
         }
-        if (error instanceof RoomAPIError && !error.retryable) {
-          intent.deliveryState = "quarantined";
-          intent.status = "quarantined";
-        } else {
-          intent.deliveryState = "delivery_pending";
-          intent.status = "delivery_pending";
-        }
-        intent.lifecycleState = "not_started";
-        intent.deliveryErrorCode = error instanceof RoomAPIError ? error.code : "";
-        intent.deliveryError = String(error?.message ?? error).slice(0, 1000);
-        await this.persistState();
-        throw error;
       }
       if (!validCanonicalMessage(message)) {
-        throw new Error("Room canonical delivery receipt requires event ID, sequence, and timestamp");
+        // The frozen request stays delivery_pending and replays idempotently.
+        throw Object.assign(new Error("Room canonical delivery receipt requires event ID, sequence, and timestamp"), {
+          roomDeliveryOutcome: "delivery_pending",
+        });
       }
       const previousIntent = structuredClone(intent);
       const previousTerminalEvidence = this.state.terminalEvidence === undefined
@@ -1439,6 +1746,38 @@ export class OpenClawRoomRuntime {
     }
   }
 
+  // Delivery contract P1-2 stale_context: the refusal proves the old request
+  // did not commit. Re-read the head and, only when it is newer, re-key the
+  // same frozen contribution under an observation-scoped idempotency key.
+  async rekeyStaleContext(intent, deliveryKey, signal) {
+    let head;
+    try {
+      head = await this.client.roomState(this.state, signal);
+    } catch {
+      return "";
+    }
+    if (intent.identity.sourceEpochId && String(head?.activeEpoch?.id ?? "") !== intent.identity.sourceEpochId) return "stale_epoch";
+    const observed = Number(head?.headSeq);
+    if (!Number.isSafeInteger(observed) || observed <= intent.post.observedSeq) return "";
+    const previousIntent = structuredClone(intent);
+    try {
+      intent.supersededIdempotencyAttempts = [
+        ...(Array.isArray(intent.supersededIdempotencyAttempts) ? intent.supersededIdempotencyAttempts : []),
+        {idempotencyKey: intent.post.idempotencyKey, observedSeq: intent.post.observedSeq, reason: "stale_context"},
+      ];
+      intent.messageIdempotencyKey = safeKey(`${deliveryKey}:message-context:${observed}`);
+      intent.identity.postObservedSeq = observed;
+      intent.post.observedSeq = observed;
+      intent.post.idempotencyKey = intent.messageIdempotencyKey;
+      await this.persistState();
+    } catch (error) {
+      for (const key of Object.keys(intent)) delete intent[key];
+      Object.assign(intent, previousIntent);
+      throw error;
+    }
+    return "rekeyed";
+  }
+
   async persistState() {
     if (this.account?.stateFile) await saveState(this.account.stateFile, this.state);
   }
@@ -1453,24 +1792,37 @@ export class OpenClawRoomRuntime {
    * as a nonsemantic, lease-releasing outcome since the agent execution
    * contract deployed on 2026-09-05.
    *
-   * Like the Hermes adapter, this sends no `executionFailure`; the server
-   * defaults an unqualified failure to `runtime` / `execution_failed`.
+   * Delivery contract P1-4: a `fail` always carries `executionFailure{layer,
+   * code}`; without a typed value the runtime default is sent explicitly.
+   * Renewal stops first so no re-claim can race the settled attempt.
    */
-  async settleDiscussionAttempt(cycleAttempt, action, signal) {
+  async settleDiscussionAttempt(cycleAttempt, action, signal, executionFailure) {
     if (!cycleAttempt || cycleAttempt.settled) return null;
     if (action !== "pass" && action !== "fail") throw new TypeError(`unsupported attempt outcome: ${action}`);
+    const lease = this.leaseForAttempt(cycleAttempt);
+    if (lease && !lease.stopped) await this.stopAttemptLease(lease.sourceEvent.id);
+    const failure = action === "fail" ? executionFailureFor(executionFailure) : null;
+    const fields = outcomeLogFields({
+      code: failure ? `${failure.layer}/${failure.code}` : action,
+      sourceSeq: lease?.sourceEvent?.seq ?? (this.pendingEvent?.seq || ""),
+      attemptId: cycleAttempt.attempt?.id,
+    });
     try {
       const result = await this.client.completeDiscussionAttempt(
         this.state,
         cycleAttempt.cycle.id,
         cycleAttempt.attempt.id,
-        {generation: cycleAttempt.cycle.generation, action},
+        {generation: cycleAttempt.cycle.generation, action, ...(failure ? {executionFailure: failure} : {})},
         signal,
       );
       cycleAttempt.settled = true;
+      this.logger?.info?.(`Room attempt settled ${action} ${fields}`);
       return result;
     } catch (error) {
-      if (error instanceof RoomAPIError && error.code === "cycle_superseded") return null;
+      if (error instanceof RoomAPIError && error.code === "cycle_superseded") {
+        this.logger?.info?.(`Room attempt settle ${action} superseded ${fields}`);
+        return null;
+      }
       throw error;
     }
   }
@@ -1668,7 +2020,10 @@ export class OpenClawRoomRuntime {
 
   async close() {
     this.closed = true;
+    // Stop every renewal before aborting, so an aborted claim is not read as lost authority.
+    const stopping = [...this.attemptLeases.keys()].map((sourceEventId) => this.stopAttemptLease(sourceEventId));
     this.heartbeatAbort.abort();
+    await Promise.all(stopping);
     await this.heartbeatTask?.catch(() => {});
     await this.bindingOperation.catch(() => {});
   }

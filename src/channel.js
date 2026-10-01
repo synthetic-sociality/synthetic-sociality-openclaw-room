@@ -11,6 +11,11 @@ import {looksLikeRoomId, normalizeRoomTarget, resolveConfiguredRoomTarget} from 
 import {outboundIdempotencyKey} from "./outbound.js";
 import {roomErrorDiagnostic} from "./room-client.js";
 import {
+  DEFAULT_EXECUTION_FAILURE,
+  OPERATIONAL_FALLBACK_EXECUTION_FAILURE,
+  RELEASED_ATTEMPT_EXECUTION_FAILURE,
+} from "./runtime.js";
+import {
   roomReplyDeliveryPolicy,
 } from "./reply-policy.js";
 
@@ -51,7 +56,7 @@ export function createRoomChannel({makeClient}) {
           resolveRecipientMentions: true,
           signal: ctx.signal,
         });
-        if (sent.skipped) throw new Error(`Room did not accept the post: ${sent.reason}`);
+        if (sent.skipped || sent.superseded) throw new Error(`Room did not accept the post: ${sent.reason}`);
         return {messageId: sent.eventId, receipt: receipt(sent.eventId, sent.sentAt)};
       },
     },
@@ -113,6 +118,10 @@ export function createRoomChannel({makeClient}) {
             let visibleReplySent = false;
             let operationalFallbackSuppressed = false;
             let skipReason = "";
+            // The recorded outcome of a produced reply (delivery contract P1-5):
+            // posted, skipped, superseded, quarantined, delivery_pending, or
+            // failed. A refused reply is never a model that chose silence.
+            let deliveryOutcome = "";
             // A handler that throws never reached a deliberate decision either.
             let handlerCompleted = false;
             ctx.setStatus({...ctx.getStatus(), running: true, connected: true, lastInboundAt: Date.now(), lastError: null});
@@ -190,24 +199,36 @@ export function createRoomChannel({makeClient}) {
                         }
                         const text = payload.text?.trim();
                         if (!text) return {visibleReplySent: false};
-                        const sent = await client.postAndFinish({
-                          roomId: event.roomId,
-                          text,
-                          replyToId: event.respondsToId,
-                          idempotencyKey: `${event.sourceEventId}:final`,
-                          signal: ctx.abortSignal,
-                          sourceEventId: event.sourceEventId,
-                          sourceEpochId: event.epochId,
-                          cycleAttempt: event.cycleAttempt,
-                        });
+                        let sent;
+                        try {
+                          sent = await client.postAndFinish({
+                            roomId: event.roomId,
+                            text,
+                            replyToId: event.respondsToId,
+                            idempotencyKey: `${event.sourceEventId}:final`,
+                            signal: ctx.abortSignal,
+                            sourceEventId: event.sourceEventId,
+                            sourceEpochId: event.epochId,
+                            cycleAttempt: event.cycleAttempt,
+                          });
+                        } catch (error) {
+                          // The host swallows a delivery error; keep its recorded outcome.
+                          // A later delivery call never downgrades one already recorded.
+                          deliveryOutcome = ["quarantined", "delivery_pending"].includes(error?.roomDeliveryOutcome)
+                            ? error.roomDeliveryOutcome : (deliveryOutcome || "failed");
+                          throw error;
+                        }
                         if (sent.superseded) {
+                          deliveryOutcome = "superseded";
                           cycleSettled = true;
                           return {visibleReplySent: false};
                         }
                         if (sent.skipped) {
+                          deliveryOutcome = "skipped";
                           skipReason = sent.reason;
                           return {visibleReplySent: false};
                         }
+                        deliveryOutcome = "posted";
                         cycleSettled = Boolean(event.cycleAttempt);
                         visibleReplySent = true;
                         return {messageIds: [sent.eventId], receipt: receipt(sent.eventId, sent.sentAt), visibleReplySent: true};
@@ -221,15 +242,23 @@ export function createRoomChannel({makeClient}) {
               });
               handlerCompleted = true;
             } finally {
-              if (event.cycleAttempt && !cycleSettled) {
+              // A parked reply replays its exact frozen post and keeps its attempt.
+              if (event.cycleAttempt && !cycleSettled && deliveryOutcome !== "delivery_pending") {
                 // The skip record one line below already distinguishes these two
                 // cases; the attempt outcome must not throw that away.
-                const action = operationalFallbackSuppressed || !handlerCompleted ? "fail" : "pass";
-                await client.settleDiscussionAttempt(event.cycleAttempt, action, ctx.abortSignal);
+                const failed = operationalFallbackSuppressed || !handlerCompleted || ["quarantined", "failed"].includes(deliveryOutcome);
+                const failure = operationalFallbackSuppressed ? OPERATIONAL_FALLBACK_EXECUTION_FAILURE
+                  : deliveryOutcome === "quarantined" ? RELEASED_ATTEMPT_EXECUTION_FAILURE
+                    : DEFAULT_EXECUTION_FAILURE;
+                await client.settleDiscussionAttempt(event.cycleAttempt, failed ? "fail" : "pass", ctx.abortSignal, failed ? failure : undefined);
               }
             }
-            if (!visibleReplySent) {
-              await client.recordSkipped(event.id, skipReason || (operationalFallbackSuppressed ? "gateway_operational_error" : "model_no_visible_reply"));
+            // A quarantined source stays isolated without evidence and a parked
+            // one replays; neither is acknowledged here. The scan moves on.
+            if (deliveryOutcome === "quarantined" || deliveryOutcome === "delivery_pending") continue;
+            if (!visibleReplySent && deliveryOutcome !== "superseded") {
+              await client.recordSkipped(event.id, skipReason || (operationalFallbackSuppressed ? "gateway_operational_error"
+                : deliveryOutcome === "failed" ? "delivery_failed" : "model_no_visible_reply"));
             }
             await client.ack(event.id);
           }
