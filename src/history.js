@@ -8,6 +8,7 @@ import {readdirSync} from "node:fs";
 import {join} from "node:path";
 import {defaultStateDirectory, loadState} from "./state.js";
 import {RoomClient} from "./room-client.js";
+import {speakerRoleLabel} from "./speaker.js";
 
 export const HISTORY_PAGE_DEFAULT = 20;
 export const HISTORY_PAGE_MAX = 50;
@@ -52,9 +53,7 @@ function actorName(state, event) {
   const actorId = String(event.actorId ?? "");
   const member = (state?.roster ?? []).find((item) => String(item?.membershipId ?? "") === actorId);
   if (member?.displayName) return String(member.displayName);
-  const role = String(event.actorRole ?? "");
-  if (role === "human" || role.startsWith("human_") || role === "agent_owner") return "Human participant";
-  return role ? "Room agent" : "Room participant";
+  return speakerRoleLabel(event);
 }
 
 // Incrementally scan the append-only event chain for epoch starts and owner

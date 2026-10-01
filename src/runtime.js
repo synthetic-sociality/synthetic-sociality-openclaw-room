@@ -5,6 +5,7 @@ import {loadState, saveNewState, saveState} from "./state.js";
 import {activateRoomChannel} from "./activation.js";
 import {ROOM_CONNECTOR_PROVENANCE} from "./release-provenance.js";
 import {renewCredential} from "./credential-renewal.js";
+import {speakerName, speakerRoleLabel} from "./speaker.js";
 
 export const OPEN_EXCHANGE_PREAMBLE_VERSION = "Open Exchange – Room Behaviour Preamble v1";
 // Delivery contract P1a: the connector holds no behavioural text. A Room may
@@ -78,7 +79,7 @@ function transcriptActorName(state, item, payload) {
   const member = roster.find((entry) => String(entry?.membershipId ?? "") !== "" && String(entry.membershipId) === String(item?.actorId ?? ""));
   const named = String(member?.displayName ?? payload.actorDisplayName ?? payload.displayName ?? "").trim();
   if (named) return named;
-  return ["participant_agent", "room_master", "observer"].includes(String(item?.actorRole ?? "")) ? "Room agent" : "Room participant";
+  return speakerRoleLabel(item);
 }
 
 // A Room refusal that can never succeed for this frozen post is a terminal
@@ -672,6 +673,7 @@ export class OpenClawRoomRuntime {
         this.pendingEvent = event;
         this.contextPolicyWordLimit = 0;
         this.contextDiscussionStart = null;
+        this.contextSenderName = "";
         const sharedContext = await this.sharedRoomContext(event, pageEpoch, signal);
         const normalized = normalizeEvent(
           event,
@@ -682,6 +684,7 @@ export class OpenClawRoomRuntime {
           this.state.legacySessionEpochId,
           this.contextPolicyWordLimit,
           this.contextDiscussionStart,
+          this.contextSenderName,
         );
         // The model runs while the consumer holds this yield; keep its claimed
         // attempt alive until a terminal outcome is recorded or it returns.
@@ -914,6 +917,7 @@ export class OpenClawRoomRuntime {
     // Delivery contract P1a-5: a cycle seeded by the discussion start presents
     // that start, verbatim and attributed, as the current-turn input.
     this.contextDiscussionStart = discussionStartInput(event, startEvent, state);
+    this.contextSenderName = speakerName(state?.roster, event);
     const roomContext = canonicalRoomContext(state, page?.events, event?.id, policy, sourceEpoch.startsAtSeq, startEvent);
     const library = await this.client.listArtifacts(this.state, signal);
     const artifactContext = await sourceArtifactContext(
@@ -2333,6 +2337,7 @@ export function normalizeEvent(
   legacySessionEpochId = "",
   policyWordLimit = 0,
   discussionStart = null,
+  senderName = "",
 ) {
   const payload = eventPayload(event.payload);
   const actorRole = String(event.actorRole ?? "");
@@ -2352,7 +2357,7 @@ export function normalizeEvent(
       : epochConversationId(roomId, epochId),
     senderId: discussionStart ? discussionStart.authorId : event.actorId,
     senderName: discussionStart ? discussionStart.authorName
-      : payload.actorDisplayName || payload.displayName || event.actorRole || "Room participant",
+      : String(senderName || payload.actorDisplayName || payload.displayName || "").trim() || speakerRoleLabel(event),
     senderKind: discussionStart || actorRole === "human" || actorRole.startsWith("human_") ? "human" : "agent",
     text: cyclePrompt(event, payload, cycleAttempt, sharedContext, policyWordLimit, discussionStart),
     occurredAt: Date.parse(event.ts) || Date.now(),
@@ -2393,10 +2398,12 @@ export function roomTurnFacts({phase = "", cycleAttempt = null, policyWordLimit 
   } else if (phase) {
     lines.push(`Discussion phase: ${phase}`);
   }
-  // With an assigned attempt the cycle budget binds; otherwise the Room policy.
-  const cycleWords = positiveWordLimit(cycleAttempt?.cycle?.budgets?.maxContributionWords);
-  const words = cycleWords || positiveWordLimit(policyWordLimit);
-  if (words) lines.push(`Word limit per response: ${words} (${cycleWords ? "discussion cycle budget" : "Room policy"})`);
+  // With an assigned attempt only the cycle budget binds (the Room enforces it,
+  // not the policy); 0 or none is no cap. Without one, the Room policy.
+  const words = cycleAttempt
+    ? positiveWordLimit(cycleAttempt?.cycle?.budgets?.maxContributionWords)
+    : positiveWordLimit(policyWordLimit);
+  if (words) lines.push(`Word limit per response: ${words} (${cycleAttempt ? "discussion cycle budget" : "Room policy"})`);
   lines.push(ROOM_PASS_ENVELOPE);
   return ["[Room turn facts]", ...lines, "[/Room turn facts]"].join("\n");
 }

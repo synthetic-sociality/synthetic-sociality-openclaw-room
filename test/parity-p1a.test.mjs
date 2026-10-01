@@ -12,7 +12,7 @@ import {
   normalizeEvent, sourceArtifactContext,
 } from "../src/runtime.js";
 import {registerRoomCommands} from "../src/commands.js";
-import {registerRoomHistoryTool} from "../src/history.js";
+import {readRoomHistory, registerRoomHistoryTool} from "../src/history.js";
 
 // Host SDK stand-ins; the tool-error warning marker is host-private metadata,
 // so the stand-in reads a test-only field in its place.
@@ -34,16 +34,10 @@ const conformance = JSON.parse(await readFile(new URL("../conformance.json", imp
 // Room-supplied text: the Open Exchange preamble as an owner would save it.
 const PREAMBLE = await readFile(new URL("./fixtures/open-exchange-preamble/v1.txt", import.meta.url), "utf8");
 const DENY = ["consensus", "common ground", "synthes", "otherwise pass", "only if", "meaningful", "manufacture", "do not repeat", "force", "agree"];
-const ROOM_BLOCKS = [
-  /\[Room phase instruction — server-provided\]\n[\s\S]*?\n\[\/Room phase instruction — server-provided\]/g,
-  /\[Room command [^\]]* — owner instruction\]\n[\s\S]*?\n\[\/Room command [^\]]* — owner instruction\]/g,
-  /\[Active Room guidance — owner-controlled behavioral guidance\]\n[\s\S]*?\n\[\/Active Room guidance\]/g,
-  /\nRecent canonical transcript:[\s\S]*?\n\[\/Canonical Room context\]/g,
-];
-
+// Only the Room's own texts are removed before scanning; every connector line,
+// labels and policy restatements included, is scanned.
 function connectorAuthored(prompt, roomTexts = []) {
   let text = prompt;
-  for (const pattern of ROOM_BLOCKS) text = text.replace(pattern, "\n");
   for (const roomText of roomTexts) text = text.split(roomText).join("");
   return text;
 }
@@ -59,7 +53,13 @@ const STATE = {
   rules: [],
 };
 const TRANSCRIPT = [{id: "m-3", seq: 3, type: "message.posted", actorId: "paula", payload: {body: "Europe needs public compute."}}];
+const TRANSCRIPT_LINES = ["#3 Paula: Europe needs public compute."];
 const context = (state = STATE, policy = {}) => canonicalRoomContext(state, TRANSCRIPT, "current", policy, 1);
+// A Room with owner guidance, every restated policy field and a transcript.
+const RULE = "Seek common ground; agree to disagree; do not force consensus.";
+const POLICY = {policy: {topicDrift: "soft", researchGroundingMode: "time-sensitive", researchMaxSources: 3, researchFreshnessSeconds: 3600}};
+const RICH = () => context({...STATE, rules: [{enforcement: "guidance", text: RULE}]}, POLICY);
+const BODIES = ["What is your view?", "Paula answered.", "Wrap up please.", "Direct question for you.", "Message relayed from another channel."];
 const cycle = ({round = 1, totalTurns = 2, budgetTurns = 6, words} = {}) => ({
   attempt: {id: "attempt-1", round},
   cycle: {id: "cycle-1", generation: 1, totalTurns, budgets: {totalTurns: budgetTurns, perAgentTurns: 3, ...(words ? {maxContributionWords: words} : {})}},
@@ -73,23 +73,27 @@ const build = (event, attempt = null, shared = context(), words = 0) =>
   normalizeEvent(event, "room-1", attempt, shared, "epoch-1", "", words).text;
 
 // Every prompt kind the connector builds, without any Room-supplied instruction.
-function promptKinds({words = 0, cycleWords} = {}) {
+function promptKinds({words = 0, cycleWords, shared = context()} = {}) {
   return {
-    opening: build(human("What is your view?"), cycle({round: 1, words: cycleWords}), context(), words),
-    "follow-up": build(human("Paula answered."), cycle({round: 2, words: cycleWords}), context(), words),
+    opening: build(human("What is your view?"), cycle({round: 1, words: cycleWords}), shared, words),
+    "follow-up": build(human("Paula answered."), cycle({round: 2, words: cycleWords}), shared, words),
     summary: build({...human("Wrap up please."), payload: {body: "Wrap up please.", epochId: "epoch-1", command: {command: "summarize"}}},
-      cycle({round: 1, words: cycleWords}), context(), words),
-    "wrap-up": build(command("summarize"), null, context(), words),
-    "autonomous fallback": build(ready(), cycle({round: 2, words: cycleWords}), context(), words),
-    "human-reply": build(human("Direct question for you."), null, context(), words),
+      cycle({round: 1, words: cycleWords}), shared, words),
+    "wrap-up": build(command("summarize"), null, shared, words),
+    "autonomous fallback": build(ready(), cycle({round: 2, words: cycleWords}), shared, words),
+    "human-reply": build(human("Direct question for you."), null, shared, words),
     // Cross-channel posts carry the agent's own text; the connector frames none.
     "cross-channel": build(human("Message relayed from another channel."), null, "", words),
   };
 }
 
 test("P1a-01 no connector-authored behavioural wording in any prompt", async () => {
-  for (const [kind, prompt] of Object.entries(promptKinds())) {
-    assert.deepEqual(denied(connectorAuthored(prompt)), [], `${kind}: ${prompt}`);
+  const shared = RICH();
+  assert.match(shared, /Topic drift policy: soft\.\nResearch grounding policy: time-sensitive; maximum sources 3; freshness window 3600 seconds\./);
+  const roomTexts = [RULE, ...TRANSCRIPT_LINES, ...BODIES];
+  for (const [kind, prompt] of Object.entries(promptKinds({words: 250, cycleWords: 120, shared}))) {
+    assert.ok(prompt.includes(RULE) || kind === "cross-channel", kind);
+    assert.deepEqual(denied(connectorAuthored(prompt, roomTexts)), [], `${kind}: ${prompt}`);
   }
   // Fixed connector texts that can reach a model.
   const fixed = {
@@ -99,9 +103,20 @@ test("P1a-01 no connector-authored behavioural wording in any prompt", async () 
     documents: await sourceArtifactContext(
       {type: "message.posted", payload: {attachments: [{artifactId: "a", versionId: "v", name: "n"}]}}, [],
       async () => ({currentVersion: {versionId: "v", extractionStatus: "ready", extractedText: "x"}})),
-    researchPolicy: context(STATE, {policy: {researchGroundingMode: "time-sensitive", researchMaxSources: 3, topicDrift: "soft"}})
-      .match(/Topic drift policy:.*|Research grounding policy:.*/g).join("\n"),
   };
+  // The history tool's result as the model receives it, read through the real tool path.
+  const start = {id: "s1", seq: 1, type: "discussion.started", payload: {epoch: {id: "e1", ordinal: 1, startsAtSeq: 1, topic: {title: "T"}}}};
+  const message = {id: "m2", seq: 2, type: "message.posted", actorId: "a", actorRole: "participant_agent", payload: {body: "hello"}};
+  const history = await readRoomHistory({
+    client: {
+      roomState: async () => ({title: "R", headSeq: 2, activeEpoch: {id: "e1", ordinal: 1, startsAtSeq: 1}, roster: []}),
+      listEpochs: async () => ({epochs: [{id: "e1", ordinal: 1, startsAtSeq: 1, status: "active", topicTitle: "T"}]}),
+      readEvents: async (_session, after) => ({events: [start, message].filter((item) => item.seq > after), hasMore: false, headSeq: 2}),
+    },
+    session: {roomId: "room-h", credential: "x"}, args: {}, cache: new Map(),
+  });
+  assert.equal(history.success, true, JSON.stringify(history));
+  fixed["history result"] = JSON.stringify({...history, messages: history.messages.map(({body, ...rest}) => rest)});
   const tools = [];
   registerRoomHistoryTool({registerTool: (tool) => tools.push(tool)});
   const commands = [];
@@ -137,7 +152,7 @@ test("P1a-02 Room phaseInstruction and policy guidance passed verbatim with sour
 
   // Room text keeps its own words; nothing connector-authored surrounds it.
   for (const prompt of [fromReady, fromCycleMessage, fromAsk]) {
-    assert.deepEqual(denied(connectorAuthored(prompt, [PREAMBLE])), [], prompt);
+    assert.deepEqual(denied(connectorAuthored(prompt, [PREAMBLE, guidance, phaseInstruction, ask, ...TRANSCRIPT_LINES, "Paula answered."])), [], prompt);
     assert.equal(prompt.split(phaseInstruction).length - 1, prompt === fromAsk ? 0 : 1, "passed once, unchanged");
   }
 });
@@ -182,12 +197,15 @@ test("P1a-04 pass envelope documented technically without usage advice", () => {
 });
 
 test("P1a-05 policy word limit stated as a number on every turn when set, in open and coordinated modes", async () => {
+  const ATTEMPT_KINDS = ["opening", "follow-up", "summary", "autonomous fallback"];
   for (const [kind, prompt] of Object.entries(promptKinds({words: 250}))) {
-    assert.match(prompt, /Word limit per response: 250 \(Room policy\)/, kind);
+    // An assigned attempt states only its cycle budget; here it has none.
+    if (ATTEMPT_KINDS.includes(kind)) assert.doesNotMatch(prompt, /Word limit/, kind);
+    else assert.match(prompt, /Word limit per response: 250 \(Room policy\)/, kind);
   }
   // With an assigned attempt the cycle budget binds.
   for (const [kind, prompt] of Object.entries(promptKinds({words: 250, cycleWords: 120}))) {
-    const attempt = ["opening", "follow-up", "summary", "autonomous fallback"].includes(kind);
+    const attempt = ATTEMPT_KINDS.includes(kind);
     assert.match(prompt, attempt ? /Word limit per response: 120 \(discussion cycle budget\)/ : /Word limit per response: 250 \(Room policy\)/, kind);
   }
   for (const words of [0, undefined, -5, 2.5]) {
@@ -298,7 +316,7 @@ test("P1a-06 discussion start title and description presented verbatim and attri
   for (const other of [await turn({ready: readyFor("some-message-id")}), await turn({pageEvents: [started]})]) {
     assert.doesNotMatch(other.text, /Discussion started by/);
     assert.doesNotMatch(other.text, /Continue the autonomous discussion/);
-    assert.equal(other.senderName, "system");
+    assert.equal(other.senderName, "Room (system)");
   }
 });
 
@@ -378,6 +396,75 @@ test("P1a-07 host fallback notice is never posted; the model reply is", async ()
   assert.equal(several.results[1].visibleReplySent, true);
   assert.equal(several.results[2].visibleReplySent, false);
   assert.ok(several.logs.some((line) => /Room reply payload not posted: the turn's reply is already posted delivery=final chars=27 source=src-1/.test(line)), several.logs.join("\n"));
+});
+
+test("an assigned attempt states only its cycle word budget, never the policy value", () => {
+  // The Room enforces the cycle budget for an attempt (cycles.go:394), not the policy.
+  const opening = (cycleWords) => build(human("What is your view?"), cycle({round: 1, words: cycleWords}), context(), 250);
+  assert.match(opening(120), /\nWord limit per response: 120 \(discussion cycle budget\)\n/);
+  assert.doesNotMatch(opening(120), /250/);
+  for (const none of [undefined, 0]) assert.doesNotMatch(opening(none), /Word limit/, String(none));
+  const ready0 = build(ready(), {attempt: {id: "a", round: 1}, cycle: {id: "c", totalTurns: 0, budgets: {totalTurns: 4, maxContributionWords: 0}}}, context(), 250);
+  assert.doesNotMatch(ready0, /Word limit/);
+  // Without an assigned attempt the Room policy value is stated.
+  assert.match(build(human("Direct question for you."), null, context(), 250), /Word limit per response: 250 \(Room policy\)/);
+});
+
+test("speaker labels name the real actor and never say Room participant or system", async () => {
+  const roster = [{membershipId: "owner", displayName: "TJ"}, {membershipId: "paula", displayName: "Paula"}];
+  const label = (event, name = "") => normalizeEvent(event, "room-1", null, "", "epoch-1", "", 0, null, name).senderName;
+  assert.equal(label(human("q"), "TJ"), "TJ", "roster name for the actor");
+  assert.equal(label({...human("q"), payload: {body: "q", actorDisplayName: "Tom"}}), "Tom");
+  assert.equal(label(human("q")), "Human participant");
+  assert.equal(label(ready()), "Room (system)");
+  assert.equal(label({...human("q"), actorRole: "participant_agent", actorId: "x"}), "Room agent");
+  assert.equal(label({...human("q"), actorRole: "", actorId: ""}), "Unknown actor");
+
+  // Transcript lines.
+  const transcript = canonicalRoomContext({roster}, [
+    {id: "a", seq: 2, type: "message.posted", actorRole: "human_owner", actorId: "owner", payload: {body: "named"}},
+    {id: "b", seq: 3, type: "message.posted", actorRole: "human_owner", actorId: "stranger", payload: {body: "unnamed human"}},
+    {id: "c", seq: 4, type: "message.posted", actorRole: "system", actorId: "room_coordinator", payload: {body: "notice"}},
+  ], "current", {}, 1);
+  assert.match(transcript, /#2 TJ: named\n#3 Human participant: unnamed human\n#4 Room \(system\): notice/);
+
+  // End to end: the roster name reaches the host's sender label.
+  const runtime = new OpenClawRoomRuntime({accountId: "t", stateFile: "/unused", baseUrl: "https://room.example/api"});
+  runtime.state = {roomId: "room-1", membershipId: "aura", cursor: 0, deliveryIntents: {}, terminalEvidence: {},
+    epochSessionRoutingInitialized: true, legacySessionEpochId: ""};
+  runtime.connectorSession = {sessionId: "s"};
+  runtime.persistState = async () => {};
+  const event = {id: "m-1", seq: 1, type: "message.posted", actorRole: "human_owner", actorId: "owner", payload: {body: "Question", epochId: "epoch-1"}};
+  runtime.client = {
+    readEvents: async () => ({activeEpochId: "epoch-1", activeEpochStartsAtSeq: 1, events: [event]}),
+    roomState: async () => ({headSeq: 1, activeEpoch: {id: "epoch-1", startsAtSeq: 1}, roster, rules: []}),
+    roomPolicy: async () => ({policy: {coordinationMode: "open"}}),
+    listArtifacts: async () => ({items: []}),
+  };
+  runtime.renewAccess = async () => false;
+  runtime.maintainPresence = async () => {};
+  runtime.markContextAcknowledged = async () => {};
+  const controller = new AbortController();
+  const turns = runtime.assignedTurns(controller.signal);
+  const {value} = await turns.next();
+  assert.equal(value.senderName, "TJ");
+  controller.abort();
+  await turns.return();
+
+  // History tool results use the same labels.
+  const start = {id: "s1", seq: 1, type: "discussion.started", payload: {epoch: {id: "e1", ordinal: 1, startsAtSeq: 1, topic: {title: "T"}}}};
+  const system = {id: "m2", seq: 2, type: "message.posted", actorRole: "system", actorId: "room_coordinator", payload: {body: "x"}};
+  const history = await readRoomHistory({
+    client: {
+      roomState: async () => ({title: "R", headSeq: 2, activeEpoch: {id: "e1", ordinal: 1, startsAtSeq: 1}, roster: []}),
+      listEpochs: async () => ({epochs: [{id: "e1", ordinal: 1, startsAtSeq: 1, status: "active", topicTitle: "T"}]}),
+      readEvents: async (_session, after) => ({events: [start, system].filter((item) => item.seq > after), hasMore: false, headSeq: 2}),
+    },
+    session: {roomId: "room-s", credential: "x"}, args: {}, cache: new Map(),
+  });
+  const names = JSON.stringify(history.messages);
+  assert.match(names, /Room \(system\)/);
+  assert.doesNotMatch(names, /Room participant|"system"/);
 });
 
 test("conformance P1a case names resolve to tests in this file", async () => {
