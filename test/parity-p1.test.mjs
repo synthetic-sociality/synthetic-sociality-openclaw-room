@@ -670,3 +670,109 @@ test("a later delivery call never downgrades a recorded quarantine", async () =>
   assert.equal(deliveries, 2);
   assert.deepEqual(calls, {settled: [["fail", {layer: "infrastructure", code: "attempt_timeout"}]], skipped: [], ack: []});
 });
+
+test("a parked replay refused as quarantined is isolated and the next event runs", async () => {
+  const runtime = p1Runtime();
+  runtime.connectorSession = {sessionId: "session-1"};
+  runtime.state.epochSessionRoutingInitialized = true;
+  runtime.state.legacySessionEpochId = "epoch-1";
+  const parked = {id: "human-5", seq: 5, type: "message.posted", actorRole: "human_owner", actorId: "human-1", payload: {body: "q", epochId: "epoch-1"}};
+  const next = {id: "human-6", seq: 6, type: "message.posted", actorRole: "human_owner", actorId: "human-1", payload: {body: "next", epochId: "epoch-1"}};
+  let refusal = new RoomAPIError(503, {code: "busy", retryable: true});
+  const acknowledgements = [];
+  runtime.client = recordingClient({
+    postMessage: async () => { runtime.client.calls.push(["post"]); throw refusal; },
+    readEvents: async () => ({activeEpochId: "epoch-1", activeEpochStartsAtSeq: 1, events: [parked, next]}),
+    acknowledge: async (_state, seq) => { acknowledgements.push(seq); return {acknowledgedSeq: seq}; },
+  });
+  runtime.pendingEvent = parked;
+  await assert.rejects(runtime.postAndFinish({
+    roomId: "room-1", text: BODY, replyToId: "human-5", idempotencyKey: "human-5:final", sourceEventId: "human-5",
+  }), (error) => error.roomDeliveryOutcome === "delivery_pending");
+  runtime.pendingEvent = null;
+  refusal = new RoomAPIError(400, {code: "validation_error", retryable: false});
+  runtime.renewAccess = async () => false;
+  runtime.maintainPresence = async () => {};
+  runtime.markContextAcknowledged = async () => {};
+  runtime.sharedRoomContext = async () => "";
+  const controller = new AbortController();
+  const turns = runtime.assignedTurns(controller.signal);
+  const result = await turns.next();
+  assert.equal(result.value.sourceEventId, "human-6", "the channel keeps running and processes the next event");
+  assert.equal(runtime.state.deliveryIntents["human-5:final"].deliveryState, "quarantined");
+  assert.equal(runtime.client.calls.filter(([kind]) => kind === "post").length, 2, "one replay, no repost");
+  assert.equal(runtime.state.terminalEvidence["5"], undefined);
+  assert.deepEqual(acknowledgements, []);
+  assert.equal(runtime.pendingEvent?.id, "human-6");
+  controller.abort();
+  await turns.return();
+});
+
+test("a renewal-driven release and a channel settle send exactly one complete", async () => {
+  const runtime = p1Runtime();
+  let releaseComplete;
+  runtime.client = recordingClient({
+    claimDiscussionAttempt: async () => { throw new RoomAPIError(409, {code: "cycle_superseded"}); },
+    completeDiscussionAttempt: async (_state, _cycleId, attemptId, request) => {
+      runtime.client.calls.push(["complete", attemptId, structuredClone(request)]);
+      await new Promise((resolve) => { releaseComplete = resolve; });
+      return {};
+    },
+  });
+  runtime.pendingEvent = SOURCE;
+  const cycleAttempt = CYCLE();
+  const lease = runtime.startAttemptLease(SOURCE, cycleAttempt);
+  clearTimeout(lease.timer);
+  lease.timer = null;
+  const renewal = runtime.renewAttemptLease(lease);
+  while (!releaseComplete) await new Promise((resolve) => setImmediate(resolve));
+  const channelSettle = runtime.settleDiscussionAttempt(cycleAttempt, "pass");
+  releaseComplete();
+  await Promise.all([renewal, channelSettle]);
+  assert.deepEqual(runtime.client.calls.filter(([kind]) => kind === "complete").map(([, , request]) => request), [
+    {generation: 3, action: "fail", executionFailure: {layer: "infrastructure", code: "attempt_timeout"}},
+  ]);
+  assert.equal(cycleAttempt.settled, true);
+});
+
+test("a renewal claim that does not answer in time is a failed renewal", async () => {
+  const runtime = p1Runtime();
+  runtime.attemptRenewalTimeoutFloorMs = 50;
+  runtime.client = recordingClient({
+    claimDiscussionAttempt: (_state, _cycleId, signal) => new Promise((_resolve, reject) => {
+      signal.addEventListener("abort", () => reject(signal.reason), {once: true});
+    }),
+  });
+  runtime.pendingEvent = SOURCE;
+  const lease = runtime.startAttemptLease(SOURCE, CYCLE());
+  clearTimeout(lease.timer);
+  lease.timer = null;
+  lease.delayMs = 50;
+  const started = Date.now();
+  // AbortSignal.timeout does not hold the event loop open; the gateway does.
+  const keepAlive = setInterval(() => {}, 1_000);
+  try {
+    assert.equal(await runtime.renewAttemptLease(lease), false);
+  } finally {
+    clearInterval(keepAlive);
+  }
+  assert.ok(Date.now() - started < 5_000, "the claim is bounded by the renewal interval");
+  assert.equal(lease.superseded, true);
+  assert.equal(runtime.state.terminalEvidence["5"].reason, "attempt_renewal_failed");
+  assert.deepEqual(runtime.client.calls.filter(([kind]) => kind === "complete").map(([, , request]) => request.action), ["fail"]);
+});
+
+test("an outbound post superseded by an epoch advance names its reason", async () => {
+  let live;
+  const client = {
+    initialize: async () => ({sessionId: "s"}),
+    assignedTurns: async function* () {
+      await assert.rejects(live.plugin.message.send.text({accountId: "default", to: "room-1", text: "hello"}),
+        {message: "Room did not accept the post: historical_epoch"});
+    },
+    postAndFinish: async () => ({superseded: true}),
+    close: async () => {},
+  };
+  live = createRoomChannel({makeClient: () => client});
+  await live.plugin.gateway.startAccount(channelContext(join(home, "outbound-epoch.json"), async () => {}));
+});

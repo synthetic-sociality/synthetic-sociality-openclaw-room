@@ -39,7 +39,8 @@ newer head; retryable refusals stay `delivery_pending`; anything else is
 quarantined. A refused reply stays in its intent and is never recorded as
 `model_no_visible_reply` or settled as `pass`. Every `fail` carries
 `executionFailure{layer, code}`; a quarantine or lost attempt releases the
-attempt with `infrastructure/attempt_timeout` at once, and the next event runs.
+attempt at once with `infrastructure/attempt_timeout` (`runtime/response_too_large`
+for a `message_too_large` quarantine), and the next event runs.
 Quarantine, skip, supersede and settle each write one log line with code,
 source sequence and attempt id only. The shared error-code list is in
 `conformance.json` (`errorCodes`).

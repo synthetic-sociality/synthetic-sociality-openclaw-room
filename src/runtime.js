@@ -428,6 +428,8 @@ export class OpenClawRoomRuntime {
     // Claimed cycle attempts held alive while their model run is in flight.
     this.attemptLeases = new Map();
     this.parkedRetryDelay = 0;
+    // Lower bound of one renewal claim's timeout; the bound is the renewal interval.
+    this.attemptRenewalTimeoutFloorMs = 5_000;
   }
 
   async initialize(signal) {
@@ -631,6 +633,13 @@ export class OpenClawRoomRuntime {
         try {
           replayed = await this.recoverPendingDelivery(event, signal);
         } catch (error) {
+          if (this.isQuarantinedEvent(event)) {
+            // The replay itself was quarantined: isolate the source, as the
+            // scan does for any quarantined event, and keep the channel running.
+            if (this.pendingEvent?.id === event.id) this.pendingEvent = null;
+            scanCursor = event.seq;
+            continue;
+          }
           if (!this.isParkedDelivery(event)) throw error;
           // A retryable refusal leaves the exact frozen request parked. Wait
           // and re-scan from the same frontier instead of stopping the channel.
@@ -738,6 +747,7 @@ export class OpenClawRoomRuntime {
   scheduleAttemptRenewal(lease) {
     if (lease.stopped || this.closed) return;
     const delay = attemptRenewalDelaySeconds(lease.cycleAttempt.attempt?.leaseExpiresAt) * 1000;
+    lease.delayMs = delay;
     lease.timer = setTimeout(() => {
       lease.timer = null;
       lease.inflight = this.renewAttemptLease(lease)
@@ -753,7 +763,11 @@ export class OpenClawRoomRuntime {
     let refreshed = null;
     let reason = "";
     try {
-      refreshed = await this.client.claimDiscussionAttempt(this.state, String(lease.cycleAttempt.cycle.id), this.heartbeatAbort.signal);
+      // A claim that does not answer within the renewal interval is a failed renewal.
+      const timeout = AbortSignal.timeout(Math.max(this.attemptRenewalTimeoutFloorMs, lease.delayMs ?? 30_000));
+      refreshed = await this.client.claimDiscussionAttempt(
+        this.state, String(lease.cycleAttempt.cycle.id), AbortSignal.any([this.heartbeatAbort.signal, timeout]),
+      );
     } catch (error) {
       reason = error instanceof RoomAPIError && error.code ? error.code : "attempt_renewal_failed";
     }
@@ -1799,6 +1813,19 @@ export class OpenClawRoomRuntime {
   async settleDiscussionAttempt(cycleAttempt, action, signal, executionFailure) {
     if (!cycleAttempt || cycleAttempt.settled) return null;
     if (action !== "pass" && action !== "fail") throw new TypeError(`unsupported attempt outcome: ${action}`);
+    // One complete per attempt: a renewal-driven release and a channel settle
+    // may race; the later caller joins the request already in flight.
+    if (cycleAttempt.settling) return cycleAttempt.settling;
+    const settling = this.settleDiscussionAttemptOnce(cycleAttempt, action, signal, executionFailure);
+    Object.defineProperty(cycleAttempt, "settling", {value: settling, configurable: true, enumerable: false});
+    try {
+      return await settling;
+    } finally {
+      delete cycleAttempt.settling;
+    }
+  }
+
+  async settleDiscussionAttemptOnce(cycleAttempt, action, signal, executionFailure) {
     const lease = this.leaseForAttempt(cycleAttempt);
     if (lease && !lease.stopped) await this.stopAttemptLease(lease.sourceEvent.id);
     const failure = action === "fail" ? executionFailureFor(executionFailure) : null;

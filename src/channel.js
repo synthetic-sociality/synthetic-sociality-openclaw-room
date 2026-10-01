@@ -56,7 +56,8 @@ export function createRoomChannel({makeClient}) {
           resolveRecipientMentions: true,
           signal: ctx.signal,
         });
-        if (sent.skipped || sent.superseded) throw new Error(`Room did not accept the post: ${sent.reason}`);
+        // The epoch-path supersede carries no reason; its evidence says historical_epoch.
+        if (sent.skipped || sent.superseded) throw new Error(`Room did not accept the post: ${sent.reason || (sent.superseded ? "historical_epoch" : "skipped")}`);
         return {messageId: sent.eventId, receipt: receipt(sent.eventId, sent.sentAt)};
       },
     },
