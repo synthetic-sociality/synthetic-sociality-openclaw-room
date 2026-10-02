@@ -18,7 +18,7 @@ import {
   RELEASED_ATTEMPT_EXECUTION_FAILURE,
   statusErrorCode,
 } from "./runtime.js";
-import {BLOCK_MESSAGE, REFUSAL_CODE, scrubDeep, scrubbingLogger, secretIsolationEnforced, storeReachability, toolCallBlock} from "./secret-isolation.js";
+import {BLOCK_MESSAGE, REFUSAL_CODE, agentWorkspace, scrubDeep, scrubbingLogger, secretIsolationEnforced, storeReachability, toolCallBlock} from "./secret-isolation.js";
 import {localStatusFor} from "./local-status.js";
 import {ROOM_CONNECTOR_PROVENANCE} from "./release-provenance.js";
 import {
@@ -109,10 +109,15 @@ function untilAborted(signal) {
 // search root containing it), or a shell call naming it, is refused. A fence
 // error refuses too.
 export function roomToolCallPolicy(api) {
-  return (event) => {
+  return (event, ctx) => {
     try {
       const cfg = api?.runtime?.config?.current?.() ?? api?.config;
-      const reason = toolCallBlock(event?.toolName, event?.params, roomStoreDirectories(cfg), {derivedPaths: event?.derivedPaths});
+      const stateDir = openClawStateDirectory();
+      // Relative paths resolve where the tool runs: the hook context's
+      // workspace or cwd when the host provides one (2026.7.1-2 does not),
+      // else the agent's configured workspace.
+      const cwd = ctx?.workspaceDir || ctx?.cwd || agentWorkspace(cfg, ctx?.agentId, {stateDir});
+      const reason = toolCallBlock(event?.toolName, event?.params, roomStoreDirectories(cfg), {derivedPaths: event?.derivedPaths, cwd, stateDir});
       if (!reason) return undefined;
       api?.logger?.warn?.(`Room connector refused a ${String(event?.toolName ?? "tool")} tool call that reaches its private state`);
       return {block: true, blockReason: reason};
@@ -448,10 +453,16 @@ export function createRoomChannel({makeClient}) {
     description: "Native OpenClaw channel for Synthetic Sociality Rooms",
     plugin,
     registerFull: (api) => {
+      // Contract P2c-4: the gateway's status file exists from load; the host
+      // stop marks the plugin unloaded. Only the gateway's full registration,
+      // never a CLI discovery pass.
+      const gatewayLoad = api?.registrationMode === "full";
+      if (gatewayLoad) roomLocalStatus(api?.logger).setLoaded(true);
       // Contract P2c-1: fence the store in every session, and scrub results.
       if (typeof api?.on === "function") {
         api.on("before_tool_call", roomToolCallPolicy(api), {priority: 1000});
         api.on("tool_result_persist", roomToolResultScrub);
+        if (gatewayLoad) api.on("gateway_stop", () => { roomLocalStatus(api?.logger).setLoaded(false); });
       } else {
         api?.logger?.warn?.("Room connector: this OpenClaw host offers no tool hooks; the start gate still applies");
       }

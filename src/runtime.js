@@ -598,6 +598,8 @@ export class OpenClawRoomRuntime {
           account: this.account, client: this.client, signal: renewalSignal});
         if (changed) {
           this.client.credential = this.state.credential;
+          // Contract P2c-1: the renewed credential is scrubbed too.
+          rememberSecrets(this.state);
           if (this.connectorSession) await this.registerConnector(signal);
         }
         return changed;
@@ -1207,6 +1209,11 @@ export class OpenClawRoomRuntime {
       const epochId = String(intent?.identity?.sourceEpochId || intent?.identity?.initialEpochId || "");
       if (!text || !answered || !epochId || reason === "stale_epoch" || reason === "historical_epoch") return;
       if (text.length > KEPT_REPLY_CHARACTER_LIMIT) {
+        // Latest wins: an older kept reply is not offered in its place.
+        if (this.state.keptReply) {
+          delete this.state.keptReply;
+          await this.persistState();
+        }
         this.logger?.info?.(`Room reply not kept ${outcomeLogFields({code: "late_reply_too_large", sourceSeq: "", attemptId: intent?.identity?.cycle?.attemptId})}`);
         return;
       }

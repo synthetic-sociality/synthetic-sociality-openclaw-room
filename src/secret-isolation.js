@@ -27,11 +27,10 @@ export const REFUSAL_CODE = "secret_store_reachable";
 // The per-installation switch: off reports and keeps running, on refuses.
 export const ENFORCEMENT_SETTING = "enforceSecretIsolation";
 
-// The installation's switch, read from the plugin's own config entry.
+// The installation's switch, read from the plugin's own config entry. The
+// manifest declares it boolean; only boolean true enables enforcement.
 export function secretIsolationEnforced(cfg, pluginId = "synthetic-sociality-room") {
-  const value = cfg?.plugins?.entries?.[pluginId]?.config?.[ENFORCEMENT_SETTING];
-  if (typeof value === "string") return ["1", "true", "yes", "on"].includes(value.trim().toLowerCase());
-  return value === true;
+  return cfg?.plugins?.entries?.[pluginId]?.config?.[ENFORCEMENT_SETTING] === true;
 }
 export const BLOCK_MESSAGE = "Blocked by the Synthetic Sociality Room connector: its private state holds the Room credential and is not available to agent tools.";
 export const REDACTED = "[redacted Room credential]";
@@ -149,14 +148,57 @@ function* pathCandidates(toolName, params, derivedPaths) {
 }
 
 // The block reason for a tool call that would reach the store, else null.
-export function toolCallBlock(toolName, params, storeDirectories, {cwd = process.cwd(), derivedPaths} = {}) {
+// The ways a command can name the store itself: its absolute and resolved
+// path, and the same path written from ~, $HOME or $OPENCLAW_STATE_DIR. The
+// bare directory name is not one: a plugin directory or a command argument
+// naming the plugin is not the store.
+export function storeSpellings(storeDirectories, {stateDir = "", home = homedir()} = {}) {
+  const paths = new Set();
+  for (const item of storeDirectories.filter(Boolean)) {
+    paths.add(resolve(expandHome(item, home)));
+    paths.add(resolvedPath(item));
+  }
+  const prefixes = [[home, ["~", "$HOME", "${HOME}"]]];
+  if (stateDir) for (const root of new Set([resolve(stateDir), resolvedPath(stateDir)])) prefixes.push([root, ["$OPENCLAW_STATE_DIR", "${OPENCLAW_STATE_DIR}"]]);
+  const spellings = new Set(paths);
+  for (const path of paths) {
+    for (const [root, names] of prefixes) {
+      const base = String(root).replace(/[/\\]+$/, "");
+      if (base && path.startsWith(`${base}${sep}`)) for (const name of names) spellings.add(`${name}${path.slice(base.length)}`);
+    }
+  }
+  spellings.delete("/");
+  return [...spellings].filter(Boolean);
+}
+
+// The workspace an agent's relative tool paths resolve against, as the host
+// resolves it (resolveAgentWorkspaceDir): the agent's workspace, else the
+// defaults' workspace (joined with the id for a non-default agent), else
+// <stateDir>/workspace or <stateDir>/workspace-<id>.
+export function agentWorkspace(cfg, agentId, {stateDir = "", home = homedir()} = {}) {
+  const list = Array.isArray(cfg?.agents?.list) ? cfg.agents.list.filter((item) => item && typeof item === "object") : [];
+  const id = String(agentId ?? "").trim().toLowerCase() || "main";
+  const configured = list.find((agent) => String(agent.id ?? "").trim().toLowerCase() === id)?.workspace;
+  if (typeof configured === "string" && configured.trim()) return resolve(expandHome(configured.trim(), home));
+  const defaultId = String((list.find((agent) => agent.default) ?? list[0])?.id ?? "main").trim().toLowerCase() || "main";
+  const fallback = typeof cfg?.agents?.defaults?.workspace === "string" ? cfg.agents.defaults.workspace.trim() : "";
+  if (id === defaultId) return fallback ? resolve(expandHome(fallback, home)) : join(stateDir, "workspace");
+  return fallback ? join(resolve(expandHome(fallback, home)), id) : join(stateDir, `workspace-${id}`);
+}
+
+export function toolCallBlock(toolName, params, storeDirectories, {cwd = process.cwd(), derivedPaths, stateDir = ""} = {}) {
   const name = String(toolName ?? "").toLowerCase();
   const stores = storeDirectories.filter(Boolean).map((item) => resolvedPath(item));
   if (SHELL_TOOLS.has(name)) {
     // Backstop only: a command string cannot be fenced reliably. The start
     // gate keeps shell tools denied or sandboxed away from the store.
-    const names = [STORE_DIRECTORY_NAME, ...stores];
+    const names = storeSpellings(storeDirectories, {stateDir});
     for (const text of stringLeaves(params)) if (names.some((item) => text.includes(item))) return BLOCK_MESSAGE;
+  }
+  // A search without a path searches its cwd.
+  if (SEARCH_TOOLS.has(name) && !String(params?.path ?? params?.cwd ?? params?.dir ?? "").trim()) {
+    const root = resolvedPath(cwd);
+    if (stores.some((store) => within(store, root))) return BLOCK_MESSAGE;
   }
   for (const candidate of pathCandidates(name, params, derivedPaths)) {
     if (!candidate) continue;

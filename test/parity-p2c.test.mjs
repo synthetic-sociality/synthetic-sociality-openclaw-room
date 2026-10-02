@@ -5,6 +5,7 @@
 import assert from "node:assert/strict";
 import test, {after} from "node:test";
 import {execFile} from "node:child_process";
+import {randomBytes} from "node:crypto";
 import {readFileSync} from "node:fs";
 import {mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile} from "node:fs/promises";
 import {hostname, tmpdir} from "node:os";
@@ -37,7 +38,8 @@ await mkdir(join(STORE, "accounts"), {recursive: true, mode: 0o700});
 const {createRoomChannel, roomToolCallPolicy, roomToolResultScrub, resetSecretRefusalLog} = await import("../src/channel.js");
 const {OpenClawRoomRuntime, HOST_LABEL, KEPT_REPLY_CHARACTER_LIMIT, keptReplyBlock} = await import("../src/runtime.js");
 const {RoomAPIError} = await import("../src/room-client.js");
-const {validateState} = await import("../src/state.js");
+const {loadState, saveState, validateState} = await import("../src/state.js");
+const {renewCredential} = await import("../src/credential-renewal.js");
 const isolation = await import("../src/secret-isolation.js");
 const {LocalStatus, STATUS_SCHEMA, resetLocalStatusWriters} = await import("../src/local-status.js");
 
@@ -158,14 +160,15 @@ test("P2c-01 the credential is not readable through the agent's tools and never 
   if (!hostRoot) t.diagnostic("installed host 2026.7.1-2 unavailable; host proof skipped");
   else {
     const fenced = await hostToolCall(hostRoot, stateDir, stateFile, notes);
-    assert.deepEqual(fenced.hooks, ["before_tool_call", "inbound_claim", "tool_result_persist"]);
-    for (const label of ["readStore", "bashStore"]) {
+    assert.deepEqual(fenced.hooks, ["before_tool_call", "gateway_stop", "inbound_claim", "tool_result_persist"]);
+    for (const label of ["readStore", "bashStore", "readStoreRelative"]) {
       assert.match(JSON.stringify(fenced[label]), /not available to agent tools/, label);
       assert.doesNotMatch(JSON.stringify(fenced[label]), new RegExp(FAKE_CREDENTIAL), label);
     }
     assert.equal(fenced.readOther.text.trim(), "an ordinary file");
     const control = await hostToolCall(hostRoot, stateDir, stateFile, notes, {control: true});
     assert.match(control.readStore.text, new RegExp(FAKE_CREDENTIAL), "control: the host alone would return the credential");
+    assert.match(control.readStoreRelative.text, new RegExp(FAKE_CREDENTIAL), "control: also by a workspace-relative path");
   }
 
   // 2. The fence itself, in every session.
@@ -179,17 +182,36 @@ test("P2c-01 the credential is not readable through the agent's tools and never 
     ["edit", {path: stateFile, oldText: "a", newText: "b"}],
     ["apply_patch", {input: `*** Begin Patch\n*** Update File: ${stateFile}\n@@\n-a\n+b\n*** End Patch`}],
     ["grep", {path: home, pattern: "credential"}],
-    ["exec", {command: "cd ~/.openclaw && cat synthetic-sociality-room/accounts/*.json"}],
+    ["exec", {command: "cat $OPENCLAW_STATE_DIR/synthetic-sociality-room/accounts/*.json"}],
+    ["exec", {command: "cat ${OPENCLAW_STATE_DIR}/synthetic-sociality-room/accounts/zurie.json"}],
     ["process", {action: "spawn", command: `tail -f ${stateFile}`}],
+    // Relative to the agent's workspace (<stateDir>/workspace), not the gateway cwd.
+    ["read", {path: "../synthetic-sociality-room/accounts/x.json"}],
   ];
+  const mainAgent = {agentId: "main"};
   for (const [toolName, params] of refused) {
-    const verdict = policy({toolName, params});
+    const verdict = policy({toolName, params}, mainAgent);
     assert.equal(verdict?.block, true, `${toolName} ${JSON.stringify(params).slice(0, 60)}`);
     assert.doesNotMatch(verdict.blockReason, new RegExp(FAKE_CREDENTIAL));
   }
   assert.equal(policy({toolName: "read", params: {path: notes}}), undefined);
-  assert.equal(policy({toolName: "read", params: {path: "relative/notes.md"}}), undefined);
+  assert.equal(policy({toolName: "read", params: {path: "relative/notes.md"}}, mainAgent), undefined);
   assert.equal(policy({toolName: "web_fetch", params: {url: "https://example.com/a/b"}}), undefined);
+  // The shell backstop matches the store, not the plugin's name.
+  for (const command of ["ls ~/.openclaw/plugins/synthetic-sociality-room", "hermes plugins update synthetic-sociality-room",
+    "openclaw plugins inspect synthetic-sociality-room", "ls $OPENCLAW_STATE_DIR/extensions/synthetic-sociality-room"]) {
+    assert.equal(policy({toolName: "exec", params: {command}}, mainAgent), undefined, command);
+  }
+  // Relative paths: the hook context's workspace when the host gives one,
+  // else the agent's workspace (non-default agents: <stateDir>/workspace-<id>).
+  const listed = {...ISOLATED_HOST_CONFIG, agents: {list: [{id: "main", default: true}, {id: "zurie"}]}};
+  const listedPolicy = roomToolCallPolicy({config: listed, logger: {warn: () => {}}});
+  assert.equal(listedPolicy({toolName: "read", params: {path: "../synthetic-sociality-room/accounts/x.json"}}, {agentId: "zurie"})?.block, true);
+  assert.equal(policy({toolName: "read", params: {path: "synthetic-sociality-room/accounts/x.json"}}, {workspaceDir: stateDir})?.block, true);
+  assert.equal(policy({toolName: "read", params: {path: "synthetic-sociality-room/accounts/x.json"}}, mainAgent), undefined);
+  // A search without a path searches its cwd.
+  assert.equal(policy({toolName: "grep", params: {pattern: "credential"}}, {workspaceDir: stateDir})?.block, true);
+  assert.equal(policy({toolName: "grep", params: {pattern: "credential"}}, mainAgent), undefined);
   // A fence error refuses.
   const broken = policy({get toolName() { throw new Error("boom"); }, params: {}});
   assert.equal(broken.block, true);
@@ -252,7 +274,11 @@ test("P2c-01 the credential is not readable through the agent's tools and never 
   assert.match(reports[0], /reporting only/);
   assert.deepEqual([reporting.written.secretStore, reporting.written.secretStoreReasons, reporting.written.secretIsolationEnforced],
     ["reachable", ["fs_tools_unfenced", "host_shell_tools"], false]);
-  for (const cfg of [enforcing, {plugins: {entries: {"synthetic-sociality-room": {config: {enforceSecretIsolation: "true"}}}}}]) {
+  // Only boolean true enables enforcement (the manifest declares a boolean).
+  const stringly = await startOnce({plugins: {entries: {"synthetic-sociality-room": {config: {enforceSecretIsolation: "true"}}}}});
+  assert.equal(stringly.made, 2);
+  assert.equal(stringly.written.secretIsolationEnforced, false);
+  for (const cfg of [enforcing]) {
     const refused = await startOnce(cfg);
     assert.equal(refused.made, 0, "enforced: no client");
     assert.equal(refused.first.lastError, "secret_store_reachable");
@@ -287,7 +313,22 @@ test("P2c-01 the credential is not readable through the agent's tools and never 
   const turn = await firstTurn(runtime);
   assert.doesNotMatch(JSON.stringify({text: turn.text, raw: turn.raw}), new RegExp(FAKE_CREDENTIAL));
 
-  // 5. No plugin module places anything in the environment tools inherit.
+  // 5. A renewed credential is scrubbed: the real renewal path journals and
+  // swaps through saveState, which registers each secret it writes.
+  isolation.forgetSecrets();
+  const renewal = await renewalFixture();
+  assert.equal(await renewCredential(renewal), true);
+  for (const secret of [renewal.replacement(), renewal.grantSecret()]) {
+    assert.ok(secret && secret.length >= 16);
+    assert.equal(isolation.scrub(`export X=${secret}`), `export X=${isolation.REDACTED}`);
+  }
+  isolation.forgetSecrets();
+  // A state read from disk (a renewal by another process) registers it too.
+  await loadState(renewal.stateFile);
+  assert.equal(isolation.scrub(renewal.replacement()), isolation.REDACTED);
+  isolation.forgetSecrets();
+
+  // 6. No plugin module places anything in the environment tools inherit.
   for (const name of await readdir(join(root, "src"))) {
     const source = await readFile(join(root, "src", name), "utf8");
     assert.doesNotMatch(source, /process\.env(\.\w+|\[[^\]]+\])\s*=[^=]|Object\.assign\(process\.env/, name);
@@ -322,9 +363,15 @@ test("P2c-02 a late reply is offered once as a fact with its kept text and then 
   // Bounded: one per Room, the latest wins; an over-long reply is not kept.
   await stale.keepLateReply({identity: {body: "first", replyToId: "m-1", sourceEpochId: "epoch-z"}}, "turn_expired");
   await stale.keepLateReply({identity: {body: "second", replyToId: "m-2", sourceEpochId: "epoch-z"}}, "cycle_superseded");
-  await stale.keepLateReply({identity: {body: "x".repeat(KEPT_REPLY_CHARACTER_LIMIT + 1), replyToId: "m-3", sourceEpochId: "epoch-z"}}, "turn_expired");
   assert.deepEqual([stale.state.keptReply.sourceEventId, stale.state.keptReply.text], ["m-2", "second"]);
-  for (const broken of [{text: "x"}, {...stale.state.keptReply, text: ""}, {...stale.state.keptReply, sourceSeq: "5"}]) {
+  const second = {...stale.state.keptReply};
+  // Latest wins even when the latest is too long to keep: the older kept
+  // reply is cleared, never offered in its place.
+  await stale.keepLateReply({identity: {body: "x".repeat(KEPT_REPLY_CHARACTER_LIMIT + 1), replyToId: "m-3", sourceEpochId: "epoch-z"}}, "turn_expired");
+  assert.equal(stale.state.keptReply, undefined);
+  assert.ok(stale.logs.some((line) => /Room reply not kept code=late_reply_too_large/.test(line)));
+  validateState({...stale.state, keptReply: second});
+  for (const broken of [{text: "x"}, {...second, text: ""}, {...second, sourceSeq: "5"}]) {
     assert.throws(() => validateState({...stale.state, keptReply: broken}), /kept reply is invalid/);
   }
 
@@ -364,7 +411,66 @@ test("P2c-02 a late reply is offered once as a fact with its kept text and then 
   assert.equal(other.state.keptReply, undefined);
 });
 
+// The renewal flow of credential-renewal.test.mjs, reduced: the real
+// renewCredential generates the grant secret and the replacement credential.
+async function renewalFixture() {
+  const stateFile = join(await mkdtemp(join(home, "renew-")), "state.json");
+  const state = {version: 1, baseUrl: "https://room.example/api", roomId: "room-1", membershipId: "member-1",
+    clientInstanceId: "instance-1", credential: "expired-base-credential", credentialExpiresAt: "2020-01-01T00:00:00Z",
+    cursor: 7, terminalEvidence: {}, deliveryIntents: {}};
+  await saveState(stateFile, state);
+  const request = {roomId: "room-1", membershipId: "member-1", displayName: "An agent", identityVersion: 2,
+    baseCredentialGeneration: 1, requestId: randomBytes(32).toString("base64url"), deliveredSeq: 9, acknowledgedSeq: 7, state: "owner_requested",
+    expiresAt: new Date(Date.now() + 60_000).toISOString()};
+  const proof = {...request, grantId: "grant-1", credentialExpiresAt: "2030-01-01T00:00:00Z"};
+  let replacement = "", grantSecret = "", confirmed = false;
+  const client = {
+    credentialRenewalIntent: async () => ({request: confirmed ? null : request}),
+    roomState: async () => ({roomId: "room-1", roster: [proof]}),
+    requestCredentialRenewal: async () => {
+      grantSecret = (await loadState(stateFile)).credentialRotation.grantSecret;
+      return {...request, state: "issued", grantId: "grant-1"};
+    },
+    redeemCredentialRenewal: async (_session, _grantId, body) => { replacement = body.replacementCredential; return proof; },
+    verifyCredentialRenewal: async () => proof,
+    confirmCredentialRenewal: async () => {
+      confirmed = true;
+      return {id: "event-1", type: "credential.renewed", payload: {membershipId: "member-1", credentialGeneration: 2, credentialExpiresAt: proof.credentialExpiresAt}};
+    },
+  };
+  return {state, stateFile, client, replacement: () => replacement, grantSecret: () => grantSecret};
+}
+
 test("P2c-03 after network loss and session expiry the connector reconnects without a restart", async () => {
+  // The Room says no active session while its heartbeat is accepted and
+  // nothing failed before: the enrollment check alone makes the runtime
+  // register again (Wu and Real logged this check every 70 s).
+  {
+    const sessions = ["session-stored"];
+    const enrollments = [];
+    const runtime = roomRuntime([message(2964, "paula", "participant_agent", "Quiet.")]);
+    delete runtime.maintainPresence;
+    runtime.publishPresence = async () => {};
+    runtime.connectorSession = {sessionId: "session-stored"};
+    runtime.account.stateFile = join(home, "p2c-03-enrollment.json");
+    Object.assign(runtime.client, {
+      heartbeat: async () => ({leaseExpiresAt: "2099-01-01T00:00:00Z"}),
+      register: async () => { sessions.push(`session-${sessions.length + 1}`); return {sessionId: sessions.at(-1), capabilities: []}; },
+      connectorEnrollments: async () => {
+        if (sessions.length === 1) {
+          enrollments.push("not_active");
+          throw new RoomAPIError(401, {code: "connector_not_active", retryable: true});
+        }
+        enrollments.push("ok");
+        return [];
+      },
+    });
+    await runtime.maintainPresence();
+    await runtime.maintainPresence();
+    assert.deepEqual(enrollments, ["not_active", "ok"]);
+    assert.deepEqual(sessions, ["session-stored", "session-2"]);
+    assert.equal(runtime.connectorSession.sessionId, "session-2");
+  }
   // Wu and Real, Mac128, 2026-10-02: after a network loss the Room had no
   // live session for the installation; the connector logged that every 70 s
   // until a gateway restart. Here: the event read drops, heartbeats fail, then
@@ -486,6 +592,29 @@ test("P2c-04 local status reports load, version, connection and last error witho
   const last = JSON.parse(await readFile(path, "utf8"));
   assert.equal(last.pluginLoaded, false);
   assert.equal(last.rooms["room-1"].lastErrorCode, "unknown_error");
+});
+
+test("P2c-04 local status reports load, version, connection and last error without secrets or bodies (load and stop)", async () => {
+  // Part of P2c-04 (OP-12 F6): created when the gateway loads the plugin,
+  // pluginLoaded false when the host stops; a CLI discovery pass writes nothing.
+  const statusFile = join(STORE, "status.json");
+  const register = async (registrationMode) => {
+    resetLocalStatusWriters();
+    await rm(statusFile, {force: true});
+    const hooks = {};
+    const api = new Proxy({registrationMode, config: ISOLATED_HOST_CONFIG, logger: {info() {}, warn() {}, error() {}},
+      on(name, handler) { hooks[name] = handler; }}, {get: (target, property) => (property in target ? target[property] : () => undefined)});
+    createRoomChannel({makeClient: () => null}).registerFull(api);
+    return hooks;
+  };
+  const hooks = await register("full");
+  const loaded = JSON.parse(await readFile(statusFile, "utf8"));
+  assert.deepEqual([loaded.pluginLoaded, loaded.plugin, loaded.version, loaded.hostLabel], [true, "openclaw", packageJson.version, HOST_LABEL]);
+  assert.equal(typeof hooks.gateway_stop, "function");
+  await hooks.gateway_stop();
+  assert.equal(JSON.parse(await readFile(statusFile, "utf8")).pluginLoaded, false);
+  await register("tool-discovery");
+  await assert.rejects(readFile(statusFile, "utf8"), /ENOENT/);
 });
 
 test("P2c-05 the reported host label comes from the current machine", async () => {

@@ -3,6 +3,7 @@ import {open, readFile, rename, mkdir, chmod, lstat, link, unlink} from "node:fs
 import {dirname, join, resolve} from "node:path";
 import {homedir} from "node:os";
 import {validateRenewalJournal} from "./credential-renewal.js";
+import {rememberSecrets} from "./secret-isolation.js";
 
 export function openClawStateDirectory({env = process.env, home = homedir()} = {}) {
   const configured = String(env.OPENCLAW_STATE_DIR ?? "").trim();
@@ -23,12 +24,18 @@ export async function loadState(path) {
   if ((stat.mode & 0o077) !== 0) throw new Error("Room state file permissions must be 0600");
   const value = JSON.parse(await readFile(path, "utf8"));
   validateState(value);
+  // Contract P2c-1: every credential this process reads (including one a
+  // renewal wrote) is scrubbed from tool results and logs.
+  rememberSecrets(value);
   return value;
 }
 
 const stateWrites = new Map();
 
 export function saveState(path, value) {
+  // Contract P2c-1: a credential or renewal-journal secret is registered for
+  // scrubbing before it is written.
+  rememberSecrets(value);
   const key = resolve(path);
   const previous = stateWrites.get(key) ?? Promise.resolve();
   const operation = previous.catch(() => {}).then(() => replaceState(path, value));

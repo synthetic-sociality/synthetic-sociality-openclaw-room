@@ -4,7 +4,7 @@
 // wrapped by the host's before_tool_call wrapper, against the Room store.
 // Run in a child process (the host installs process-wide hooks).
 // Usage: node host-tool-call.mjs HOST_ROOT ENTRY STATE_DIR STATE_FILE OTHER_FILE CONFIG_JSON
-import {readdirSync, readFileSync} from "node:fs";
+import {mkdirSync, readdirSync, readFileSync} from "node:fs";
 import {join} from "node:path";
 import {pathToFileURL} from "node:url";
 
@@ -74,8 +74,11 @@ hooks.pick("initializeGlobalHookRunner")({typedHooks, hooks: [], plugins: [], to
 
 const context = {agentId: "main", sessionKey: "agent:main:telegram:direct:owner", sessionId: "session-1", runId: "run-1", config};
 const wrap = (tool) => wrapper.pick("wrapToolWithBeforeToolCallHook")(tool, context);
-const read = wrap(tools.pick("createReadTool")(stateDir));
-const bash = wrap(tools.pick("createBashTool")(stateDir));
+// The tools run in the default agent's workspace, as the host creates them.
+const workspace = join(stateDir, "workspace");
+mkdirSync(workspace, {recursive: true});
+const read = wrap(tools.pick("createReadTool")(workspace));
+const bash = wrap(tools.pick("createBashTool")(workspace));
 
 async function attempt(label, tool, params) {
   try {
@@ -90,4 +93,6 @@ async function attempt(label, tool, params) {
 await attempt("readStore", read, {path: stateFile});
 await attempt("readOther", read, {path: otherFile});
 await attempt("bashStore", bash, {command: `cat ${stateFile}`});
+// The same file named relative to the workspace.
+await attempt("readStoreRelative", read, {path: `../synthetic-sociality-room/accounts/${stateFile.split("/").at(-1)}`});
 console.log(JSON.stringify(result));
