@@ -144,7 +144,11 @@ test("P1-01 lease renewed while model runs; post after re-claim", async () => {
 test("P1-02 re-claim failure supersedes without post", async () => {
   const cases = [
     ["renewal refused", async (runtime, lease) => runtime.renewAttemptLease(lease), {code: "cycle_superseded"}, "cycle_superseded"],
-    ["renewal unreachable", async (runtime, lease) => runtime.renewAttemptLease(lease), new Error("socket hang up"), "attempt_renewal_failed"],
+    // Unreachable is transient: retried within the lease, lost once it has run out (P1-1).
+    ["renewal unreachable until the lease runs out", async (runtime, lease) => {
+      await runtime.renewAttemptLease(lease);
+      while (!lease.superseded) await new Promise((resolve) => setTimeout(resolve, 10));
+    }, new Error("socket hang up"), "attempt_renewal_failed"],
     ["renewal returns another attempt", async (runtime, lease) => runtime.renewAttemptLease(lease), "other", "attempt_superseded"],
     ["pre-post re-claim refused", async () => {}, {code: "cycle_no_attempt", retryable: true}, "cycle_no_attempt"],
   ];
@@ -159,7 +163,9 @@ test("P1-02 re-claim failure supersedes without post", async () => {
       },
     });
     runtime.pendingEvent = SOURCE;
+    runtime.attemptRenewalRetryMs = 20;
     const cycleAttempt = CYCLE();
+    if (refusal instanceof Error) cycleAttempt.attempt.leaseExpiresAt = new Date(Date.now() + 200).toISOString();
     const lease = runtime.startAttemptLease(SOURCE, cycleAttempt);
     await during(runtime, lease);
     const result = await cyclePost(runtime, cycleAttempt);
@@ -736,28 +742,32 @@ test("a renewal-driven release and a channel settle send exactly one complete", 
   assert.equal(cycleAttempt.settled, true);
 });
 
-test("a renewal claim that does not answer in time is a failed renewal", async () => {
+test("a renewal claim that does not answer in time is retried, then lost when the lease runs out", async () => {
   const runtime = p1Runtime();
-  runtime.attemptRenewalTimeoutFloorMs = 50;
+  runtime.attemptRenewalRequestTimeoutMs = 50;
+  runtime.attemptRenewalRetryMs = 20;
   runtime.client = recordingClient({
     claimDiscussionAttempt: (_state, _cycleId, signal) => new Promise((_resolve, reject) => {
       signal.addEventListener("abort", () => reject(signal.reason), {once: true});
     }),
   });
   runtime.pendingEvent = SOURCE;
-  const lease = runtime.startAttemptLease(SOURCE, CYCLE());
+  const cycleAttempt = CYCLE();
+  cycleAttempt.attempt.leaseExpiresAt = new Date(Date.now() + 400).toISOString();
+  const lease = runtime.startAttemptLease(SOURCE, cycleAttempt);
   clearTimeout(lease.timer);
   lease.timer = null;
-  lease.delayMs = 50;
   const started = Date.now();
   // AbortSignal.timeout does not hold the event loop open; the gateway does.
   const keepAlive = setInterval(() => {}, 1_000);
   try {
     assert.equal(await runtime.renewAttemptLease(lease), false);
+    assert.equal(lease.superseded, false, "one unanswered claim does not lose a valid lease");
+    while (!lease.superseded && Date.now() - started < 5_000) await new Promise((resolve) => setTimeout(resolve, 10));
   } finally {
     clearInterval(keepAlive);
   }
-  assert.ok(Date.now() - started < 5_000, "the claim is bounded by the renewal interval");
+  assert.ok(Date.now() - started < 5_000, "each claim is bounded by the request timeout");
   assert.equal(lease.superseded, true);
   assert.equal(runtime.state.terminalEvidence["5"].reason, "attempt_renewal_failed");
   assert.deepEqual(runtime.client.calls.filter(([kind]) => kind === "complete").map(([, , request]) => request.action), ["fail"]);
@@ -776,4 +786,54 @@ test("an outbound post superseded by an epoch advance names its reason", async (
   };
   live = createRoomChannel({makeClient: () => client});
   await live.plugin.gateway.startAccount(channelContext(join(home, "outbound-epoch.json"), async () => {}));
+});
+
+test("a transient renewal failure within the lease is retried and the turn is posted (canary 2026-10-02 07:48)", async () => {
+  // Live sequence, Zurie attempt 06wh3u60zhz5jnm: claim ok, first renewal ok,
+  // second renewal failed client-side (no request reached the Room) and
+  // superseded a 120 s lease that still had about 60 s left. Now: logged with
+  // its real error, retried, renewed, and the reply is posted.
+  const runtime = p1Runtime();
+  const warnings = [];
+  runtime.logger = {info: () => {}, warn: (line) => warnings.push(line), error: (line) => warnings.push(line)};
+  runtime.attemptRenewalRetryMs = 20;
+  const outcomes = ["ok", "fetch failed", "ok", "fetch failed", "ok", "ok"];
+  runtime.client = recordingClient({
+    claimDiscussionAttempt: async (_state, cycleId, signal) => {
+      assert.ok(signal instanceof AbortSignal, "every claim is bounded");
+      const outcome = outcomes.shift();
+      runtime.client.calls.push(["claim", outcome]);
+      if (outcome !== "ok") throw new TypeError(outcome, {cause: Object.assign(new Error("other side closed"), {code: "UND_ERR_SOCKET"})});
+      const attempt = CYCLE();
+      return {cycle: attempt.cycle, attempt: attempt.attempt};
+    },
+  });
+  runtime.pendingEvent = SOURCE;
+  const cycleAttempt = CYCLE();
+  const lease = runtime.startAttemptLease(SOURCE, cycleAttempt);
+  clearTimeout(lease.timer);
+  lease.timer = null;
+  assert.equal(await runtime.renewAttemptLease(lease), true, "first renewal");
+  clearTimeout(lease.timer);
+  lease.timer = null;
+  assert.equal(await runtime.renewAttemptLease(lease), false, "second renewal fails");
+  assert.equal(lease.superseded, false, "a valid lease is not lost to one failure");
+  assert.equal(runtime.state.terminalEvidence?.["5"], undefined);
+  assert.ok(lease.timer, "a retry is scheduled within the lease");
+  while (lease.inflight === null && runtime.client.calls.length < 3) await new Promise((resolve) => setTimeout(resolve, 5));
+  await lease.inflight;
+  assert.deepEqual(runtime.client.calls.map(([, outcome]) => outcome), ["ok", "fetch failed", "ok"]);
+  assert.equal(lease.superseded, false);
+  // The pre-post re-claim follows the same rule: one transient failure, then ok.
+  const receipt = await cyclePost(runtime, cycleAttempt);
+  assert.equal(receipt.eventId, "posted-6");
+  assert.deepEqual(runtime.client.calls.slice(3).map(([kind, outcome]) => (kind === "claim" ? `claim:${outcome}` : kind)),
+    ["claim:fetch failed", "claim:ok", "post", "complete"]);
+  assert.equal(runtime.state.deliveryIntents[`${SOURCE.id}:final`].deliveryState, "posted");
+  // Each failure is logged with the real error, never a body.
+  assert.equal(warnings.length, 2, warnings.join("\n"));
+  for (const line of warnings) {
+    assert.match(line, /^Room attempt renewal failed code=attempt_(renewal|reclaim)_failed sourceSeq=5 attempt=attempt-1 error=TypeError cause=UND_ERR_SOCKET transient; lease remaining \d+ms$/u);
+    assert.ok(!line.includes(BODY));
+  }
 });

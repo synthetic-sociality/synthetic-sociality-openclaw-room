@@ -141,6 +141,14 @@ export function attemptRenewalDelaySeconds(leaseExpiresAt, now = Date.now()) {
   return Math.max(1, Math.min(30, (Date.parse(leaseExpiresAt) - now) / 3000));
 }
 
+// Milliseconds left on a held attempt's lease; 0 when it has run out or the
+// Room gave no valid expiry (then nothing proves it valid, so no retry).
+export function attemptLeaseRemainingMs(cycleAttempt, now = Date.now()) {
+  const expiry = cycleAttempt?.attempt?.leaseExpiresAt;
+  if (!validCanonicalTimestamp(expiry)) return 0;
+  return Math.max(0, Date.parse(expiry) - now);
+}
+
 // A renewal is valid only for the exact claimed attempt: same cycle, attempt,
 // generation and holder, with a lease that has not already run out.
 function sameAttemptClaim(refreshed, expected, membershipId, now = Date.now()) {
@@ -417,8 +425,11 @@ export class OpenClawRoomRuntime {
     // Claimed cycle attempts held alive while their model run is in flight.
     this.attemptLeases = new Map();
     this.parkedRetryDelay = 0;
-    // Lower bound of one renewal claim's timeout; the bound is the renewal interval.
-    this.attemptRenewalTimeoutFloorMs = 5_000;
+    // One renewal claim answers within this bound, shorter than the retry
+    // interval; a transient failure is retried at that interval while the
+    // lease is still valid (contract P1-1).
+    this.attemptRenewalRequestTimeoutMs = 4_000;
+    this.attemptRenewalRetryMs = 5_000;
   }
 
   async initialize(signal) {
@@ -741,9 +752,9 @@ export class OpenClawRoomRuntime {
     return lease;
   }
 
-  scheduleAttemptRenewal(lease) {
+  scheduleAttemptRenewal(lease, retryDelayMs = 0) {
     if (lease.stopped || this.closed) return;
-    const delay = attemptRenewalDelaySeconds(lease.cycleAttempt.attempt?.leaseExpiresAt) * 1000;
+    const delay = retryDelayMs || attemptRenewalDelaySeconds(lease.cycleAttempt.attempt?.leaseExpiresAt) * 1000;
     lease.delayMs = delay;
     lease.timer = setTimeout(() => {
       lease.timer = null;
@@ -754,22 +765,46 @@ export class OpenClawRoomRuntime {
     lease.timer.unref?.();
   }
 
-  // One renewal: re-claim the exact attempt. Any failure or mismatch loses it.
+  // One claim of the exact held attempt, bounded by the request timeout and by
+  // what is left of the lease. Returns {refreshed} or {reason, transient}: a
+  // refusal with a code, any other 4xx and a mismatched claim are final; a
+  // network error, a timeout, 429 or 5xx without a code is transient.
+  async claimHeldAttempt(lease, signal, label) {
+    const remaining = attemptLeaseRemainingMs(lease.cycleAttempt);
+    const bound = Math.max(1, Math.min(this.attemptRenewalRequestTimeoutMs, remaining > 0 ? remaining : this.attemptRenewalRequestTimeoutMs));
+    const timeout = AbortSignal.timeout(bound);
+    try {
+      const refreshed = await this.client.claimDiscussionAttempt(
+        this.state, String(lease.cycleAttempt.cycle.id), signal ? AbortSignal.any([signal, timeout]) : timeout,
+      );
+      if (!sameAttemptClaim(refreshed, lease.cycleAttempt, this.state.membershipId)) return {reason: "attempt_superseded", transient: false};
+      return {refreshed};
+    } catch (error) {
+      const refused = error instanceof RoomAPIError && (Boolean(error.code) || !error.retryable);
+      const reason = error instanceof RoomAPIError && error.code ? error.code : label;
+      if (!signal?.aborted) {
+        // Every failed claim is logged with its real error; never a body.
+        const cause = error?.cause?.code || error?.cause?.name || "";
+        this.logger?.warn?.(`Room attempt renewal failed ${outcomeLogFields({code: reason, sourceSeq: lease.sourceEvent?.seq, attemptId: lease.cycleAttempt.attempt?.id})}${roomErrorDiagnostic(error)} error=${singleLine(error?.name || "Error")}${cause ? ` cause=${singleLine(cause)}` : ""} ${refused ? "refused" : `transient; lease remaining ${Math.max(0, attemptLeaseRemainingMs(lease.cycleAttempt))}ms`}`);
+      }
+      return {reason, transient: !refused};
+    }
+  }
+
+  // One renewal: re-claim the exact attempt. A refusal or mismatch loses it at
+  // once; a transient failure is retried every attemptRenewalRetryMs and loses
+  // it only when the lease has run out (contract P1-1).
   async renewAttemptLease(lease) {
     if (lease.stopped) return false;
-    let refreshed = null;
-    let reason = "";
-    try {
-      // A claim that does not answer within the renewal interval is a failed renewal.
-      const timeout = AbortSignal.timeout(Math.max(this.attemptRenewalTimeoutFloorMs, lease.delayMs ?? 30_000));
-      refreshed = await this.client.claimDiscussionAttempt(
-        this.state, String(lease.cycleAttempt.cycle.id), AbortSignal.any([this.heartbeatAbort.signal, timeout]),
-      );
-    } catch (error) {
-      reason = error instanceof RoomAPIError && error.code ? error.code : "attempt_renewal_failed";
-    }
+    const {refreshed, reason, transient} = await this.claimHeldAttempt(lease, this.heartbeatAbort.signal, "attempt_renewal_failed");
     if (lease.stopped || this.closed) return false;
-    if (!reason && !sameAttemptClaim(refreshed, lease.cycleAttempt, this.state.membershipId)) reason = "attempt_superseded";
+    if (transient) {
+      const remaining = attemptLeaseRemainingMs(lease.cycleAttempt);
+      if (remaining > 0) {
+        this.scheduleAttemptRenewal(lease, Math.max(1, Math.min(this.attemptRenewalRetryMs, remaining)));
+        return false;
+      }
+    }
     if (reason) {
       await this.supersedeAttemptLease(lease, reason);
       return false;
@@ -882,12 +917,20 @@ export class OpenClawRoomRuntime {
     await this.stopAttemptLease(intent.identity.sourceEventId);
     if (lease.superseded) return lease.reason || "attempt_superseded";
     let reason = "";
-    try {
-      const refreshed = await this.client.claimDiscussionAttempt(this.state, cycle.cycleId, signal);
-      if (!sameAttemptClaim(refreshed, lease.cycleAttempt, this.state.membershipId)) reason = "attempt_superseded";
-      else if (refreshed.attempt.leaseExpiresAt !== undefined) lease.cycleAttempt.attempt.leaseExpiresAt = refreshed.attempt.leaseExpiresAt;
-    } catch (error) {
-      reason = error instanceof RoomAPIError && error.code ? error.code : "attempt_reclaim_failed";
+    // The same rule as a renewal: transient failures are retried while the
+    // lease is valid; a refusal or an expired lease loses the attempt.
+    for (;;) {
+      const claim = await this.claimHeldAttempt(lease, signal, "attempt_reclaim_failed");
+      if (claim.refreshed) {
+        if (claim.refreshed.attempt.leaseExpiresAt !== undefined) lease.cycleAttempt.attempt.leaseExpiresAt = claim.refreshed.attempt.leaseExpiresAt;
+        break;
+      }
+      const remaining = attemptLeaseRemainingMs(lease.cycleAttempt);
+      if (!claim.transient || remaining <= 0 || signal?.aborted || this.closed) {
+        reason = claim.reason;
+        break;
+      }
+      await sleep(Math.max(1, Math.min(this.attemptRenewalRetryMs, remaining)), signal);
     }
     if (reason) {
       lease.superseded = true;
