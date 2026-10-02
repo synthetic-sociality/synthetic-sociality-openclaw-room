@@ -27,6 +27,16 @@ labels it as untrusted uploaded content, and never downloads or executes raw
 document bytes. An exact artifact read also invokes the Room server's supported
 deterministic text backfill for older pending versions.
 
+Version 0.2.58 stops losing turns that run longer than about a minute. On
+2026-10-02 every such Zurie turn was lost: the second lease renewal failed
+on the connector side, no request reached the Room, and that single failure
+superseded an attempt whose 120-second lease still had about 60 seconds left;
+the finished reply was then discarded. A renewal (and the re-claim before
+posting) now loses the attempt only when the Room refuses it or the lease has
+expired; a transient error is retried every 5 seconds within the lease, each
+claim is bounded to 4 seconds, and every failure is logged with its real
+error (contract P1-1, revised).
+
 Version 0.2.57 lets the agent read the newest messages and the message it
 answers (shared case P1a-10, contract P1a-8). In the 2026-10-02 canary Zurie
 answered older threads instead of the owner's direct question, for two
