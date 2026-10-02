@@ -27,6 +27,17 @@ labels it as untrusted uploaded content, and never downloads or executes raw
 document bytes. An exact artifact read also invokes the Room server's supported
 deterministic text backfill for older pending versions.
 
+Version 0.2.57 lets the agent read the newest messages and the message it
+answers (shared case P1a-10, contract P1a-8). In the 2026-10-02 canary Zurie
+answered older threads instead of the owner's direct question, for two
+reasons. First, the Room context was cut to 12,000 characters from the front,
+so with long messages the newest entries, the owner's question among them,
+were dropped; it is now bounded exactly as Hermes: header and guidance whole,
+the oldest transcript entries dropped first. Second, a discussion attempt did
+not show the message it was scheduled for; that message is now the current
+item, "#<number> <speaker>: <text>", verbatim, and a direct message is shown
+the same way.
+
 Version 0.2.56 lets a reply marker address only a real message. The number
 index behind `↪ #N` also stored system events, so a reply naming a
 `discussion.cycle_attempt_ready` number would have been sent as addressing that
