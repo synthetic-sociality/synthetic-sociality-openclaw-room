@@ -127,7 +127,8 @@
     "P1a-06": "P1a-06 discussion start title and description presented verbatim and attributed to the starting human",
     "P1a-07": "P1a-07 host fallback notice is never posted; the model reply is",
     "P1a-08": "P1a-08 speaker labels follow one precedence and four role labels",
-    "P1a-09": "P1a-09 reply marker addresses only real messages"
+    "P1a-09": "P1a-09 reply marker addresses only real messages",
+    "P1a-10": "P1a-10 the agent reads the newest messages and the message it answers"
   },
   "presentationAcknowledgementFixtures": {
     "before_coordination_and_model": "receive-boundary acknowledgement precedes coordination and model dispatch",

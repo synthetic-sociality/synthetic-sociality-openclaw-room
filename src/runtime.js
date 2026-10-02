@@ -21,6 +21,10 @@ export const MAX_SOURCE_ATTACHMENTS = 8;
 export const LIBRARY_CATALOG_LIMIT = 32;
 export const LIBRARY_CATALOG_CHARACTER_LIMIT = 4_000;
 export const HANDOVER_CONTEXT_CHARACTER_LIMIT = 12_000;
+// The canonical Room context (header, guidance and transcript) is bounded to
+// the same limit as in Hermes; see canonicalRoomContext.
+export const CONTEXT_CHARACTER_LIMIT = 12_000;
+const CONTEXT_FOOTER = "[/Canonical Room context]";
 
 function validCanonicalTimestamp(value) {
   if (typeof value !== "string" || !value.trim()) return false;
@@ -670,6 +674,7 @@ export class OpenClawRoomRuntime {
         this.contextPolicyWordLimit = 0;
         this.contextDiscussionStart = null;
         this.contextSenderName = "";
+        this.contextCurrentItem = "";
         const sharedContext = await this.sharedRoomContext(event, pageEpoch, signal);
         const normalized = normalizeEvent(
           event,
@@ -681,6 +686,7 @@ export class OpenClawRoomRuntime {
           this.contextPolicyWordLimit,
           this.contextDiscussionStart,
           this.contextSenderName,
+          this.contextCurrentItem,
         );
         // The model runs while the consumer holds this yield; keep its claimed
         // attempt alive until a terminal outcome is recorded or it returns.
@@ -914,7 +920,11 @@ export class OpenClawRoomRuntime {
     // that start, verbatim and attributed, as the current-turn input.
     this.contextDiscussionStart = discussionStartInput(event, startEvent, state);
     this.contextSenderName = speakerName(state?.roster, event);
-    const roomContext = canonicalRoomContext(state, page?.events, event?.id, policy, sourceEpoch.startsAtSeq, startEvent);
+    // Delivery contract P1a-8: the message a cycle attempt answers is the
+    // current item, not a transcript entry.
+    const sourceMessage = cycleSourceMessage(event, page?.events);
+    this.contextCurrentItem = sourceMessage ? currentItemLine(sourceMessage, speakerLabel(state?.roster, sourceMessage)) : "";
+    const roomContext = canonicalRoomContext(state, page?.events, sourceMessage?.id ?? event?.id, policy, sourceEpoch.startsAtSeq, startEvent);
     const library = await this.client.listArtifacts(this.state, signal);
     const artifactContext = await sourceArtifactContext(
       event,
@@ -2337,10 +2347,16 @@ export function normalizeEvent(
   policyWordLimit = 0,
   discussionStart = null,
   senderName = "",
+  sourceItem = "",
 ) {
   const payload = eventPayload(event.payload);
   const actorRole = String(event.actorRole ?? "");
   const epochId = eventEpochId(event, pageActiveEpochId);
+  const speaker = String(senderName ?? "").trim() || speakerLabel([], event);
+  // Delivery contract P1a-8: the message this turn answers, numbered and
+  // labelled as in the transcript.
+  const currentItem = String(sourceItem ?? "").trim()
+    || (event.type === "message.posted" ? currentItemLine(event, speaker) : "");
   const normalized = {
     id: event.id,
     // Delivery/idempotency identity must remain the unique canonical event.
@@ -2355,10 +2371,9 @@ export function normalizeEvent(
       ? roomId
       : epochConversationId(roomId, epochId),
     senderId: discussionStart ? discussionStart.authorId : event.actorId,
-    senderName: discussionStart ? discussionStart.authorName
-      : String(senderName ?? "").trim() || speakerLabel([], event),
+    senderName: discussionStart ? discussionStart.authorName : speaker,
     senderKind: discussionStart || actorRole === "human" || actorRole.startsWith("human_") ? "human" : "agent",
-    text: cyclePrompt(event, payload, cycleAttempt, sharedContext, policyWordLimit, discussionStart),
+    text: cyclePrompt(event, payload, cycleAttempt, sharedContext, policyWordLimit, discussionStart, currentItem),
     occurredAt: Date.parse(event.ts) || Date.now(),
     raw: event,
     cycleAttempt,
@@ -2427,7 +2442,27 @@ function discussionStartBlock(start) {
   return body ? `[Discussion started by ${start.authorName}]\n${body}\n[/Discussion started by ${start.authorName}]` : "";
 }
 
-function cyclePrompt(event, payload, cycleAttempt, sharedContext = "", policyWordLimit = 0, discussionStart = null) {
+// The canonical message a cycle attempt was scheduled for, when it is in the
+// loaded context. A discussion.started source is P1a-5, not a message.
+export function cycleSourceMessage(event, events) {
+  if (event?.type !== "discussion.cycle_attempt_ready") return null;
+  const sourceEventId = String(eventPayload(event.payload).sourceEventId ?? "").trim();
+  if (!sourceEventId) return null;
+  return (Array.isArray(events) ? events : [])
+    .find((item) => item?.type === "message.posted" && String(item.id ?? "") === sourceEventId) ?? null;
+}
+
+// Delivery contract P1a-8, as Hermes renders its current input:
+// "#<seq> <speaker label>: <body>", the body verbatim and unshortened.
+export function currentItemLine(message, label) {
+  const payload = eventPayload(message?.payload);
+  const body = String(payload.body ?? payload.text ?? "").trim();
+  if (!body) return "";
+  const number = Number.isSafeInteger(message?.seq) && message.seq > 0 ? `#${message.seq} ` : "";
+  return `${number}${label}: ${body}`;
+}
+
+function cyclePrompt(event, payload, cycleAttempt, sharedContext = "", policyWordLimit = 0, discussionStart = null, currentItem = "") {
   const context = String(sharedContext ?? "").trim();
   const preface = context ? [context, ROOM_HISTORY_INSTRUCTION] : [];
   if (event.type === "discussion.cycle_attempt_ready") {
@@ -2436,6 +2471,7 @@ function cyclePrompt(event, payload, cycleAttempt, sharedContext = "", policyWor
       ...preface,
       roomTurnFacts({phase, cycleAttempt, policyWordLimit}),
       ...(discussionStart ? [discussionStartBlock(discussionStart)] : []),
+      ...(currentItem ? [currentItem] : []),
       roomSupplied("Room phase instruction — server-provided", payload.phaseInstruction),
     ].filter(Boolean).join("\n\n");
   }
@@ -2447,7 +2483,7 @@ function cyclePrompt(event, payload, cycleAttempt, sharedContext = "", policyWor
       roomSupplied(`Room command ${command || "unnamed"} — owner instruction`, commandInstruction(payload)),
     ].filter(Boolean).join("\n\n");
   }
-  const text = String(payload.body ?? payload.text ?? "").trim();
+  const text = currentItem || String(payload.body ?? payload.text ?? "").trim();
   if (!cycleAttempt) {
     return [...preface, roomTurnFacts({policyWordLimit}), text].filter(Boolean).join("\n\n");
   }
@@ -2680,10 +2716,28 @@ export function canonicalRoomContext(state, events, currentEventId = "", policy 
       "[/Active Room guidance]",
     ] : []),
     REPLY_MARKER_GUIDANCE,
-    ...(transcript.length ? ["Recent canonical transcript:", ...transcript] : ["Recent canonical transcript: no earlier messages in the available window."]),
-    "[/Canonical Room context]",
   ];
-  return lines.join("\n").slice(0, 12_000);
+  if (!transcript.length) {
+    return [...lines, "Recent canonical transcript: no earlier messages in the available window.", CONTEXT_FOOTER].join("\n");
+  }
+  // Delivery contract P1a-8, bounded exactly as Hermes (context.py): the
+  // header and guidance stay whole; whole transcript entries are kept from the
+  // newest backwards while they fit, so the oldest are dropped first. Only a
+  // newest entry that alone exceeds the remaining budget is shortened.
+  const prefix = `${[...lines, "Recent canonical transcript:"].join("\n")}\n`;
+  let remaining = Math.max(0, CONTEXT_CHARACTER_LIMIT - prefix.length - CONTEXT_FOOTER.length - 1);
+  const kept = [];
+  for (const line of [...transcript].reverse()) {
+    const cost = line.length + (kept.length ? 1 : 0);
+    if (cost <= remaining) {
+      kept.unshift(line);
+      remaining -= cost;
+      continue;
+    }
+    if (!kept.length && remaining > 1) kept.unshift(`${line.slice(0, remaining - 1)}…`);
+    break;
+  }
+  return `${prefix}${kept.join("\n")}\n${CONTEXT_FOOTER}`;
 }
 
 function eventPayload(value) {
