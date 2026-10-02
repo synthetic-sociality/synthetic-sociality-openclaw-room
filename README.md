@@ -31,19 +31,26 @@ Version 0.2.60 is parity release P2c with Hermes 1.0.76 ("Secrets, late
 replies, self-recovery", contract section P2c, shared cases P2c-01 to P2c-05;
 section U, automatic updates, is recorded as planned only).
 
-Install precondition (P2c-1): this version refuses to start an account, and
-logs once "Room connector refused to start: secret_store_reachable
-(<reasons>)", while the agent's own tools can read the Room credential. By
-default OpenClaw's read tool takes any absolute path and exec runs on the
-gateway host as the same user; in the P2c-01 control the host's own read
-tool returned the credential. Before installing, set in openclaw.json, for
-every agent: tools.fs.workspaceOnly true; tools.elevated.enabled false; and
-either tools.deny containing "group:runtime" or agents.defaults.sandbox.mode
-"all" with no docker bind over the OpenClaw state directory; no agent
-workspace may contain the state directory.
+Secret isolation (P2c-1) reports first and is enforced per installation.
+At start the connector checks whether the agent's own tools can read the Room
+credential. By default OpenClaw's read tool takes any absolute path and exec
+runs on the gateway host as the same user; in the P2c-01 control the host's
+own read tool returned the credential. By default the connector only reports
+this: it logs once "Room connector: secret_store_reachable (<reasons>) ...
+reporting only", writes "secretStore": "reachable" with secretStoreReasons to
+status.json, and keeps running. Installing 0.2.60 needs no host change.
+Enforcement is off by default; set
+plugins.entries["synthetic-sociality-room"].config.enforceSecretIsolation to
+true and the connector refuses to start an account while the store is
+reachable. Per-host step before switching it on, in openclaw.json for every
+agent: tools.fs.workspaceOnly true; tools.elevated.enabled false; and either
+tools.deny containing "group:runtime" or agents.defaults.sandbox.mode "all"
+with no docker bind over the OpenClaw state directory; no agent workspace may
+contain the state directory. Then confirm "secretStore": "isolated" in
+status.json.
 
-Behaviour changes. P2c-1: the plugin's before_tool_call hook refuses, in
-every session, a file path inside synthetic-sociality-room/ (or a search
+Behaviour changes. P2c-1: in both modes the plugin's before_tool_call hook
+refuses, in every session, a file path inside synthetic-sociality-room/ (or a search
 root containing it) and an exec/process call naming it; the exact credential
 and renewal values are scrubbed from persisted tool results and from the
 connector's log lines. P2c-2: a reply the Room refused because the turn had
