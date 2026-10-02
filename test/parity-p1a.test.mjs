@@ -515,9 +515,86 @@ test("P1a-08 speaker labels follow one precedence and four role labels", async (
 test("conformance P1a case names resolve to tests in this file", async () => {
   const source = await readFile(new URL(import.meta.url), "utf8");
   const cases = Object.entries(conformance.parityP1aCases ?? {});
-  assert.equal(cases.length, 8);
+  assert.equal(cases.length, 9);
   for (const [id, name] of cases) {
     assert.ok(name.startsWith(`${id} `), id);
     assert.ok(source.includes(`test(${JSON.stringify(name)},`), name);
+  }
+});
+
+test("P1a-09 reply marker addresses only real messages", async () => {
+  // Canary shape, Joined Coding 2026-10-01 22:01 UTC (neutral IDs and text):
+  // Zurie's message 991 addresses Paula; attempt-ready 992 offers Paula the
+  // turn. A marker naming 992 must address nothing; naming 991 addresses 991.
+  const roster = [
+    {membershipId: "owner-tj", displayName: "TJE", role: "human_owner", status: "active"},
+    {membershipId: "zurie", displayName: "Zurie", role: "participant_agent", status: "active"},
+    {membershipId: "paula", displayName: "Paula", role: "participant_agent", status: "active"},
+  ];
+  const start = {id: "startevent00949", seq: 949, type: "discussion.started", actorRole: "human_owner", actorId: "owner-tj",
+    payload: {epoch: {id: "epoch-j", ordinal: 13, startsAtSeq: 949, status: "active",
+      topic: {epochId: "epoch-j", id: "topic-j", status: "active", title: "From design to code"}}}};
+  const zurie = {id: "message00000991", seq: 991, type: "message.posted", actorRole: "participant_agent", actorId: "zurie",
+    payload: {body: "A passing test is presumptive closure.", resolvedRecipientMembershipIds: ["paula"], epochId: "epoch-j"}};
+  const ready = {id: "attemptready992", seq: 992, type: "discussion.cycle_attempt_ready", actorRole: "system",
+    actorId: "room_coordinator", payload: {cycleId: "cycle-j", epochId: "epoch-j", generation: 1, membershipId: "paula",
+      round: 1, sourceEventId: zurie.id}};
+  const runtime = new OpenClawRoomRuntime({accountId: "t", stateFile: "/unused", baseUrl: "https://room.example/api"});
+  runtime.state = {roomId: "room-1", membershipId: "paula", clientInstanceId: "client-1", messagePayloadDialect: "v2",
+    cursor: 991, deliveryIntents: {}, terminalEvidence: {}, epochSessionRoutingInitialized: true, legacySessionEpochId: ""};
+  runtime.connectorSession = {sessionId: "s"};
+  runtime.persistState = async () => {};
+  const posts = [];
+  const controller = new AbortController();
+  runtime.client = {
+    readEvents: async (_state, after) => ({activeEpochId: "epoch-j", activeEpochStartsAtSeq: 949,
+      events: after >= 991 ? [ready] : [start, zurie].filter((item) => item.seq > after)}),
+    roomState: async () => ({headSeq: 992, activeEpoch: {id: "epoch-j", startsAtSeq: 949}, activeTopic: {title: "From design to code"}, roster, rules: []}),
+    roomPolicy: async () => ({policy: {coordinationMode: "coordinated"}}),
+    listArtifacts: async () => ({items: []}),
+    claimDiscussionAttempt: async () => ({attempt: {id: "attempt-992", round: 1},
+      cycle: {id: "cycle-j", generation: 1, totalTurns: 1, budgets: {totalTurns: 10, perAgentTurns: 5}}}),
+    acknowledge: async (_state, seq) => ({acknowledgedSeq: seq}),
+    postMessage: async (_state, post) => {
+      posts.push(structuredClone(post));
+      return {id: `posted-${posts.length}`, seq: 993 + posts.length, ts: "2026-10-01T22:01:18Z"};
+    },
+  };
+  runtime.renewAccess = async () => false;
+  runtime.maintainPresence = async () => {};
+  runtime.markContextAcknowledged = async () => {};
+  runtime.markTurnPreparing = async () => {};
+  runtime.markTurnPosted = async () => {};
+  runtime.startAttemptLease = () => null;
+  const turns = runtime.assignedTurns(controller.signal);
+  const {value} = await turns.next();
+  controller.abort();
+  await turns.return();
+  // The prompt numbers only real messages: 991 is offered, 992 nowhere.
+  assert.match(value.text, /#991\b/u, value.text);
+  assert.doesNotMatch(value.text, /992/u, value.text);
+  // The number index holds only messages.
+  assert.equal(runtime.postNumberIndex().get(991), zurie.id);
+  assert.equal(runtime.postNumberIndex().has(992), false);
+  // The frozen post addresses 991 or nothing, never the attempt-ready event.
+  // Posted directly, as in reply-marker.test.mjs, with this turn's number index.
+  const poster = new OpenClawRoomRuntime({accountId: "t", stateFile: "/unused", baseUrl: "https://room.example/api"});
+  poster.state = {roomId: "room-1", membershipId: "paula", clientInstanceId: "client-1", messagePayloadDialect: "v2",
+    cursor: 0, deliveryIntents: {}};
+  poster.persistState = async () => {};
+  poster.markTurnPreparing = async () => {};
+  poster.markTurnPosted = async () => {};
+  poster.postNumbers = runtime.postNumberIndex();
+  poster.client = {
+    roomState: async () => ({activeEpoch: {id: "epoch-j"}, headSeq: 993, roster: []}),
+    roomPolicy: async () => ({policy: {coordinationMode: "open"}}),
+    postMessage: runtime.client.postMessage,
+  };
+  for (const [marker, expected] of [["↪ #992", undefined], ["↪ #991", zurie.id]]) {
+    await poster.postAndFinishOnce({roomId: "room-1", text: `${marker} I agree, with a caveat.`, replyToId: `src-${marker.slice(-3)}`,
+      idempotencyKey: `src-${marker.slice(-3)}:final`, sourceEventId: `src-${marker.slice(-3)}`});
+    const post = posts.at(-1);
+    assert.equal(post.body, "I agree, with a caveat.");
+    assert.equal(post.addresses, expected, marker);
   }
 });

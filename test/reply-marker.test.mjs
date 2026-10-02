@@ -59,7 +59,7 @@ const request = (text, key = "src-1:final") => ({roomId: "room-1", text, replyTo
 test("a known number becomes addresses, frozen with the stripped body", async () => {
   const posts = [];
   const runtime = deliveringRuntime(posts);
-  runtime.rememberPostNumbers([{id: "event-437", seq: 437}]);
+  runtime.rememberPostNumbers([{id: "event-437", seq: 437, type: "message.posted"}]);
   await runtime.postAndFinishOnce(request("↪ #437\nI disagree with Real."));
   assert.equal(posts.length, 1);
   assert.equal(posts[0].body, "I disagree with Real.");
@@ -80,7 +80,7 @@ test("an unknown number is dropped but the marker never reaches the Room", async
 test("a retry after a restart re-derives the same identity and does not fail the delivery", async () => {
   const posts = [];
   const runtime = deliveringRuntime(posts);
-  runtime.rememberPostNumbers([{id: "event-437", seq: 437}]);
+  runtime.rememberPostNumbers([{id: "event-437", seq: 437, type: "message.posted"}]);
   const frozenPost = async () => {
     runtime.client.postMessage = async () => { throw Object.assign(new Error("lost response"), {retryable: true}); };
     await runtime.postAndFinishOnce(request("↪ #437\nI disagree with Real.")).catch(() => {});

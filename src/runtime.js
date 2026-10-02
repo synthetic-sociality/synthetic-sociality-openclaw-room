@@ -1263,6 +1263,9 @@ export class OpenClawRoomRuntime {
   rememberPostNumbers(events) {
     const known = this.postNumberIndex();
     for (const item of events) {
+      // Only real messages are reply targets: a marker naming a system event
+      // (discussion.cycle_attempt_ready) must resolve to no addresses (P1a-09).
+      if (item?.type !== "message.posted") continue;
       if (Number.isSafeInteger(item?.seq) && item.seq > 0 && item?.id) known.set(item.seq, String(item.id));
     }
     // Numbers are canonical and never reassigned; keep the window bounded.
