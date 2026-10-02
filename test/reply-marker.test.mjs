@@ -1,6 +1,15 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {OpenClawRoomRuntime, REPLY_MARKER_GUIDANCE, canonicalRoomContext, parseReplyMarker} from "../src/runtime.js";
+// Runtimes in this file get a private scratch state file: a runtime may write
+// its state (ackEvent, persistState), and the directory is made 0700.
+import {after as afterStateTests} from "node:test";
+import {mkdtemp as mkdtempState, rm as rmState} from "node:fs/promises";
+import {tmpdir as tmpdirState} from "node:os";
+import {join as joinState} from "node:path";
+const TEST_STATE_DIRECTORY = await mkdtempState(joinState(tmpdirState(), "openclaw-room-test-state-"));
+const UNUSED_STATE_FILE = joinState(TEST_STATE_DIRECTORY, "state.json");
+afterStateTests(() => rmState(TEST_STATE_DIRECTORY, {recursive: true, force: true}));
 
 // An agent may begin a reply with "↪ #437" to name the one post it answers. Its
 // own connector reads the marker, removes it, and records that post as
@@ -38,7 +47,7 @@ test("the transcript numbers each post, names speakers, and explains the marker"
 });
 
 function deliveringRuntime(posts) {
-  const runtime = new OpenClawRoomRuntime({accountId: "default", stateFile: "/unused", baseUrl: "https://room.example/api"});
+  const runtime = new OpenClawRoomRuntime({accountId: "default", stateFile: UNUSED_STATE_FILE, baseUrl: "https://room.example/api"});
   runtime.state = {roomId: "room-1", membershipId: "member-1", clientInstanceId: "client-1", messagePayloadDialect: "v2", cursor: 0, deliveryIntents: {}};
   runtime.persistState = async () => {};
   runtime.markTurnPreparing = async () => {};

@@ -7,6 +7,15 @@ import {join} from "node:path";
 import {ARTIFACT_CONTEXT_CHARACTER_LIMIT, HANDOVER_CONTEXT_CHARACTER_LIMIT, canonicalRoomContext, commandInstruction, discussionHandoverContext, sourceArtifactContext, cyclePhaseInstruction, epochConversationId, epochEvidence, eventEpochId, isAssignedEvent, isAssignedMessage, isBoundaryEvent, isLifecycleOnlyCycleTerminal, normalizeEvent, OpenClawRoomRuntime, resolveStandaloneRecipientSelectors, validateActiveEpochPage} from "../src/runtime.js";
 import {RoomAPIError} from "../src/room-client.js";
 import {loadState, saveState, validateState} from "../src/state.js";
+// Runtimes in this file get a private scratch state file: a runtime may write
+// its state (ackEvent, persistState), and the directory is made 0700.
+import {after as afterStateTests} from "node:test";
+import {mkdtemp as mkdtempState, rm as rmState} from "node:fs/promises";
+import {tmpdir as tmpdirState} from "node:os";
+import {join as joinState} from "node:path";
+const TEST_STATE_DIRECTORY = await mkdtempState(joinState(tmpdirState(), "openclaw-room-test-state-"));
+const UNUSED_STATE_FILE = joinState(TEST_STATE_DIRECTORY, "state.json");
+afterStateTests(() => rmState(TEST_STATE_DIRECTORY, {recursive: true, force: true}));
 
 const ZURIE_FIXTURE_HASHES = Object.freeze({
   132: "136e0ad9f1b82b40338da0def2cecd6fccf2e05dcb70f8838520de23cf2b1194",
@@ -408,7 +417,7 @@ test("canonical Room context carries topic and recent named contributions withou
 });
 
 test("receive-boundary acknowledgement precedes coordination and model dispatch", async () => {
-  const runtime = new OpenClawRoomRuntime({accountId: "default", stateFile: "/unused", baseUrl: "https://room.example/api"});
+  const runtime = new OpenClawRoomRuntime({accountId: "default", stateFile: UNUSED_STATE_FILE, baseUrl: "https://room.example/api"});
   const controller = new AbortController();
   const event = {
     id: "source-5", seq: 5, type: "message.posted", actorId: "human-1", actorRole: "human_owner",
@@ -477,7 +486,7 @@ test("durable cursor acknowledgement does not emit presentation acknowledgement"
 });
 
 test("coordinated human source starts one server-owned cycle but only its ready event claims the attempt", async () => {
-  const runtime = new OpenClawRoomRuntime({accountId: "default", stateFile: "/unused", baseUrl: "https://room.example/api"});
+  const runtime = new OpenClawRoomRuntime({accountId: "default", stateFile: UNUSED_STATE_FILE, baseUrl: "https://room.example/api"});
   runtime.state = {roomId: "room-1", membershipId: "aura-member"};
   const starts = [];
   runtime.client = {
@@ -516,7 +525,7 @@ test("explicit owner retry targets only the non-summary agent and never calls a 
   assert.equal(isAssignedEvent(event, "first"), false);
   assert.equal(isAssignedEvent({...event, actorRole: "participant_agent"}, "second"), false);
   for (const mode of ["open", "coordinated"]) {
-    const runtime = new OpenClawRoomRuntime({accountId: "default", stateFile: "/unused", baseUrl: "https://room.example/api"});
+    const runtime = new OpenClawRoomRuntime({accountId: "default", stateFile: UNUSED_STATE_FILE, baseUrl: "https://room.example/api"});
     runtime.state = {roomId: "room-1", membershipId: "second"};
     const starts = [];
     runtime.client = {
@@ -538,7 +547,7 @@ test("explicit owner retry targets only the non-summary agent and never calls a 
 });
 
 test("open-room agent contribution replies directly while a cycle-bound contribution continues its cycle", async () => {
-  const runtime = new OpenClawRoomRuntime({accountId: "default", stateFile: "/unused", baseUrl: "https://room.example/api"});
+  const runtime = new OpenClawRoomRuntime({accountId: "default", stateFile: UNUSED_STATE_FILE, baseUrl: "https://room.example/api"});
   runtime.state = {roomId: "room-1", membershipId: "reader-member"};
   const starts = [];
   const claims = [];
@@ -580,7 +589,7 @@ test("open-room agent contribution replies directly while a cycle-bound contribu
 });
 
 test("agent contribution cannot seed outside the open follow-up policy", async () => {
-  const runtime = new OpenClawRoomRuntime({accountId: "default", stateFile: "/unused", baseUrl: "https://room.example/api"});
+  const runtime = new OpenClawRoomRuntime({accountId: "default", stateFile: UNUSED_STATE_FILE, baseUrl: "https://room.example/api"});
   runtime.state = {roomId: "room-1", membershipId: "reader-member"};
   let stateReads = 0;
   runtime.client = {
@@ -604,7 +613,7 @@ test("follow-up phase carries no connector guidance; a Room phase instruction pa
 });
 
 function deliveryLifecycleRuntime() {
-  const runtime = new OpenClawRoomRuntime({accountId: "test", stateFile: "/unused", baseUrl: "https://room.example/api"});
+  const runtime = new OpenClawRoomRuntime({accountId: "test", stateFile: UNUSED_STATE_FILE, baseUrl: "https://room.example/api"});
   runtime.state = {
     version: 1, baseUrl: "https://room.example/api", roomId: "room-1",
     membershipId: "member-1", credential: "redacted", clientInstanceId: "client-1",
@@ -2224,7 +2233,7 @@ test("a later turn fetches the epoch start event once when it lies outside the t
 
 // ADR 0089: open Rooms give agents equal access without a server-chosen order.
 test("open-room human and general agent posts reply directly without a cycle", async () => {
-  const runtime = new OpenClawRoomRuntime({accountId: "default", stateFile: "/unused", baseUrl: "https://room.example/api"});
+  const runtime = new OpenClawRoomRuntime({accountId: "default", stateFile: UNUSED_STATE_FILE, baseUrl: "https://room.example/api"});
   runtime.state = {roomId: "room-1", membershipId: "reader-member"};
   const starts = [];
   runtime.client = {
@@ -2248,7 +2257,7 @@ test("open-room human and general agent posts reply directly without a cycle", a
 
 test("coordinated rooms and disabled peer replies keep agent posts from starting replies", async () => {
   for (const policy of [{coordinationMode: "coordinated", agentFollowUpEnabled: true}, {coordinationMode: "open", agentFollowUpEnabled: false}]) {
-    const runtime = new OpenClawRoomRuntime({accountId: "default", stateFile: "/unused", baseUrl: "https://room.example/api"});
+    const runtime = new OpenClawRoomRuntime({accountId: "default", stateFile: UNUSED_STATE_FILE, baseUrl: "https://room.example/api"});
     runtime.state = {roomId: "room-1", membershipId: "reader-member"};
     runtime.client = {
       roomPolicy: async () => ({policy}),
@@ -2264,7 +2273,7 @@ test("coordinated rooms and disabled peer replies keep agent posts from starting
 const fullFixtureState = (state) => ({version: 1, baseUrl: "https://room.example/api", credential: "fixture-only", ...state});
 
 test("reply cap refusal is a terminal skipped delivery, never quarantined or reposted", async () => {
-  const runtime = new OpenClawRoomRuntime({accountId: "default", stateFile: "/unused", baseUrl: "https://room.example/api"});
+  const runtime = new OpenClawRoomRuntime({accountId: "default", stateFile: UNUSED_STATE_FILE, baseUrl: "https://room.example/api"});
   runtime.state = {roomId: "room-1", membershipId: "reader-member", clientInstanceId: "client-1", messagePayloadDialect: "v2", cursor: 0};
   runtime.persistState = async () => {};
   let posts = 0;
@@ -2285,7 +2294,7 @@ test("reply cap refusal is a terminal skipped delivery, never quarantined or rep
   validateState(fullFixtureState(runtime.state));
 
   // A sourced skip without its bound source fails closed and stays pending.
-  const unboundRuntime = new OpenClawRoomRuntime({accountId: "default", stateFile: "/unused", baseUrl: "https://room.example/api"});
+  const unboundRuntime = new OpenClawRoomRuntime({accountId: "default", stateFile: UNUSED_STATE_FILE, baseUrl: "https://room.example/api"});
   unboundRuntime.state = {roomId: "room-1", membershipId: "reader-member", clientInstanceId: "client-1", messagePayloadDialect: "v2", cursor: 0};
   unboundRuntime.persistState = async () => {};
   unboundRuntime.client = runtime.client;
@@ -2294,7 +2303,7 @@ test("reply cap refusal is a terminal skipped delivery, never quarantined or rep
 });
 
 test("outbound reply cap refusal persists a skip without source evidence", async () => {
-  const runtime = new OpenClawRoomRuntime({accountId: "default", stateFile: "/unused", baseUrl: "https://room.example/api"});
+  const runtime = new OpenClawRoomRuntime({accountId: "default", stateFile: UNUSED_STATE_FILE, baseUrl: "https://room.example/api"});
   runtime.state = {roomId: "room-1", membershipId: "reader-member", clientInstanceId: "client-1", messagePayloadDialect: "v2", cursor: 0};
   let saves = 0;
   runtime.persistState = async () => { saves += 1; validateState(fullFixtureState(runtime.state)); };
@@ -2323,7 +2332,7 @@ test("the Room client preserves the reply cap refusal code", () => {
 
 // ADR 0089: a human "summarize now" still uses one coordinator cycle in an open Room.
 test("open-room summarize starts one coordinator cycle", async () => {
-  const runtime = new OpenClawRoomRuntime({accountId: "default", stateFile: "/unused", baseUrl: "https://room.example/api"});
+  const runtime = new OpenClawRoomRuntime({accountId: "default", stateFile: UNUSED_STATE_FILE, baseUrl: "https://room.example/api"});
   runtime.state = {roomId: "room-1", membershipId: "member-1"};
   const starts = [];
   runtime.client = {
@@ -2344,7 +2353,7 @@ test("open-room summarize starts one coordinator cycle", async () => {
 
 // A duplicate delivery of the same open-mode source posts exactly once.
 test("duplicate open-mode delivery reuses the canonical receipt without reposting", async () => {
-  const runtime = new OpenClawRoomRuntime({accountId: "default", stateFile: "/unused", baseUrl: "https://room.example/api"});
+  const runtime = new OpenClawRoomRuntime({accountId: "default", stateFile: UNUSED_STATE_FILE, baseUrl: "https://room.example/api"});
   runtime.state = {roomId: "room-1", membershipId: "member-1", clientInstanceId: "client-1", messagePayloadDialect: "v2", cursor: 0};
   runtime.persistState = async () => {};
   let posts = 0;
@@ -2680,7 +2689,7 @@ test("an unacknowledged reply-cap skip survives an epoch rotation and restart", 
 // If the skip evidence cannot be written, the in-memory intent must roll back
 // to its pending state so the process can still save and recover.
 test("a refused reply-cap evidence write rolls the intent back to pending", async () => {
-  const runtime = new OpenClawRoomRuntime({accountId: "default", stateFile: "/unused", baseUrl: "https://room.example/api"});
+  const runtime = new OpenClawRoomRuntime({accountId: "default", stateFile: UNUSED_STATE_FILE, baseUrl: "https://room.example/api"});
   runtime.state = {
     roomId: "room-1", membershipId: "reader-member", clientInstanceId: "client-1", messagePayloadDialect: "v2", cursor: 0,
     terminalEvidence: {"1": {

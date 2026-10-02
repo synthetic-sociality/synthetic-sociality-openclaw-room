@@ -7,6 +7,15 @@ import {registerHooks} from "node:module";
 import {mkdtemp, readFile} from "node:fs/promises";
 import {tmpdir} from "node:os";
 import {join} from "node:path";
+// Runtimes in this file get a private scratch state file: a runtime may write
+// its state (ackEvent, persistState), and the directory is made 0700.
+import {after as afterStateTests} from "node:test";
+import {mkdtemp as mkdtempState, rm as rmState} from "node:fs/promises";
+import {tmpdir as tmpdirState} from "node:os";
+import {join as joinState} from "node:path";
+const TEST_STATE_DIRECTORY = await mkdtempState(joinState(tmpdirState(), "openclaw-room-test-state-"));
+const UNUSED_STATE_FILE = joinState(TEST_STATE_DIRECTORY, "state.json");
+afterStateTests(() => rmState(TEST_STATE_DIRECTORY, {recursive: true, force: true}));
 
 const mocks = {
   "openclaw/plugin-sdk/channel-core": "export const defineChannelPluginEntry = (entry) => entry;",
@@ -40,7 +49,7 @@ const CYCLE = () => ({
 });
 
 function p1Runtime() {
-  const runtime = new OpenClawRoomRuntime({accountId: "test", stateFile: "/unused", baseUrl: "https://room.example/api"});
+  const runtime = new OpenClawRoomRuntime({accountId: "test", stateFile: UNUSED_STATE_FILE, baseUrl: "https://room.example/api"});
   runtime.state = {
     version: 1, baseUrl: "https://room.example/api", roomId: "room-1",
     membershipId: "member-1", credential: SECRET, clientInstanceId: "client-1",
@@ -856,7 +865,7 @@ test("a refused cycle start skips its source and the scan continues (canary 2026
   const ready = {id: "attemptready2966", seq: 2966, type: "discussion.cycle_attempt_ready", actorRole: "system",
     actorId: "room_coordinator", payload: {cycleId: "cycle-r", epochId: "epoch-z", generation: 1, membershipId: "zurie", round: 1, sourceEventId: retry.id}};
   const events = [mention, retry, ready];
-  const runtime = new OpenClawRoomRuntime({accountId: "t", stateFile: "/unused", baseUrl: "https://room.example/api"});
+  const runtime = new OpenClawRoomRuntime({accountId: "t", stateFile: UNUSED_STATE_FILE, baseUrl: "https://room.example/api"});
   runtime.state = {version: 1, baseUrl: "https://room.example/api", roomId: "room-1", membershipId: "zurie", credential: SECRET,
     clientInstanceId: "client-1", messagePayloadDialect: "v2", cursor: 2963, deliveryIntents: {}, terminalEvidence: {},
     epochSessionRoutingInitialized: true, legacySessionEpochId: ""};

@@ -15,6 +15,15 @@ import {registerRoomCommands} from "../src/commands.js";
 import {RoomAPIError} from "../src/room-client.js";
 import {readRoomHistory, registerRoomHistoryTool, resetHistoryScanCache} from "../src/history.js";
 import {speakerName} from "../src/speaker.js";
+// Runtimes in this file get a private scratch state file: a runtime may write
+// its state (ackEvent, persistState), and the directory is made 0700.
+import {after as afterStateTests} from "node:test";
+import {mkdtemp as mkdtempState, rm as rmState} from "node:fs/promises";
+import {tmpdir as tmpdirState} from "node:os";
+import {join as joinState} from "node:path";
+const TEST_STATE_DIRECTORY = await mkdtempState(joinState(tmpdirState(), "openclaw-room-test-state-"));
+const UNUSED_STATE_FILE = joinState(TEST_STATE_DIRECTORY, "state.json");
+afterStateTests(() => rmState(TEST_STATE_DIRECTORY, {recursive: true, force: true}));
 
 // Host SDK stand-ins; the tool-error warning marker is host-private metadata,
 // so the stand-in reads a test-only field in its place.
@@ -218,7 +227,7 @@ test("P1a-05 policy word limit stated as a number on every turn when set, in ope
 
   // End to end: the value is read from GET policy (open) or the claimed cycle budget (coordinated).
   for (const mode of ["open", "coordinated"]) {
-    const runtime = new OpenClawRoomRuntime({accountId: "t", stateFile: "/unused", baseUrl: "https://room.example/api"});
+    const runtime = new OpenClawRoomRuntime({accountId: "t", stateFile: UNUSED_STATE_FILE, baseUrl: "https://room.example/api"});
     runtime.state = {roomId: "room-1", membershipId: "aura", cursor: 0, deliveryIntents: {}, terminalEvidence: {},
       epochSessionRoutingInitialized: true, legacySessionEpochId: ""};
     runtime.connectorSession = {sessionId: "s"};
@@ -268,7 +277,7 @@ test("P1a-06 discussion start title and description presented verbatim and attri
   ];
 
   async function turn({ready = readyFor(start.id), activeTopic = {title: TITLE, description: DESCRIPTION}, pageEvents = [start, started]} = {}) {
-    const runtime = new OpenClawRoomRuntime({accountId: "t", stateFile: "/unused", baseUrl: "https://room.example/api"});
+    const runtime = new OpenClawRoomRuntime({accountId: "t", stateFile: UNUSED_STATE_FILE, baseUrl: "https://room.example/api"});
     runtime.state = {roomId: "room-1", membershipId: "aura", cursor: 11, deliveryIntents: {}, terminalEvidence: {},
       epochSessionRoutingInitialized: true, legacySessionEpochId: ""};
     runtime.connectorSession = {sessionId: "s"};
@@ -345,7 +354,7 @@ test("P1a-07 host fallback notice is never posted; the model reply is", async ()
     const channel = createRoomChannel({makeClient: () => client});
     let status = {};
     await channel.plugin.gateway.startAccount({
-      account: {accountId: "default", stateFile: `/tmp/p1a-07-${Math.random()}.json`}, accountId: "default",
+      account: {accountId: "default", stateFile: joinState(TEST_STATE_DIRECTORY, `p1a-07-${Math.random()}.json`)}, accountId: "default",
       abortSignal: new AbortController().signal, cfg: {},
       channelRuntime: {
         inbound: {run: async ({raw, adapter}) => {
@@ -433,7 +442,7 @@ test("speaker labels name the real actor and never say Room participant or syste
   assert.match(transcript, /#2 TJ: named\n#3 Human participant: unnamed human\n#4 Room \(system\): notice/);
 
   // End to end: the roster name reaches the host's sender label.
-  const runtime = new OpenClawRoomRuntime({accountId: "t", stateFile: "/unused", baseUrl: "https://room.example/api"});
+  const runtime = new OpenClawRoomRuntime({accountId: "t", stateFile: UNUSED_STATE_FILE, baseUrl: "https://room.example/api"});
   runtime.state = {roomId: "room-1", membershipId: "aura", cursor: 0, deliveryIntents: {}, terminalEvidence: {},
     epochSessionRoutingInitialized: true, legacySessionEpochId: ""};
   runtime.connectorSession = {sessionId: "s"};
@@ -542,7 +551,7 @@ test("P1a-09 reply marker addresses only real messages", async () => {
   const ready = {id: "attemptready992", seq: 992, type: "discussion.cycle_attempt_ready", actorRole: "system",
     actorId: "room_coordinator", payload: {cycleId: "cycle-j", epochId: "epoch-j", generation: 1, membershipId: "paula",
       round: 1, sourceEventId: zurie.id}};
-  const runtime = new OpenClawRoomRuntime({accountId: "t", stateFile: "/unused", baseUrl: "https://room.example/api"});
+  const runtime = new OpenClawRoomRuntime({accountId: "t", stateFile: UNUSED_STATE_FILE, baseUrl: "https://room.example/api"});
   runtime.state = {roomId: "room-1", membershipId: "paula", clientInstanceId: "client-1", messagePayloadDialect: "v2",
     cursor: 991, deliveryIntents: {}, terminalEvidence: {}, epochSessionRoutingInitialized: true, legacySessionEpochId: ""};
   runtime.connectorSession = {sessionId: "s"};
@@ -581,7 +590,7 @@ test("P1a-09 reply marker addresses only real messages", async () => {
   assert.equal(runtime.postNumberIndex().has(992), false);
   // The frozen post addresses 991 or nothing, never the attempt-ready event.
   // Posted directly, as in reply-marker.test.mjs, with this turn's number index.
-  const poster = new OpenClawRoomRuntime({accountId: "t", stateFile: "/unused", baseUrl: "https://room.example/api"});
+  const poster = new OpenClawRoomRuntime({accountId: "t", stateFile: UNUSED_STATE_FILE, baseUrl: "https://room.example/api"});
   poster.state = {roomId: "room-1", membershipId: "paula", clientInstanceId: "client-1", messagePayloadDialect: "v2",
     cursor: 0, deliveryIntents: {}};
   poster.persistState = async () => {};
@@ -627,7 +636,7 @@ const readyFor = (seq, source) => ({id: `attemptready${seq}`, seq, type: "discus
   actorId: "room_coordinator", payload: {cycleId: "cycle-c", epochId: "epoch-c", generation: 1, membershipId: "zurie", round: 1, sourceEventId: source.id}});
 
 async function codingTurn(page, ready, reads = [], hooks = {}) {
-  const runtime = new OpenClawRoomRuntime({accountId: "t", stateFile: "/unused", baseUrl: "https://room.example/api"});
+  const runtime = new OpenClawRoomRuntime({accountId: "t", stateFile: UNUSED_STATE_FILE, baseUrl: "https://room.example/api"});
   runtime.state = {roomId: "room-1", membershipId: "zurie", cursor: ready.seq - 1, deliveryIntents: {}, terminalEvidence: {},
     epochSessionRoutingInitialized: true, legacySessionEpochId: ""};
   runtime.connectorSession = {sessionId: "s"};

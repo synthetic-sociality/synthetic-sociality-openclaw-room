@@ -6,6 +6,15 @@ import {mkdtemp} from "node:fs/promises";
 import {tmpdir} from "node:os";
 import {join} from "node:path";
 import {saveState} from "../src/state.js";
+// Runtimes in this file get a private scratch state file: a runtime may write
+// its state (ackEvent, persistState), and the directory is made 0700.
+import {after as afterStateTests} from "node:test";
+import {mkdtemp as mkdtempState, rm as rmState} from "node:fs/promises";
+import {tmpdir as tmpdirState} from "node:os";
+import {join as joinState} from "node:path";
+const TEST_STATE_DIRECTORY = await mkdtempState(joinState(tmpdirState(), "openclaw-room-test-state-"));
+const UNUSED_STATE_FILE = joinState(TEST_STATE_DIRECTORY, "state.json");
+afterStateTests(() => rmState(TEST_STATE_DIRECTORY, {recursive: true, force: true}));
 
 function mockFetch(captured, overrides = {}) {
   return async (url, init) => {
@@ -328,7 +337,7 @@ test("missing or mismatched activity receipt sequences never acknowledge pending
   const unsafeSequence = "credentialABC123";
   for (const receipt of [{}, {acceptedStreamSeq: 999}, {acceptedStreamSeq: unsafeSequence}]) {
     const messages = [];
-    const runtime = new OpenClawRoomRuntime({accountId: "default", stateFile: "/unused", baseUrl: "https://room.example/api"}, {
+    const runtime = new OpenClawRoomRuntime({accountId: "default", stateFile: UNUSED_STATE_FILE, baseUrl: "https://room.example/api"}, {
       logger: {info: (message) => messages.push(message), warn: (message) => messages.push(message)},
     });
     runtime.state = {roomId: "room-1", membershipId: "member-1", credential: "secret"};
@@ -345,7 +354,7 @@ test("missing or mismatched activity receipt sequences never acknowledge pending
 
 test("presence rejects missing or mismatched activity receipt sequences", async () => {
   for (const receipt of [{}, {acceptedStreamSeq: 999}, {acceptedStreamSeq: "not-an-integer"}]) {
-    const runtime = new OpenClawRoomRuntime({accountId: "default", stateFile: "/unused", baseUrl: "https://room.example/api"});
+    const runtime = new OpenClawRoomRuntime({accountId: "default", stateFile: UNUSED_STATE_FILE, baseUrl: "https://room.example/api"});
     runtime.state = {roomId: "room-1", membershipId: "member-1", credential: "secret"};
     runtime.client = {publishActivity: async () => receipt};
 
@@ -359,7 +368,7 @@ test("presence rejects missing or mismatched activity receipt sequences", async 
 
 test("activity runs are immutable per source event and restart their sequence at one", async () => {
   const frames = [];
-  const runtime = new OpenClawRoomRuntime({accountId: "default", stateFile: "/unused", baseUrl: "https://room.example/api"});
+  const runtime = new OpenClawRoomRuntime({accountId: "default", stateFile: UNUSED_STATE_FILE, baseUrl: "https://room.example/api"});
   runtime.state = {roomId: "room-1", membershipId: "member-1", credential: "secret"};
   runtime.client = {
     publishActivity: async (_state, frame) => {
@@ -384,7 +393,7 @@ test("activity runs are immutable per source event and restart their sequence at
 test("a failed receipt acknowledgement is retried unchanged before lifecycle activity", async () => {
   const attempted = [];
   let failures = 1;
-  const runtime = new OpenClawRoomRuntime({accountId: "default", stateFile: "/unused", baseUrl: "https://room.example/api"});
+  const runtime = new OpenClawRoomRuntime({accountId: "default", stateFile: UNUSED_STATE_FILE, baseUrl: "https://room.example/api"});
   runtime.state = {roomId: "room-1", membershipId: "member-1", credential: "secret"};
   runtime.client = {
     publishActivity: async (_state, frame) => {

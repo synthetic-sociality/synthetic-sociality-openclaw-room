@@ -102,7 +102,19 @@ async function createTemporaryState(path, value) {
   }
 }
 
+// The state directory is created and made 0700. It is never the filesystem
+// root or a top-level directory: a state path such as "/state.json" would
+// otherwise chmod "/" (2026-10-02, a test run as root took down a gateway).
+export function assertStateDirectoryPath(directory) {
+  const resolved = resolve(String(directory ?? ""));
+  if (resolved.split(/[\\/]+/u).filter(Boolean).length < 2) {
+    throw new Error("Room state directory must be at least two levels below the filesystem root");
+  }
+  return resolved;
+}
+
 export async function ensurePrivateDirectory(directory) {
+  assertStateDirectoryPath(directory);
   await mkdir(directory, {recursive: true, mode: 0o700});
   const stat = await lstat(directory);
   if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("Room state directory must be a real directory");

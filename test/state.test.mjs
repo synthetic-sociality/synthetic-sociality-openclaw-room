@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import {mkdtemp, chmod, link, mkdir, readdir, symlink} from "node:fs/promises";
 import {tmpdir} from "node:os";
 import {join} from "node:path";
-import {defaultStateDirectory, loadState, openClawStateDirectory, saveState} from "../src/state.js";
+import {assertStateDirectoryPath, defaultStateDirectory, loadState, openClawStateDirectory, saveState} from "../src/state.js";
 
 const valid = {version: 1, baseUrl: "https://room.example/api", roomId: "r", membershipId: "m", credential: "s", clientInstanceId: "i", cursor: 0};
 
@@ -76,4 +76,22 @@ test("failed saveState removes secret-bearing temporary files", async () => {
   await mkdir(targetDirectory);
   await assert.rejects(() => saveState(targetDirectory, valid));
   assert.deepEqual((await readdir(dir)).filter((name) => name.includes(".tmp-")), []);
+});
+
+test("a state directory is never the filesystem root or a top-level directory", async () => {
+  // 2026-10-02: a test runtime with stateFile "/unused" saved state as root,
+  // and ensurePrivateDirectory chmodded "/" to 0700. Only the pure check is
+  // exercised here, so no root-level path ever reaches the filesystem.
+  for (const directory of ["/", "//", "/unused", "/tmp", "/private/", "/a/..", "/a/../b", "/./state"]) {
+    assert.throws(() => assertStateDirectoryPath(directory), /at least two levels below the filesystem root/u, directory);
+  }
+  for (const directory of ["/a/b", "/tmp/openclaw-room", "/var/lib/aura/openclaw/synthetic-sociality-room/accounts"]) {
+    assert.equal(assertStateDirectoryPath(directory), directory);
+  }
+  // A normal state file below a scratch directory is still saved.
+  const directory = await mkdtemp(join(tmpdir(), "openclaw-room-state-guard-"));
+  const stateFile = join(directory, "accounts", "default.json");
+  await saveState(stateFile, {version: 1, baseUrl: "https://room.example/api", roomId: "room-1", membershipId: "m",
+    credential: "secret", clientInstanceId: "c", cursor: 0});
+  assert.equal((await loadState(stateFile)).roomId, "room-1");
 });
