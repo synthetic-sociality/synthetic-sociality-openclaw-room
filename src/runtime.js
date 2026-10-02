@@ -1113,7 +1113,9 @@ export class OpenClawRoomRuntime {
     const facts = [];
     const offered = [];
     for (const missed of Array.isArray(this.state.missedSources) ? this.state.missedSources : []) {
-      if (answeredIds.has(missed.sourceEventId)) {
+      // Answered by this turn, or from before the current discussion: cleared
+      // without an offer (the same epoch floor as Hermes).
+      if (answeredIds.has(missed.sourceEventId) || (missed.sourceSeq > 0 && missed.sourceSeq < epochStartsAtSeq)) {
         offered.push(missed.sourceEventId);
         continue;
       }
@@ -1130,7 +1132,7 @@ export class OpenClawRoomRuntime {
             payload: {sourceEventId: missed.sourceEventId}}, epochStartsAtSeq, readPage);
         }
         offered.push(missed.sourceEventId);
-        if (!source || !Number.isSafeInteger(source.seq) || source.seq >= event.seq) continue;
+        if (!source || !Number.isSafeInteger(source.seq) || source.seq < epochStartsAtSeq || source.seq >= event.seq) continue;
         const newer = await countMessagesBetween(source.seq, event.seq, readPage);
         const time = validCanonicalTimestamp(source.ts) ? `, ${new Date(source.ts).toISOString().slice(11, 16)} UTC` : "";
         facts.push(`Missed earlier: #${source.seq} ${speakerLabel(roster, source)}${time}; ${newer.count}${newer.complete ? "" : "+"} newer ${newer.count === 1 && newer.complete ? "message" : "messages"} since.`);

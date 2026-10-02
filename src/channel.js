@@ -163,6 +163,13 @@ export function createRoomChannel({makeClient}) {
             let handlerCompleted = false;
             ctx.setStatus({...ctx.getStatus(), running: true, connected: true, lastInboundAt: Date.now(), lastError: null});
             await client.markTurnReading(event.sourceEventId ?? event.id, ctx.abortSignal);
+            // Diagnostics (OP-12 P2a): the host run is OpenClaw's only host
+            // gate; later Room events are read once it settles. Log when a
+            // turn enters it and when it leaves, so a silent agent shows why.
+            const hostSeq = Number.isSafeInteger(event.raw?.seq) ? event.raw.seq : "?";
+            const hostStartedAt = Date.now();
+            const sinceRoomEvent = Number.isFinite(event.occurredAt) ? Math.max(0, (hostStartedAt - event.occurredAt) / 1000) : 0;
+            ctx.log?.info?.(`[${ctx.accountId}] Room ${event.roomId} seq ${hostSeq} dispatched to the host after waiting ${sinceRoomEvent.toFixed(1)}s since the Room event; later Room events wait for this run`);
             try {
               await runtime.inbound.run({
               channel: ID,
@@ -294,6 +301,7 @@ export function createRoomChannel({makeClient}) {
               });
               handlerCompleted = true;
             } finally {
+              ctx.log?.info?.(`[${ctx.accountId}] Room ${event.roomId} seq ${hostSeq} host run ended after ${((Date.now() - hostStartedAt) / 1000).toFixed(1)}s`);
               // A parked reply replays its exact frozen post and keeps its attempt.
               if (event.cycleAttempt && !cycleSettled && deliveryOutcome !== "delivery_pending") {
                 // The skip record one line below already distinguishes these two

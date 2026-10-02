@@ -44,7 +44,7 @@ const readyFor = (seq, sourceEventId, membershipId = "zurie") => ({id: `attemptr
 
 // A runtime for membership `membershipId` over `events`, with a Room that
 // answers the given operations; returns the runtime and its turn iterator.
-function roomRuntime(events, {membershipId = "zurie", cursor, mode = "coordinated", start, claim} = {}) {
+function roomRuntime(events, {membershipId = "zurie", cursor, mode = "coordinated", start, claim, epochStartsAtSeq = 2900} = {}) {
   const runtime = new OpenClawRoomRuntime({accountId: "t", stateFile: join(home, `${Math.random()}.json`), baseUrl: "https://room.example/api"});
   runtime.state = {version: 1, baseUrl: "https://room.example/api", roomId: "room-1", membershipId, credential: "fixture-credential",
     clientInstanceId: "client-1", messagePayloadDialect: "v2", cursor, deliveryIntents: {}, terminalEvidence: {},
@@ -54,9 +54,9 @@ function roomRuntime(events, {membershipId = "zurie", cursor, mode = "coordinate
   runtime.logger = {info: (line) => runtime.logs.push(line), warn: (line) => runtime.logs.push(line), error: (line) => runtime.logs.push(line)};
   runtime.starts = [];
   runtime.client = {
-    readEvents: async (_state, afterSeq) => ({activeEpochId: "epoch-z", activeEpochStartsAtSeq: 2900,
+    readEvents: async (_state, afterSeq) => ({activeEpochId: "epoch-z", activeEpochStartsAtSeq: epochStartsAtSeq,
       events: events.filter((item) => item.seq > afterSeq).slice(0, 100)}),
-    roomState: async () => ({headSeq: events.at(-1).seq, activeEpoch: {id: "epoch-z", startsAtSeq: 2900}, activeTopic: {title: "Coding"}, roster: ROSTER, rules: []}),
+    roomState: async () => ({headSeq: events.at(-1).seq, activeEpoch: {id: "epoch-z", startsAtSeq: epochStartsAtSeq}, activeTopic: {title: "Coding"}, roster: ROSTER, rules: []}),
     roomPolicy: async () => ({policy: {coordinationMode: mode}}),
     listArtifacts: async () => ({items: []}),
     startDiscussionCycle: async (_state, request) => {
@@ -103,7 +103,7 @@ test("P2a-01 a host wait the connector cannot observe is bounded and falls back"
   const events = [1, 2].map((n) => ({
     id: `event-${n}`, sourceEventId: `event-${n}`, respondsToId: `event-${n}`, roomId: "room-1", epochId: "epoch-1",
     conversationId: "room-1:epoch:x", senderId: "human-1", senderName: "Owner", senderKind: "human",
-    text: `question ${n}`, occurredAt: n, raw: {}, cycleAttempt: null,
+    text: `question ${n}`, occurredAt: Date.now() - 1_500, raw: {seq: 40 + n}, cycleAttempt: null,
   }));
   const runs = [];
   const client = {
@@ -117,11 +117,12 @@ test("P2a-01 a host wait the connector cannot observe is bounded and falls back"
     close: async () => {},
   };
   const channel = createRoomChannel({makeClient: () => client});
+  const info = [];
   let status = {};
   const ctx = {
     account: {accountId: "default", stateFile: join(home, "p2a-01.json")}, accountId: "default", cfg: {},
     abortSignal: new AbortController().signal, getStatus: () => status, setStatus: (next) => { status = next; },
-    log: {info: () => {}, warn: () => {}, error: () => {}},
+    log: {info: (line) => info.push(line), warn: () => {}, error: () => {}},
     channelRuntime: {
       // Only what OpenClaw's inbound contract requires: no session-busy API.
       inbound: {run: async ({raw, adapter}) => {
@@ -141,6 +142,12 @@ test("P2a-01 a host wait the connector cannot observe is bounded and falls back"
   ]);
   assert.deepEqual(runs, ["event-1", "event-2"]);
   assert.ok(Date.now() - started < 2_000);
+  // Diagnostics: each turn logs entering and leaving the host run, with
+  // room, seq and seconds.
+  for (const seq of [41, 42]) {
+    assert.equal(info.filter((line) => new RegExp(`^\\[default\\] Room room-1 seq ${seq} dispatched to the host after waiting (1\\.[5-9]|[2-9])\\.?\\d*s since the Room event; later Room events wait for this run$`, "u").test(line)).length, 1, info.join("\n"));
+    assert.equal(info.filter((line) => new RegExp(`^\\[default\\] Room room-1 seq ${seq} host run ended after \\d+\\.\\ds$`, "u").test(line)).length, 1, info.join("\n"));
+  }
   // No source reads a host session-task internal it cannot rely on.
   for (const file of ["channel.js", "runtime.js"]) {
     const source = await readFile(new URL(`../src/${file}`, import.meta.url), "utf8");
@@ -203,6 +210,21 @@ test("P2a-03 a missed source is offered once as a procedural fact and then clear
   await turns2.return();
   assert.equal(turn.sourceEventId, ready.id);
   assert.match(turn.text, /\nMissed earlier: #2964 TJE, 09:49 UTC; 1 newer message since\.\n/u);
+
+  // Shared table: a missed source before the current discussion is not
+  // offered (missed #2900, epoch starts at 2950, turn 3000), and cleared.
+  const before = message(2900, "owner-tj", "human_owner", "Before the restart.");
+  const late = message(2999, "paula", "participant_agent", "Zurie, your turn.", {resolvedRecipientMembershipIds: ["zurie"]});
+  const floored = roomRuntime([before, late, readyFor(3000, late.id)], {cursor: 2999, epochStartsAtSeq: 2950});
+  floored.state.missedSources = [{sourceEventId: before.id, sourceSeq: 2900}];
+  const controller3 = new AbortController();
+  const turns3 = floored.assignedTurns(controller3.signal);
+  const floorTurn = await nextTurn(turns3);
+  controller3.abort();
+  await turns3.return();
+  assert.equal(floorTurn.sourceEventId, "attemptready3000");
+  assert.doesNotMatch(floorTurn.text, /Missed earlier/u);
+  assert.equal(floored.state.missedSources, undefined);
 });
 
 test("P2a-04 a coordinated ask without retry starts a cycle for its target", async () => {
