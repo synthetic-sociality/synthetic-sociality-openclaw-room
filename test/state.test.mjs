@@ -78,7 +78,7 @@ test("failed saveState removes secret-bearing temporary files", async () => {
   assert.deepEqual((await readdir(dir)).filter((name) => name.includes(".tmp-")), []);
 });
 
-test("a state directory is never the filesystem root or a top-level directory", async () => {
+test("P2a-05 the state directory is never the filesystem root", async () => {
   // 2026-10-02: a test runtime with stateFile "/unused" saved state as root,
   // and ensurePrivateDirectory chmodded "/" to 0700. Only the pure check is
   // exercised here, so no root-level path ever reaches the filesystem.

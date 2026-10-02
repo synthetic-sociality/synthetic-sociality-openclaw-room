@@ -151,6 +151,12 @@ export function validateState(value) {
     !value.deliveryIntents || typeof value.deliveryIntents !== "object" || Array.isArray(value.deliveryIntents)
   )) throw new Error("Room delivery intents are invalid");
   for (const [key, intent] of Object.entries(value.deliveryIntents ?? {})) validateDeliveryIntent(key, intent, value);
+  // Contract P2a-3: sources whose turn never reached the model, offered once.
+  if (value.missedSources !== undefined && (
+    !Array.isArray(value.missedSources) || value.missedSources.length > 8
+    || value.missedSources.some((item) => !item || typeof item.sourceEventId !== "string" || !item.sourceEventId
+      || item.sourceEventId.length > 128 || !Number.isSafeInteger(item.sourceSeq) || item.sourceSeq < 0)
+  )) throw new Error("Room missed sources are invalid");
   if (value.terminalEvidence !== undefined && (
     !value.terminalEvidence || typeof value.terminalEvidence !== "object" || Array.isArray(value.terminalEvidence)
   )) throw new Error("Room terminal evidence ledger is invalid");

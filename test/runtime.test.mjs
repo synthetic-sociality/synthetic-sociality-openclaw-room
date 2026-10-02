@@ -540,10 +540,14 @@ test("explicit owner retry targets only the non-summary agent and never calls a 
     assert.deepEqual(starts[0].roster, [{membershipId: "second", displayName: "second"}]);
     assert.equal(starts[0].sourceEventId, "retry");
   }
+  // Contract P2a-4: an addressed ask starts a cycle with or without
+  // retryUnavailable, for every resolved target and only for them.
   for (const args of [{}, {retryUnavailable: "true"}]) {
-    assert.equal(isAssignedEvent({...event, payload: {command: {...event.payload.command, arguments: args}}}, "second"), false);
+    assert.equal(isAssignedEvent({...event, payload: {command: {...event.payload.command, arguments: args}}}, "second"), true);
   }
-  assert.equal(isAssignedEvent({...event, payload: {command: {...event.payload.command, resolvedTargetMembershipIds: ["first", "second"]}}}, "second"), false);
+  const both = {...event, payload: {command: {...event.payload.command, resolvedTargetMembershipIds: ["first", "second"]}}};
+  assert.equal(isAssignedEvent(both, "second"), true);
+  assert.equal(isAssignedEvent(both, "third"), false);
 });
 
 test("open-room agent contribution replies directly while a cycle-bound contribution continues its cycle", async () => {

@@ -25,6 +25,8 @@ export const HANDOVER_CONTEXT_CHARACTER_LIMIT = 12_000;
 // the same limit as in Hermes; see canonicalRoomContext.
 export const CONTEXT_CHARACTER_LIMIT = 12_000;
 export const CONTEXT_SCAN_LIMIT = 2_000;
+// At most this many missed sources wait for the next model turn (P2a-3).
+export const MISSED_SOURCE_LIMIT = 8;
 export const CONTEXT_SCAN_CHUNK = 100;
 const CONTEXT_FOOTER = "[/Canonical Room context]";
 
@@ -685,6 +687,8 @@ export class OpenClawRoomRuntime {
         }
         const cycleAttempt = await this.prepareCycleAttempt(event, signal);
         if (cycleAttempt?.refused) {
+          // Refused before the model ran: offered on the next turn (P2a-3).
+          if (event.type === "message.posted") await this.noteMissedSource(String(event.id), event.seq);
           await this.recordTerminalEvidence(event, "skipped", {reason: cycleAttempt.refused});
           this.logger?.info?.(`Room delivery skipped ${outcomeLogFields({code: cycleAttempt.refused, sourceSeq: event.seq})}`);
           await this.ackEvent(event);
@@ -703,6 +707,8 @@ export class OpenClawRoomRuntime {
         this.contextDiscussionStart = null;
         this.contextSenderName = "";
         this.contextCycleSource = null;
+        this.contextMissedFacts = [];
+        this.contextMissedOffered = [];
         const sharedContext = await this.sharedRoomContext(event, pageEpoch, signal);
         const normalized = normalizeEvent(
           event,
@@ -715,7 +721,9 @@ export class OpenClawRoomRuntime {
           this.contextDiscussionStart,
           this.contextSenderName,
           this.contextCycleSource,
+          this.contextMissedFacts,
         );
+        await this.clearMissedSources(this.contextMissedOffered);
         // The model runs while the consumer holds this yield; keep its claimed
         // attempt alive until a terminal outcome is recorded or it returns.
         if (normalized.cycleAttempt) this.startAttemptLease(event, normalized.cycleAttempt);
@@ -1006,6 +1014,10 @@ export class OpenClawRoomRuntime {
       authorRole: String(sourceMessage.actorRole ?? ""),
     } : null;
     const roomContext = canonicalRoomContext(state, page?.events, sourceMessage?.id ?? event?.id, policy, sourceEpoch.startsAtSeq, startEvent);
+    const answered = new Set([String(event?.id ?? ""), String(sourceMessage?.id ?? ""), String(eventPayload(event?.payload).sourceEventId ?? "")]);
+    const missed = await this.missedSourceFacts(event, page?.events, state?.roster, sourceEpoch.startsAtSeq, answered, signal);
+    this.contextMissedFacts = missed.facts;
+    this.contextMissedOffered = missed.offered;
     const library = await this.client.listArtifacts(this.state, signal);
     const artifactContext = await sourceArtifactContext(
       event,
@@ -1074,7 +1086,71 @@ export class OpenClawRoomRuntime {
     }
     if (!payload.cycleId) return null;
     if (event.type !== "discussion.cycle_attempt_ready") return false;
-    return this.claimAssignedAttempt(String(payload.cycleId), signal);
+    const claimed = await this.claimAssignedAttempt(String(payload.cycleId), signal);
+    // Unclaimed or expired: the model never saw this attempt's source (P2a-3).
+    if (claimed === false) await this.noteMissedSource(String(payload.sourceEventId ?? ""));
+    return claimed;
+  }
+
+  // Contract P2a-3: a source whose turn never reached the model is offered
+  // once on the next model turn. Bounded, durable, one entry per source.
+  async noteMissedSource(sourceEventId, sourceSeq = 0) {
+    if (!sourceEventId) return;
+    let seq = Number.isSafeInteger(sourceSeq) && sourceSeq > 0 ? sourceSeq : 0;
+    if (!seq) {
+      for (const [number, id] of this.postNumberIndex()) if (id === sourceEventId) seq = number;
+    }
+    const kept = (Array.isArray(this.state.missedSources) ? this.state.missedSources : [])
+      .filter((item) => item.sourceEventId !== sourceEventId);
+    this.state.missedSources = [...kept, {sourceEventId, sourceSeq: seq}].slice(-MISSED_SOURCE_LIMIT);
+    await this.persistState();
+  }
+
+  // The fact lines for missed sources, each resolved by bounded reads: its
+  // number, speaker label, time and the count of newer messages before this
+  // turn. Nothing else; no wording about what to do (P1a-1, P2a-3).
+  async missedSourceFacts(event, pageEvents, roster, epochStartsAtSeq, answeredIds, signal) {
+    const facts = [];
+    const offered = [];
+    for (const missed of Array.isArray(this.state.missedSources) ? this.state.missedSources : []) {
+      if (answeredIds.has(missed.sourceEventId)) {
+        offered.push(missed.sourceEventId);
+        continue;
+      }
+      try {
+        const readPage = (after) => this.client.readEvents(this.state, after, {wait: 0, signal});
+        let source = (Array.isArray(pageEvents) ? pageEvents : [])
+          .find((item) => item?.type === "message.posted" && String(item.id ?? "") === missed.sourceEventId);
+        if (!source && missed.sourceSeq > 0) {
+          source = ((await readPage(missed.sourceSeq - 1))?.events ?? [])
+            .find((item) => item?.type === "message.posted" && String(item.id ?? "") === missed.sourceEventId && item.seq === missed.sourceSeq);
+        }
+        if (!source) {
+          source = await scanCycleSourceMessage({type: "discussion.cycle_attempt_ready", seq: event.seq,
+            payload: {sourceEventId: missed.sourceEventId}}, epochStartsAtSeq, readPage);
+        }
+        offered.push(missed.sourceEventId);
+        if (!source || !Number.isSafeInteger(source.seq) || source.seq >= event.seq) continue;
+        const newer = await countMessagesBetween(source.seq, event.seq, readPage);
+        const time = validCanonicalTimestamp(source.ts) ? `, ${new Date(source.ts).toISOString().slice(11, 16)} UTC` : "";
+        facts.push(`Missed earlier: #${source.seq} ${speakerLabel(roster, source)}${time}; ${newer.count}${newer.complete ? "" : "+"} newer ${newer.count === 1 && newer.complete ? "message" : "messages"} since.`);
+      } catch (error) {
+        if (signal?.aborted) throw error;
+        // Not offered: it stays for a later turn.
+        if (offered.at(-1) === missed.sourceEventId) offered.pop();
+        this.logger?.warn?.(`Room missed source unavailable${roomErrorDiagnostic(error)}`);
+      }
+    }
+    return {facts, offered};
+  }
+
+  // Offered once, then cleared durably before the turn is handed to the host.
+  async clearMissedSources(offered) {
+    if (!offered?.length || !Array.isArray(this.state.missedSources)) return;
+    const remaining = this.state.missedSources.filter((item) => !offered.includes(item.sourceEventId));
+    if (remaining.length) this.state.missedSources = remaining;
+    else delete this.state.missedSources;
+    await this.persistState();
   }
 
   async ensureDiscussionCycle(event, signal) {
@@ -1090,8 +1166,8 @@ export class OpenClawRoomRuntime {
       roster = roster.filter((member) => selected.has(String(member.membershipId)));
     } else if (resolved?.size) roster = roster.filter((member) => resolved.has(String(member.membershipId)));
     if (event.type === "human.command") {
-      if (isExplicitExecutionRetry(event)) {
-        const targets = payload.command.resolvedTargetMembershipIds;
+      if (isAddressedAsk(event)) {
+        const targets = payload.command.resolvedTargetMembershipIds.map(String);
         roster = roster.filter((member) => targets.includes(String(member.membershipId)));
       } else {
         const policy = await this.client.roomPolicy(this.state, signal);
@@ -2204,7 +2280,7 @@ export function isAssignedEvent(event, membershipId) {
     return String(eventPayload(event.payload).membershipId ?? "") === String(membershipId);
   }
   if (event?.type === "human.command") return isHumanCycleSource(event)
-    && (!isExplicitExecutionRetry(event) || eventPayload(event.payload).command.resolvedTargetMembershipIds.includes(String(membershipId)));
+    && (!isAddressedAsk(event) || eventPayload(event.payload).command.resolvedTargetMembershipIds.map(String).includes(String(membershipId)));
   return isAssignedMessage(event, membershipId);
 }
 
@@ -2226,17 +2302,20 @@ function isHumanCycleSource(event) {
   if (!(role === "human" || role.startsWith("human_") || role === "agent_owner")) return false;
   if (event?.type === "message.posted") return true;
   const command = eventPayload(event?.payload).command;
-  return event?.type === "human.command" && (command?.command === "summarize" || isExplicitExecutionRetry(event));
+  return event?.type === "human.command" && (command?.command === "summarize" || isAddressedAsk(event));
 }
 
-// Only canonical, explicitly targeted retry intent opts into this ask path.
-// Ownership and execution admission remain server decisions, never model prose.
-function isExplicitExecutionRetry(event) {
-  const command = eventPayload(event?.payload).command;
+// Contract P2a-4: a human ask addressed to agents (resolved target
+// memberships) starts a cycle for them in open and coordinated Rooms, with or
+// without retryUnavailable. Ownership and execution admission remain server
+// decisions, never model prose. An ask that already carries a server cycle is
+// not started again.
+function isAddressedAsk(event) {
+  const payload = eventPayload(event?.payload);
+  const command = payload.command;
   return event?.type === "human.command" && command?.command === "ask"
-    && command?.arguments?.retryUnavailable === true
-    && Array.isArray(command.resolvedTargetMembershipIds) && command.resolvedTargetMembershipIds.length === 1
-    && (!command.targetSelectors || command.targetSelectors.length === 0);
+    && Array.isArray(command.resolvedTargetMembershipIds) && command.resolvedTargetMembershipIds.length > 0
+    && !String(payload.cycleId ?? "").trim();
 }
 
 function isGeneralAgentPost(payload) {
@@ -2437,6 +2516,7 @@ export function normalizeEvent(
   discussionStart = null,
   senderName = "",
   cycleSource = null,
+  missedFacts = [],
 ) {
   const payload = eventPayload(event.payload);
   const actorRole = String(event.actorRole ?? "");
@@ -2469,7 +2549,7 @@ export function normalizeEvent(
     senderId: author.id,
     senderName: author.name,
     senderKind: author.role === "human" || author.role.startsWith("human_") ? "human" : "agent",
-    text: cyclePrompt(event, payload, cycleAttempt, sharedContext, policyWordLimit, discussionStart, currentItem),
+    text: cyclePrompt(event, payload, cycleAttempt, sharedContext, policyWordLimit, discussionStart, currentItem, missedFacts),
     occurredAt: Date.parse(event.ts) || Date.now(),
     raw: event,
     cycleAttempt,
@@ -2494,7 +2574,7 @@ export function positiveWordLimit(value) {
 }
 
 // Delivery contract P1a-3: procedural facts only, numbers rather than advice.
-export function roomTurnFacts({phase = "", cycleAttempt = null, policyWordLimit = 0, command = ""} = {}) {
+export function roomTurnFacts({phase = "", cycleAttempt = null, policyWordLimit = 0, command = "", missed = []} = {}) {
   const lines = [];
   if (command) lines.push(`Room command: ${command}`);
   if (cycleAttempt) {
@@ -2514,6 +2594,8 @@ export function roomTurnFacts({phase = "", cycleAttempt = null, policyWordLimit 
     ? positiveWordLimit(cycleAttempt?.cycle?.budgets?.maxContributionWords)
     : positiveWordLimit(policyWordLimit);
   if (words) lines.push(`Word limit per response: ${words} (${cycleAttempt ? "discussion cycle budget" : "Room policy"})`);
+  // Contract P2a-3: missed sources as facts only.
+  for (const line of Array.isArray(missed) ? missed : []) if (line) lines.push(line);
   lines.push(ROOM_PASS_ENVELOPE);
   return ["[Room turn facts]", ...lines, "[/Room turn facts]"].join("\n");
 }
@@ -2573,6 +2655,25 @@ export async function scanCycleSourceMessage(event, epochStartsAtSeq, readPage) 
   return null;
 }
 
+// Messages after `fromSeq` and before `toSeq`, read forward in pages of
+// CONTEXT_SCAN_CHUNK up to CONTEXT_SCAN_LIMIT sequence numbers (P2a-3).
+export async function countMessagesBetween(fromSeq, toSeq, readPage) {
+  const end = Math.min(toSeq, fromSeq + 1 + CONTEXT_SCAN_LIMIT);
+  let after = fromSeq;
+  let count = 0;
+  while (after < end - 1) {
+    let last = after;
+    for (const item of (await readPage(after))?.events ?? []) {
+      if (!Number.isSafeInteger(item?.seq) || item.seq <= after || item.seq >= end) continue;
+      if (item.type === "message.posted") count += 1;
+      last = Math.max(last, item.seq);
+    }
+    if (last === after) break;
+    after = last;
+  }
+  return {count, complete: toSeq <= fromSeq + 1 + CONTEXT_SCAN_LIMIT};
+}
+
 // Delivery contract P1a-8, as Hermes renders its current input:
 // "#<seq> <speaker label>: <body>", the body verbatim and unshortened.
 export function currentItemLine(message, label) {
@@ -2583,14 +2684,14 @@ export function currentItemLine(message, label) {
   return `${number}${label}: ${body}`;
 }
 
-function cyclePrompt(event, payload, cycleAttempt, sharedContext = "", policyWordLimit = 0, discussionStart = null, currentItem = "") {
+function cyclePrompt(event, payload, cycleAttempt, sharedContext = "", policyWordLimit = 0, discussionStart = null, currentItem = "", missed = []) {
   const context = String(sharedContext ?? "").trim();
   const preface = context ? [context, ROOM_HISTORY_INSTRUCTION] : [];
   if (event.type === "discussion.cycle_attempt_ready") {
     const phase = String(payload.phase ?? "follow_up").trim();
     return [
       ...preface,
-      roomTurnFacts({phase, cycleAttempt, policyWordLimit}),
+      roomTurnFacts({phase, cycleAttempt, policyWordLimit, missed}),
       ...(discussionStart ? [discussionStartBlock(discussionStart)] : []),
       ...(currentItem ? [currentItem] : []),
       roomSupplied("Room phase instruction — server-provided", payload.phaseInstruction),
@@ -2600,18 +2701,18 @@ function cyclePrompt(event, payload, cycleAttempt, sharedContext = "", policyWor
     const command = String(payload?.command?.command ?? "").trim();
     return [
       ...preface,
-      roomTurnFacts({command: command || "unnamed", policyWordLimit}),
+      roomTurnFacts({command: command || "unnamed", policyWordLimit, missed}),
       roomSupplied(`Room command ${command || "unnamed"} — owner instruction`, commandInstruction(payload)),
     ].filter(Boolean).join("\n\n");
   }
   const text = currentItem || String(payload.body ?? payload.text ?? "").trim();
   if (!cycleAttempt) {
-    return [...preface, roomTurnFacts({policyWordLimit}), text].filter(Boolean).join("\n\n");
+    return [...preface, roomTurnFacts({policyWordLimit, missed}), text].filter(Boolean).join("\n\n");
   }
   const {phase, instruction} = cyclePhaseInstruction(cycleAttempt.attempt, cycleAttempt.cycle, payload);
   return [
     ...(context ? [context] : []),
-    roomTurnFacts({phase, cycleAttempt, policyWordLimit}),
+    roomTurnFacts({phase, cycleAttempt, policyWordLimit, missed}),
     text,
     roomSupplied("Room phase instruction — server-provided", instruction),
   ].filter(Boolean).join("\n\n");

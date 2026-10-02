@@ -797,7 +797,7 @@ test("an outbound post superseded by an epoch advance names its reason", async (
   await live.plugin.gateway.startAccount(channelContext(join(home, "outbound-epoch.json"), async () => {}));
 });
 
-test("a transient renewal failure within the lease is retried and the turn is posted (canary 2026-10-02 07:48)", async () => {
+test("P2a-06 a transient renewal failure keeps a turn with a valid lease", async () => {
   // Live sequence, Zurie attempt 06wh3u60zhz5jnm: claim ok, first renewal ok,
   // second renewal failed client-side (no request reached the Room) and
   // superseded a 120 s lease that still had about 60 s left. Now: logged with
@@ -847,7 +847,7 @@ test("a transient renewal failure within the lease is retried and the turn is po
   }
 });
 
-test("a refused cycle start skips its source and the scan continues (canary 2026-10-02 07:49)", async () => {
+test("P2a-02 a refused cycle start is skipped and the scan continues", async () => {
   // Live: Zurie was not execution-ready after a failed attempt, so starting
   // the cycle for the owner's @Zurie message 2964 was refused with 409
   // cycle_conflict; the channel exited and replayed 2964 forever. Now 2964 is
