@@ -132,6 +132,15 @@
     "P1a-11": "P1a-11 the host session speaker is the author of the message the turn answers",
     "P1a-12": "P1a-12 a source message older than the loaded context is still the current item"
   },
+  "parityP2aContract": "docs/delivery-lifecycle-contract-v1.md#p2a--equal-access-after-missed-turns-2026-10-02",
+  "parityP2aCases": {
+    "P2a-01": "P2a-01 a host wait the connector cannot observe is bounded and falls back",
+    "P2a-02": "P2a-02 a refused cycle start is skipped and the scan continues",
+    "P2a-03": "P2a-03 a missed source is offered once as a procedural fact and then cleared",
+    "P2a-04": "P2a-04 a coordinated ask without retry starts a cycle for its target",
+    "P2a-05": "P2a-05 the state directory is never the filesystem root",
+    "P2a-06": "P2a-06 a transient renewal failure keeps a turn with a valid lease"
+  },
   "presentationAcknowledgementFixtures": {
     "before_coordination_and_model": "receive-boundary acknowledgement precedes coordination and model dispatch",
     "separate_from_durable_cursor_ack": "durable cursor acknowledgement does not emit presentation acknowledgement"
