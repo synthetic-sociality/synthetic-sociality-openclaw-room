@@ -38,6 +38,8 @@ export class LocalStatus {
       startedAt: now(),
       updatedAt: now(),
       secretStore: "isolated",
+      secretStoreReasons: [],
+      secretIsolationEnforced: false,
       rooms: {},
     };
   }
@@ -46,8 +48,11 @@ export class LocalStatus {
     return structuredClone(this.data);
   }
 
-  setSecretStore(value) {
-    this.data.secretStore = value === "reachable" ? "reachable" : "isolated";
+  setSecretStore(value, reasons = [], {enforced = false} = {}) {
+    const reachable = value === "reachable";
+    this.data.secretStore = reachable ? "reachable" : "isolated";
+    this.data.secretStoreReasons = reachable ? reasons.map(code).filter(Boolean) : [];
+    this.data.secretIsolationEnforced = Boolean(enforced);
     this.write();
   }
 

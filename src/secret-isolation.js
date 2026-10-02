@@ -5,23 +5,34 @@
 // gateway host unless they are denied or sandboxed. Nothing in this process can
 // fence a host shell, so the connector:
 //
-// 1. refuses to start while the store is reachable (storeReachability): fs
-//    tools not workspace-only, a workspace that contains the store, or host
-//    shell tools (not denied, not sandboxed for every agent, elevated on, a
-//    sandbox bind over the store);
+// 1. reports whether the store is reachable (storeReachability): fs tools not
+//    workspace-only, a workspace that contains the store, or host shell tools
+//    (not denied, not sandboxed for every agent, elevated on, a sandbox bind
+//    over the store); it refuses to start while the store is reachable only
+//    when the installation enables enforceSecretIsolation
+//    (plugins.entries.synthetic-sociality-room.config);
 // 2. blocks, in every session, any tool call whose path arguments resolve into
 //    the store (or, for a search, contain it), and any shell call that names it
 //    (toolCallBlock); a hook error blocks;
 // 3. removes the exact credential and renewal secret values from persisted tool
 //    results and from its own log lines (scrub).
 //
-// The install script sets the host configuration. Reason codes never contain a
-// path or a secret.
+// Before enforcement is switched on, the host configuration is set. Reason
+// codes never contain a path or a secret.
 import {realpathSync} from "node:fs";
 import {homedir} from "node:os";
 import {dirname, isAbsolute, join, relative, resolve, sep} from "node:path";
 
 export const REFUSAL_CODE = "secret_store_reachable";
+// The per-installation switch: off reports and keeps running, on refuses.
+export const ENFORCEMENT_SETTING = "enforceSecretIsolation";
+
+// The installation's switch, read from the plugin's own config entry.
+export function secretIsolationEnforced(cfg, pluginId = "synthetic-sociality-room") {
+  const value = cfg?.plugins?.entries?.[pluginId]?.config?.[ENFORCEMENT_SETTING];
+  if (typeof value === "string") return ["1", "true", "yes", "on"].includes(value.trim().toLowerCase());
+  return value === true;
+}
 export const BLOCK_MESSAGE = "Blocked by the Synthetic Sociality Room connector: its private state holds the Room credential and is not available to agent tools.";
 export const REDACTED = "[redacted Room credential]";
 export const STORE_DIRECTORY_NAME = "synthetic-sociality-room";

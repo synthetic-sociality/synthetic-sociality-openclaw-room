@@ -210,35 +210,64 @@ test("P2c-01 the credential is not readable through the agent's tools and never 
   assert.deepEqual(gate({...ISOLATED_HOST_CONFIG, agents: {defaults: {workspace: stateDir}}}), ["workspace_covers_store"]);
   assert.deepEqual(gate({...ISOLATED_HOST_CONFIG, tools: {...ISOLATED_HOST_CONFIG.tools, exec: {applyPatch: {workspaceOnly: false}}}}), ["fs_tools_unfenced"]);
 
-  // The channel refuses to start under a reachable store: no client, the
-  // status says why, logged once, and it waits for the host's stop.
-  resetLocalStatusWriters();
-  resetSecretRefusalLog();
-  let made = 0;
-  const channel = createRoomChannel({makeClient: () => { made += 1; throw new Error("must not start"); }});
-  const errors = [];
-  const start = async () => {
-    const controller = new AbortController();
-    let status = {};
-    const running = channel.plugin.gateway.startAccount({
-      account: {accountId: "zurie", stateFile}, accountId: "zurie", abortSignal: controller.signal, cfg: {},
-      channelRuntime: {inbound: {run: async () => {}}}, getStatus: () => status, setStatus: (next) => { status = next; },
-      log: {info: () => {}, warn: () => {}, error: (line) => errors.push(line)},
-    });
-    await new Promise((resolve) => setTimeout(resolve, 50));
-    controller.abort();
-    await running;
-    return status;
+  // The channel under a reachable store. Report-only (the default): logged
+  // once, the status says why, and the account starts. Enforced
+  // (enforceSecretIsolation on): no client, logged once, it waits for the
+  // host's stop. The fence above is active in both modes.
+  const enforcing = {plugins: {entries: {"synthetic-sociality-room": {config: {enforceSecretIsolation: true}}}}};
+  const startOnce = async (cfg) => {
+    resetLocalStatusWriters();
+    let made = 0;
+    const client = {
+      initialize: async () => ({sessionId: "session-1"}),
+      assignedTurns: async function* (signal) { await new Promise((resolve) => signal.addEventListener("abort", resolve, {once: true})); },
+      close: async () => {},
+    };
+    const channel = createRoomChannel({makeClient: () => { made += 1; return client; }});
+    const lines = {warn: [], error: []};
+    const run = async () => {
+      const controller = new AbortController();
+      let status = {};
+      const running = channel.plugin.gateway.startAccount({
+        account: {accountId: "zurie", stateFile}, accountId: "zurie", abortSignal: controller.signal, cfg,
+        channelRuntime: {inbound: {run: async () => {}}}, getStatus: () => status, setStatus: (next) => { status = next; },
+        log: {info: () => {}, warn: (line) => lines.warn.push(line), error: (line) => lines.error.push(line)},
+      });
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      controller.abort();
+      await running;
+      return status;
+    };
+    resetSecretRefusalLog();
+    const first = await run();
+    await run();
+    return {made, first, lines, written: JSON.parse(await readFile(join(STORE, "status.json"), "utf8"))};
   };
-  const first = await start();
-  await start();
-  assert.equal(made, 0);
-  assert.equal(first.lastError, "secret_store_reachable");
-  assert.equal(errors.length, 1);
-  assert.match(errors[0], /refused to start: secret_store_reachable \(fs_tools_unfenced,host_shell_tools\)/);
-  const written = JSON.parse(await readFile(join(STORE, "status.json"), "utf8"));
-  assert.equal(written.secretStore, "reachable");
-  assert.doesNotMatch(JSON.stringify(written), new RegExp(FAKE_CREDENTIAL));
+  const reporting = await startOnce({});
+  assert.equal(reporting.made, 2, "report-only: the account starts");
+  assert.notEqual(reporting.first.lastError, "secret_store_reachable");
+  assert.equal(reporting.lines.error.length, 0);
+  const reports = reporting.lines.warn.filter((line) => line.includes("secret_store_reachable (fs_tools_unfenced,host_shell_tools)"));
+  assert.equal(reports.length, 1, reporting.lines.warn.join(" | "));
+  assert.match(reports[0], /reporting only/);
+  assert.deepEqual([reporting.written.secretStore, reporting.written.secretStoreReasons, reporting.written.secretIsolationEnforced],
+    ["reachable", ["fs_tools_unfenced", "host_shell_tools"], false]);
+  for (const cfg of [enforcing, {plugins: {entries: {"synthetic-sociality-room": {config: {enforceSecretIsolation: "true"}}}}}]) {
+    const refused = await startOnce(cfg);
+    assert.equal(refused.made, 0, "enforced: no client");
+    assert.equal(refused.first.lastError, "secret_store_reachable");
+    assert.equal(refused.lines.error.length, 1);
+    assert.match(refused.lines.error[0], /refused to start: secret_store_reachable \(fs_tools_unfenced,host_shell_tools\)/);
+    assert.deepEqual([refused.written.secretStore, refused.written.secretIsolationEnforced], ["reachable", true]);
+    assert.doesNotMatch(JSON.stringify(refused.written), new RegExp(FAKE_CREDENTIAL));
+  }
+  const isolatedEnforced = await startOnce({...ISOLATED_HOST_CONFIG, ...enforcing});
+  assert.equal(isolatedEnforced.made, 2, "enforced on an isolated host: starts");
+  assert.deepEqual([isolatedEnforced.written.secretStore, isolatedEnforced.written.secretStoreReasons], ["isolated", []]);
+  // The switch is declared in the plugin's strict config schema.
+  const manifest = JSON.parse(await readFile(join(root, "openclaw.plugin.json"), "utf8"));
+  assert.deepEqual(manifest.configSchema.properties.enforceSecretIsolation, {type: "boolean"});
+  assert.equal(conformance.parityP2cEnforcementSetting, isolation.ENFORCEMENT_SETTING);
 
   // 4. Never in a persisted tool result, a log line, or the model prompt.
   isolation.forgetSecrets();

@@ -18,7 +18,7 @@ import {
   RELEASED_ATTEMPT_EXECUTION_FAILURE,
   statusErrorCode,
 } from "./runtime.js";
-import {BLOCK_MESSAGE, REFUSAL_CODE, scrubDeep, scrubbingLogger, storeReachability, toolCallBlock} from "./secret-isolation.js";
+import {BLOCK_MESSAGE, REFUSAL_CODE, scrubDeep, scrubbingLogger, secretIsolationEnforced, storeReachability, toolCallBlock} from "./secret-isolation.js";
 import {localStatusFor} from "./local-status.js";
 import {ROOM_CONNECTOR_PROVENANCE} from "./release-provenance.js";
 import {
@@ -205,12 +205,19 @@ export function createRoomChannel({makeClient}) {
         let registered = false;
         const localStatus = roomLocalStatus(ctx.log);
         try {
-          // Contract P2c-1: never start while the agent's tools can reach the
-          // store that holds the Room credential. Wait for the host's stop
-          // instead of failing, so the host does not restart into it again.
+          // Contract P2c-1: report whether the agent's tools can reach the
+          // store that holds the Room credential; refuse to start only when
+          // this installation enables enforceSecretIsolation (off by default).
+          // A refusal waits for the host's stop instead of failing, so the host
+          // does not restart into it again. Fence and scrubbing stay active.
           const reasons = storeReachability(ctx.cfg, roomStoreDirectories(ctx.cfg), {stateDir: openClawStateDirectory()});
-          if (reasons.length) {
-            localStatus.setSecretStore("reachable");
+          const enforced = secretIsolationEnforced(ctx.cfg);
+          localStatus.setSecretStore(reasons.length ? "reachable" : "isolated", reasons, {enforced});
+          if (reasons.length && !enforced && !secretRefusalLogged) {
+            secretRefusalLogged = true;
+            ctx.log?.warn?.(`Room connector: ${REFUSAL_CODE} (${reasons.join(",")}). The agent's file or shell tools could read the Room credential; reporting only (enforceSecretIsolation is off), the path fence and scrubbing stay active.`);
+          }
+          if (reasons.length && enforced) {
             const saved = await loadState(ctx.account.stateFile).catch(() => null);
             if (saved?.roomId) localStatus.room(String(saved.roomId), String(saved.membershipId ?? ""), {connection: "stopped", errorCode: REFUSAL_CODE});
             if (!secretRefusalLogged) {
@@ -221,7 +228,6 @@ export function createRoomChannel({makeClient}) {
             await untilAborted(ctx.abortSignal);
             return;
           }
-          localStatus.setSecretStore("isolated");
           const replyPolicy = roomReplyDeliveryPolicy();
           ctx.setStatus({...ctx.getStatus(), running: true, connected: false, lastError: null});
           await markChannelActive(ctx.accountId);
