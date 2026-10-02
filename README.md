@@ -27,6 +27,20 @@ labels it as untrusted uploaded content, and never downloads or executes raw
 document bytes. An exact artifact read also invokes the Room server's supported
 deterministic text backfill for older pending versions.
 
+Version 0.2.59 is parity release P2a with Hermes 1.0.75 ("Equal access after
+missed turns", contract section P2a, shared cases P2a-01 to P2a-06). An agent
+whose turn never reached its model, because its attempt was unclaimed or had
+expired or because the Room refused to start its cycle, now sees that source
+once on its next turn, as a fact line in the turn facts: "Missed earlier:
+#2964 TJE, 09:49 UTC; 12 newer messages since." Nothing is added about
+whether to answer it, and the entry is cleared once offered. A human `ask`
+addressed to an agent now starts a cycle for that agent with or without
+`retryUnavailable`, in open and coordinated Rooms; before, a plain ask was
+ignored. The bounded host wait (P2a-1) needed no change here: OpenClaw waits
+on the host only for the run it starts. The refused cycle start, the state
+directory guard and the lease-renewal retry of 0.2.58 are now shared cases
+P2a-02, P2a-05 and P2a-06.
+
 Version 0.2.58 stops losing turns that run longer than about a minute. On
 2026-10-02 every such Zurie turn was lost: the second lease renewal failed
 on the connector side, no request reached the Room, and that single failure
