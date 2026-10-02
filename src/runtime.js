@@ -926,11 +926,19 @@ export class OpenClawRoomRuntime {
     // current item, not a transcript entry.
     // A source older than the loaded page is read by a bounded scan of the
     // epoch, as in Hermes (context.py cycle_source_message).
-    const sourceMessage = cycleSourceMessage(event, page?.events)
-      ?? (startEvent && String(eventPayload(event?.payload).sourceEventId ?? "") === String(startEvent.id ?? "")
-        ? null
-        : await scanCycleSourceMessage(event, sourceEpoch.startsAtSeq,
-          (after) => this.client.readEvents(this.state, after, {wait: 0, signal})));
+    let sourceMessage = cycleSourceMessage(event, page?.events);
+    if (!sourceMessage && !(startEvent && String(eventPayload(event?.payload).sourceEventId ?? "") === String(startEvent.id ?? ""))) {
+      // Enrichment only, as in Hermes: a failed read leaves the turn without
+      // the current item instead of losing the claimed attempt.
+      try {
+        sourceMessage = await scanCycleSourceMessage(event, sourceEpoch.startsAtSeq,
+          (after) => this.client.readEvents(this.state, after, {wait: 0, signal}));
+      } catch (error) {
+        if (signal?.aborted) throw error;
+        this.logger?.warn?.(`Room ${this.state.roomId} cycle source unavailable: ${error?.message ?? error}`);
+        sourceMessage = null;
+      }
+    }
     if (sourceMessage) this.rememberPostNumbers([sourceMessage]);
     // The host session speaker is the source's author (P1a-7), as in Hermes.
     this.contextCycleSource = sourceMessage ? {

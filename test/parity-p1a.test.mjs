@@ -12,6 +12,7 @@ import {
   normalizeEvent, scanCycleSourceMessage, sourceArtifactContext,
 } from "../src/runtime.js";
 import {registerRoomCommands} from "../src/commands.js";
+import {RoomAPIError} from "../src/room-client.js";
 import {readRoomHistory, registerRoomHistoryTool, resetHistoryScanCache} from "../src/history.js";
 import {speakerName} from "../src/speaker.js";
 
@@ -625,7 +626,7 @@ const paula = message(1026, "paula", "participant_agent", PAULA, {respondsTo: [z
 const readyFor = (seq, source) => ({id: `attemptready${seq}`, seq, type: "discussion.cycle_attempt_ready", actorRole: "system",
   actorId: "room_coordinator", payload: {cycleId: "cycle-c", epochId: "epoch-c", generation: 1, membershipId: "zurie", round: 1, sourceEventId: source.id}});
 
-async function codingTurn(page, ready, reads = []) {
+async function codingTurn(page, ready, reads = [], hooks = {}) {
   const runtime = new OpenClawRoomRuntime({accountId: "t", stateFile: "/unused", baseUrl: "https://room.example/api"});
   runtime.state = {roomId: "room-1", membershipId: "zurie", cursor: ready.seq - 1, deliveryIntents: {}, terminalEvidence: {},
     epochSessionRoutingInitialized: true, legacySessionEpochId: ""};
@@ -633,7 +634,7 @@ async function codingTurn(page, ready, reads = []) {
   runtime.persistState = async () => {};
   const controller = new AbortController();
   runtime.client = {
-    readEvents: async (_state, after) => (reads.push(after), {activeEpochId: "epoch-c", activeEpochStartsAtSeq: 1002,
+    readEvents: async (_state, after) => (reads.push(after), await hooks.read?.(after), {activeEpochId: "epoch-c", activeEpochStartsAtSeq: 1002,
       events: after >= ready.seq - 1 ? [ready] : page.filter((item) => item.seq > after)}),
     roomState: async () => ({headSeq: ready.seq, activeEpoch: {id: "epoch-c", startsAtSeq: 1002}, activeTopic: {title: "Coding"}, roster, rules: []}),
     roomPolicy: async () => ({policy: {coordinationMode: "coordinated"}}),
@@ -646,8 +647,12 @@ async function codingTurn(page, ready, reads = []) {
   runtime.maintainPresence = async () => {};
   runtime.markContextAcknowledged = async () => {};
   runtime.startAttemptLease = () => null;
+  runtime.logger = hooks.logger;
+  hooks.runtime = runtime;
   const turns = runtime.assignedTurns(controller.signal);
   const {value} = await turns.next();
+  hooks.atYield = structuredClone({cursor: runtime.state.cursor, deliveryIntents: runtime.state.deliveryIntents,
+    terminalEvidence: runtime.state.terminalEvidence});
   controller.abort();
   await turns.return();
   return value;
@@ -748,4 +753,36 @@ test("P1a-12 a source message older than the loaded context is still the current
   // A found source that is not a message is no current item (P1a-5 and system sources).
   assert.equal(await scanCycleSourceMessage({...far, seq: 1030, payload: {sourceEventId: start.id}}, 1002,
     async (after) => ({events: [start].filter((item) => item.seq > after)})), null);
+});
+
+test("a failed old-source read leaves the turn without the current item and loses nothing", async () => {
+  // OP-12 finding on 0.2.57: a refused scan read must not escape the turn
+  // after the attempt is claimed. As in Hermes: warn, no current item, proceed.
+  const later = Array.from({length: 70}, (_, index) => ({id: `audit${1021 + index}`, seq: 1021 + index,
+    type: "turn.granted", actorRole: "system", actorId: "room_coordinator", payload: {epochId: "epoch-c"}}));
+  const page = [start, ...earlier, owner, ...later];
+  const warnings = [];
+  let epochStartReads = 0;
+  const hooks = {
+    logger: {info: () => {}, warn: (line) => warnings.push(line)},
+    // Reads after 1001 serve the epoch start first (cached), then the scan.
+    read: (after) => {
+      if (after === 1001 && ++epochStartReads > 1) throw new RoomAPIError(503, {code: "unavailable", body: OWNER});
+    },
+  };
+  const ready = readyFor(1091, owner);
+  const value = await codingTurn(page, ready, [], hooks);
+  // The turn is yielded with its claimed attempt and its causal source.
+  assert.ok(value, "turn yielded");
+  assert.equal(value.cycleAttempt?.attempt?.id, "attempt-1091");
+  assert.equal(value.respondsToId, owner.id);
+  assert.equal(value.sourceEventId, ready.id);
+  assert.match(value.text, /\[Room turn facts\]/u);
+  assert.doesNotMatch(value.text, /#1020 TJE/u);
+  assert.equal(value.senderName, "Room (system)");
+  // Cursor and delivery state are those of a normal turn at the yield.
+  assert.deepEqual(hooks.atYield, {cursor: 1090, deliveryIntents: {}, terminalEvidence: {}});
+  // One warning, Hermes' wording, the safe diagnostic and never a body.
+  assert.deepEqual(warnings, ["Room room-1 cycle source unavailable: Room API request failed (status=503)"]);
+  assert.ok(!warnings.join("").includes("@Zurie"));
 });
