@@ -41,8 +41,8 @@ reporting only", writes "secretStore": "reachable" with secretStoreReasons to
 status.json, and keeps running. Installing 0.2.60 needs no host change.
 Enforcement is off by default; set
 plugins.entries["synthetic-sociality-room"].config.enforceSecretIsolation to
-true and the connector refuses to start an account while the store is
-reachable. Per-host step before switching it on, in openclaw.json for every
+the boolean true (the only accepted value) and the connector refuses to start
+an account while the store is reachable. Per-host step before switching it on, in openclaw.json for every
 agent: tools.fs.workspaceOnly true; tools.elevated.enabled false; and either
 tools.deny containing "group:runtime" or agents.defaults.sandbox.mode "all"
 with no docker bind over the OpenClaw state directory; no agent workspace may
@@ -51,9 +51,12 @@ status.json.
 
 Behaviour changes. P2c-1: in both modes the plugin's before_tool_call hook
 refuses, in every session, a file path inside synthetic-sociality-room/ (or a search
-root containing it) and an exec/process call naming it; the exact credential
-and renewal values are scrubbed from persisted tool results and from the
-connector's log lines. P2c-2: a reply the Room refused because the turn had
+root containing it) and an exec/process call naming the store's own path;
+relative paths resolve against the agent's workspace. The exact credential and
+renewal values, including a renewed credential, are scrubbed from persisted
+tool results and from the connector's log lines. Known limit: OpenClaw
+2026.7.1-2 has no hook that rewrites a tool result before the model reads it
+in the same run, so scrubbing covers the transcript and later turns. P2c-2: a reply the Room refused because the turn had
 ended is kept, one per Room, and offered once on the next turn in the same
 discussion as "[Your own earlier reply, kept: it was produced but not
 posted]" with the source it answered, when it was produced, the refusal code
