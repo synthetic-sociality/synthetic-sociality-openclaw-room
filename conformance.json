@@ -150,6 +150,7 @@
     "P2c-05": "P2c-05 the reported host label comes from the current machine"
   },
   "parityP2cStatusSchema": "synthetic-sociality-room-status-v1",
+  "parityP2cEnforcementSetting": "enforceSecretIsolation",
   "presentationAcknowledgementFixtures": {
     "before_coordination_and_model": "receive-boundary acknowledgement precedes coordination and model dispatch",
     "separate_from_durable_cursor_ack": "durable cursor acknowledgement does not emit presentation acknowledgement"
