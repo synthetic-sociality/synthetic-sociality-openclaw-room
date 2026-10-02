@@ -1,4 +1,5 @@
 import {createHash, randomUUID} from "node:crypto";
+import {hostname} from "node:os";
 import {dirname, join} from "node:path";
 import {RoomAPIError, RoomClient, roomErrorDiagnostic} from "./room-client.js";
 import {loadState, saveNewState, saveState} from "./state.js";
@@ -6,6 +7,7 @@ import {activateRoomChannel} from "./activation.js";
 import {ROOM_CONNECTOR_PROVENANCE} from "./release-provenance.js";
 import {renewCredential} from "./credential-renewal.js";
 import {speakerLabel, speakerName} from "./speaker.js";
+import {rememberSecrets} from "./secret-isolation.js";
 
 export const OPEN_EXCHANGE_PREAMBLE_VERSION = "Open Exchange – Room Behaviour Preamble v1";
 // Delivery contract P1a: the connector holds no behavioural text. A Room may
@@ -27,6 +29,14 @@ export const CONTEXT_CHARACTER_LIMIT = 12_000;
 export const CONTEXT_SCAN_LIMIT = 2_000;
 // At most this many missed sources wait for the next model turn (P2a-3).
 export const MISSED_SOURCE_LIMIT = 8;
+// Contract P2c-2: the longest kept reply, in characters. A longer reply is not
+// kept (it is never shortened: the offer repeats the text verbatim).
+export const KEPT_REPLY_CHARACTER_LIMIT = 16_000;
+export const KEPT_REPLY_OPEN = "[Your own earlier reply, kept: it was produced but not posted]";
+export const KEPT_REPLY_CLOSE = "[/Your own earlier reply]";
+// Contract P2c-5: this machine's label, read when the process starts; never a
+// stored value or the account id.
+export const HOST_LABEL = hostname();
 export const CONTEXT_SCAN_CHUNK = 100;
 const CONTEXT_FOOTER = "[/Canonical Room context]";
 
@@ -401,6 +411,14 @@ const sleep = (milliseconds, signal) => new Promise((resolve, reject) => {
   signal?.addEventListener("abort", () => { clearTimeout(timer); reject(signal.reason ?? new Error("aborted")); }, {once: true});
 });
 
+// A background wait (the heartbeat loop) never keeps the process alive by itself.
+const backgroundSleep = (milliseconds, signal) => new Promise((resolve, reject) => {
+  if (signal?.aborted) return reject(signal.reason ?? new Error("aborted"));
+  const timer = setTimeout(resolve, milliseconds);
+  timer.unref?.();
+  signal?.addEventListener("abort", () => { clearTimeout(timer); reject(signal.reason ?? new Error("aborted")); }, {once: true});
+});
+
 export class OpenClawRoomRuntime {
   constructor(account, {
     fetchImpl = globalThis.fetch,
@@ -409,8 +427,15 @@ export class OpenClawRoomRuntime {
     activateEnrollment = activateRoomChannel,
     waitForRenewal = false,
     renewalWait = sleep,
+    status = null,
+    hostLabel = HOST_LABEL,
   } = {}) {
     this.account = account;
+    // Contract P2c-4 status writer (shared per installation) and P2c-3 flag:
+    // the next contact registers the connector session again.
+    this.status = status;
+    this.hostLabel = hostLabel;
+    this.reregister = false;
     this.fetchImpl = fetchImpl;
     this.logger = logger;
     this.releaseProvenance = releaseProvenance;
@@ -440,6 +465,10 @@ export class OpenClawRoomRuntime {
     // lease is still valid (contract P1-1).
     this.attemptRenewalRequestTimeoutMs = 4_000;
     this.attemptRenewalRetryMs = 5_000;
+    // P2c-3 bounds: reconnect backoff and the fastest heartbeat cadence.
+    this.reconnectInitialMs = 1_000;
+    this.reconnectMaxMs = 60_000;
+    this.heartbeatMinimumSeconds = 5;
   }
 
   async initialize(signal) {
@@ -461,6 +490,8 @@ export class OpenClawRoomRuntime {
     if (this.closed || this.account.enabled === false || this.state.enabled === false || this.state.revoked === true) throw new Error("Room account is disabled, revoked or closed");
     if (this.account.baseUrl && this.state.baseUrl !== this.account.baseUrl) throw new Error("Configured Room origin does not match private reconnect state");
     this.client = new RoomClient({baseUrl: this.state.baseUrl, credential: this.state.credential, fetchImpl: this.fetchImpl});
+    rememberSecrets(this.state);
+    this.reportStatus({connection: "connecting"});
     try {
       await this.renewAccess(signal);
       while (!this.closed) {
@@ -502,7 +533,7 @@ export class OpenClawRoomRuntime {
       metadata: {
         runtimeName: "OpenClaw",
         runtimeVersion: "2026.7.1-2",
-        hostLabel: this.account.accountId,
+        hostLabel: this.hostLabel,
         transport: "long_poll",
         modelDescriptor: "host-selected",
       },
@@ -518,7 +549,19 @@ export class OpenClawRoomRuntime {
     this.state.deliveryIntents ??= {};
     this.state.terminalEvidence ??= {};
     await saveState(this.account.stateFile, this.state);
+    rememberSecrets(this.state);
+    this.reregister = false;
+    this.reportStatus({connected: true});
     return this.connectorSession;
+  }
+
+  // Contract P2c-4: codes and times only, never a body or a secret.
+  reportStatus(fields) {
+    try {
+      this.status?.room(String(this.state?.roomId ?? ""), String(this.state?.membershipId ?? ""), fields);
+    } catch {
+      // Diagnostics only.
+    }
   }
 
   withBindingOperation(operation) {
@@ -576,7 +619,7 @@ export class OpenClawRoomRuntime {
     let scanCursor = this.state.cursor;
     while (!signal.aborted && !this.closed) {
       await this.renewAccess(signal);
-      const page = await retry(() => this.client.readEvents(this.state, Math.max(scanCursor, this.state.cursor), {wait: 20, signal}), signal);
+      const page = await this.readEventsResilient(Math.max(scanCursor, this.state.cursor), signal);
       const pageEpoch = validateActiveEpochPage(page);
       const pageActiveEpochId = pageEpoch.id;
       if (this.state.epochSessionRoutingInitialized !== true) {
@@ -593,7 +636,7 @@ export class OpenClawRoomRuntime {
       // Long-poll completion is an independent liveness clock. Maintaining
       // presence here prevents a failed timer task from leaving a locally
       // green but remotely expired connector.
-      await retry(() => this.maintainPresence(signal), signal);
+      await this.maintainPresenceResilient(signal);
       for (const event of page.events ?? []) {
         if (event.seq <= this.state.cursor) continue;
         if (this.isQuarantinedEvent(event)) {
@@ -709,6 +752,8 @@ export class OpenClawRoomRuntime {
         this.contextCycleSource = null;
         this.contextMissedFacts = [];
         this.contextMissedOffered = [];
+        this.contextKeptReply = "";
+        this.contextKeptReplyCleared = false;
         const sharedContext = await this.sharedRoomContext(event, pageEpoch, signal);
         const normalized = normalizeEvent(
           event,
@@ -722,8 +767,10 @@ export class OpenClawRoomRuntime {
           this.contextSenderName,
           this.contextCycleSource,
           this.contextMissedFacts,
+          this.contextKeptReply,
         );
         await this.clearMissedSources(this.contextMissedOffered);
+        if (this.contextKeptReplyCleared) await this.clearKeptReply();
         // The model runs while the consumer holds this yield; keep its claimed
         // attempt alive until a terminal outcome is recorded or it returns.
         if (normalized.cycleAttempt) this.startAttemptLease(event, normalized.cycleAttempt);
@@ -920,6 +967,7 @@ export class OpenClawRoomRuntime {
       throw error;
     }
     this.logger?.info?.(`Room delivery superseded ${outcomeLogFields({code: reason, sourceSeq: bound ? source.seq : "", attemptId: intent.identity.cycle?.attemptId})}`);
+    await this.keepLateReply(intent, reason);
     const attempt = cycleAttempt ?? (intent.identity.cycle ? {
       cycle: {id: intent.identity.cycle.cycleId, generation: intent.identity.cycle.generation},
       attempt: {id: intent.identity.cycle.attemptId},
@@ -1018,6 +1066,9 @@ export class OpenClawRoomRuntime {
     const missed = await this.missedSourceFacts(event, page?.events, state?.roster, sourceEpoch.startsAtSeq, answered, signal);
     this.contextMissedFacts = missed.facts;
     this.contextMissedOffered = missed.offered;
+    const kept = await this.keptReplyOffer(event, page?.events, state?.roster, sourceEpoch, signal);
+    this.contextKeptReply = kept.block;
+    this.contextKeptReplyCleared = kept.clear;
     const library = await this.client.listArtifacts(this.state, signal);
     const artifactContext = await sourceArtifactContext(
       event,
@@ -1144,6 +1195,70 @@ export class OpenClawRoomRuntime {
       }
     }
     return {facts, offered};
+  }
+
+  // Contract P2c-2: a reply whose turn's authority ended is kept, one per
+  // Room (the latest wins), never across discussions (a changed epoch keeps
+  // nothing). Best effort: never raises into the delivery path.
+  async keepLateReply(intent, reason) {
+    try {
+      const text = String(intent?.identity?.body ?? "").trim();
+      const answered = String(intent?.identity?.replyToId || intent?.identity?.sourceEventId || "");
+      const epochId = String(intent?.identity?.sourceEpochId || intent?.identity?.initialEpochId || "");
+      if (!text || !answered || !epochId || reason === "stale_epoch" || reason === "historical_epoch") return;
+      if (text.length > KEPT_REPLY_CHARACTER_LIMIT) {
+        this.logger?.info?.(`Room reply not kept ${outcomeLogFields({code: "late_reply_too_large", sourceSeq: "", attemptId: intent?.identity?.cycle?.attemptId})}`);
+        return;
+      }
+      let seq = 0;
+      for (const [number, id] of this.postNumberIndex()) if (id === answered) seq = number;
+      this.state.keptReply = {
+        sourceEventId: answered,
+        sourceSeq: seq,
+        epochId,
+        producedAt: new Date().toISOString().replace(/\.\d{3}Z$/, "Z"),
+        reason: String(reason || "superseded"),
+        text,
+      };
+      await this.persistState();
+      this.logger?.info?.(`Room reply kept, not posted ${outcomeLogFields({code: reason || "superseded", sourceSeq: seq || "", attemptId: intent?.identity?.cycle?.attemptId})}`);
+    } catch (error) {
+      this.logger?.warn?.(`Room reply not kept ${outcomeLogFields({code: "late_reply_unavailable", sourceSeq: "", attemptId: intent?.identity?.cycle?.attemptId})}`);
+    }
+  }
+
+  // The kept-reply offer (P2c-2): procedural facts, then the kept text
+  // verbatim under a label naming it as the agent's own reply. A kept reply
+  // from another discussion is cleared without an offer; one whose source read
+  // fails stays for a later turn.
+  async keptReplyOffer(event, pageEvents, roster, epoch, signal) {
+    const kept = this.state.keptReply;
+    if (!kept) return {block: "", clear: false};
+    if (kept.epochId !== epoch.id || (kept.sourceSeq > 0 && kept.sourceSeq < epoch.startsAtSeq)) return {block: "", clear: true};
+    try {
+      const readPage = (after) => this.client.readEvents(this.state, after, {wait: 0, signal});
+      let source = (Array.isArray(pageEvents) ? pageEvents : [])
+        .find((item) => item?.type === "message.posted" && String(item.id ?? "") === kept.sourceEventId);
+      if (!source && kept.sourceSeq > 0) {
+        source = ((await readPage(kept.sourceSeq - 1))?.events ?? [])
+          .find((item) => item?.type === "message.posted" && String(item.id ?? "") === kept.sourceEventId);
+      }
+      if (!source) {
+        source = await scanCycleSourceMessage({type: "discussion.cycle_attempt_ready", seq: Number(event.seq) + 1,
+          payload: {sourceEventId: kept.sourceEventId}}, epoch.startsAtSeq, readPage);
+      }
+      return {block: keptReplyBlock(kept, source, roster), clear: true};
+    } catch (error) {
+      if (signal?.aborted) throw error;
+      this.logger?.warn?.(`Room kept reply source unavailable${roomErrorDiagnostic(error)}`);
+      return {block: "", clear: false};
+    }
+  }
+
+  async clearKeptReply() {
+    if (!this.state.keptReply) return;
+    delete this.state.keptReply;
+    await this.persistState();
   }
 
   // Offered once, then cleared durably before the turn is handed to the host.
@@ -2055,12 +2170,61 @@ export class OpenClawRoomRuntime {
     throw new Error("Room turn was not granted before the lease deadline");
   }
 
+  // Contract P2c-3: a lost network or Room session is recovered here, with
+  // bounded backoff and without a host restart. Only a final refusal (a
+  // non-retryable Room error such as a revoked credential) still ends the read.
+  async readEventsResilient(after, signal) {
+    let backoff = this.reconnectInitialMs;
+    let lost = false;
+    for (;;) {
+      try {
+        const page = await this.client.readEvents(this.state, after, {wait: 20, signal});
+        if (lost) {
+          this.logger?.info?.("Room event stream resumed; registering the connector session again");
+          this.reregister = true;
+        }
+        return page;
+      } catch (error) {
+        if (signal?.aborted || this.closed || (error instanceof RoomAPIError && !error.retryable)) throw error;
+        if (!lost) this.logger?.warn?.(`Room connection lost${roomErrorDiagnostic(error)}; reconnecting`);
+        lost = true;
+        this.reregister = true;
+        this.reportStatus({connection: "reconnecting", errorCode: statusErrorCode(error)});
+        await sleep(backoff, signal);
+        backoff = Math.min(backoff * 2, this.reconnectMaxMs);
+      }
+    }
+  }
+
+  async maintainPresenceResilient(signal) {
+    try {
+      await this.maintainPresence(signal);
+    } catch (error) {
+      if (signal?.aborted || this.closed || (error instanceof RoomAPIError && !error.retryable && !sessionLost(error))) throw error;
+      this.reregister = true;
+      this.reportStatus({connection: "reconnecting", errorCode: statusErrorCode(error)});
+      this.logger?.warn?.(`Room presence unavailable${roomErrorDiagnostic(error)}; registering again at the next contact`);
+    }
+  }
+
   runHeartbeat() {
-    const interval = Math.max(5, Number(this.connectorSession.heartbeatIntervalSeconds) || 15) * 800;
+    const interval = Math.max(this.heartbeatMinimumSeconds, Number(this.connectorSession.heartbeatIntervalSeconds) || 15) * 800;
     const loop = async () => {
+      let delay = interval;
       while (!this.closed && !this.heartbeatAbort.signal.aborted) {
-        await sleep(interval, this.heartbeatAbort.signal);
-        await retry(() => this.maintainPresence(this.heartbeatAbort.signal), this.heartbeatAbort.signal);
+        await backgroundSleep(delay, this.heartbeatAbort.signal);
+        try {
+          await this.maintainPresence(this.heartbeatAbort.signal);
+          delay = interval;
+        } catch (error) {
+          if (this.closed || this.heartbeatAbort.signal.aborted) return;
+          if (error instanceof RoomAPIError && !error.retryable && !sessionLost(error)) throw error;
+          // P2c-3: keep the loop; the next contact registers the session again.
+          this.reregister = true;
+          this.reportStatus({connection: "reconnecting", errorCode: statusErrorCode(error)});
+          this.logger?.warn?.(`Room heartbeat failed${roomErrorDiagnostic(error)}; retrying`);
+          delay = Math.min(delay * 2, this.reconnectMaxMs);
+        }
       }
     };
     this.heartbeatTask = loop().catch((error) => {
@@ -2074,7 +2238,20 @@ export class OpenClawRoomRuntime {
   async maintainPresence(signal) {
     return this.withBindingOperation(async () => {
       if (this.state.credentialRotation) return;
-      await this.client.heartbeat(this.state, this.connectorSession.sessionId, signal);
+      if (this.reregister) {
+        this.logger?.info?.("Room registering its connector session again");
+        await this.registerConnector(signal);
+      } else {
+        try {
+          await this.client.heartbeat(this.state, this.connectorSession.sessionId, signal);
+        } catch (error) {
+          // P2c-3: the Room no longer holds this session; register it again.
+          if (!sessionLost(error)) throw error;
+          this.logger?.warn?.(`Room connector session lost${roomErrorDiagnostic(error)}; registering again`);
+          await this.registerConnector(signal);
+        }
+        this.reportStatus({connected: true});
+      }
       await this.acceptConnectorEnrollments(signal);
       await this.publishPresence(signal);
     });
@@ -2087,6 +2264,14 @@ export class OpenClawRoomRuntime {
     } catch (error) {
       // This additive route may be absent during a rolling server upgrade.
       // Enrollment discovery must never turn a healthy Room heartbeat red.
+      if (error instanceof RoomAPIError && error.code === "connector_not_active") {
+        // P2c-3 (Wu and Real, Mac128, 2026-10-02): the Room holds no live
+        // session for this installation; register again at the next contact.
+        this.reregister = true;
+        this.reportStatus({connection: "reconnecting", errorCode: error.code});
+        this.logger?.warn?.("Room enrollment check: no active connector session; registering again");
+        return [];
+      }
       if (!(error instanceof RoomAPIError && [404, 405, 501].includes(error.status))) {
         this.logger?.warn?.(`Room enrollment check unavailable${roomErrorDiagnostic(error)}`);
       }
@@ -2519,6 +2704,7 @@ export function normalizeEvent(
   senderName = "",
   cycleSource = null,
   missedFacts = [],
+  keptReply = "",
 ) {
   const payload = eventPayload(event.payload);
   const actorRole = String(event.actorRole ?? "");
@@ -2551,7 +2737,7 @@ export function normalizeEvent(
     senderId: author.id,
     senderName: author.name,
     senderKind: author.role === "human" || author.role.startsWith("human_") ? "human" : "agent",
-    text: cyclePrompt(event, payload, cycleAttempt, sharedContext, policyWordLimit, discussionStart, currentItem, missedFacts),
+    text: cyclePrompt(event, payload, cycleAttempt, sharedContext, policyWordLimit, discussionStart, currentItem, missedFacts, keptReply),
     occurredAt: Date.parse(event.ts) || Date.now(),
     raw: event,
     cycleAttempt,
@@ -2657,6 +2843,26 @@ export async function scanCycleSourceMessage(event, epochStartsAtSeq, readPage) 
   return null;
 }
 
+function utcMinute(value) {
+  return validCanonicalTimestamp(value) ? `${new Date(value).toISOString().slice(11, 16)} UTC` : "";
+}
+
+// Contract P2c-2: the offer, identical in Hermes (_kept_reply_text).
+export function keptReplyBlock(kept, source, roster) {
+  const seq = Number.isSafeInteger(source?.seq) && source.seq > 0 ? source.seq : Number(kept?.sourceSeq) || 0;
+  let answered = seq > 0 ? `#${seq}` : "an earlier message";
+  if (source) {
+    answered += ` ${speakerLabel(roster, source)}`;
+    const when = utcMinute(source.ts);
+    if (when) answered += `, ${when}`;
+  }
+  const lines = [KEPT_REPLY_OPEN, `Answered: ${answered}`];
+  const produced = utcMinute(kept?.producedAt);
+  if (produced) lines.push(`Produced: ${produced}`);
+  lines.push(`Not posted: ${kept?.reason || "superseded"}`, String(kept?.text ?? ""), KEPT_REPLY_CLOSE);
+  return lines.join("\n");
+}
+
 // Messages after `fromSeq` and before `toSeq`, read forward in pages of
 // CONTEXT_SCAN_CHUNK up to CONTEXT_SCAN_LIMIT sequence numbers (P2a-3).
 export async function countMessagesBetween(fromSeq, toSeq, readPage) {
@@ -2686,7 +2892,7 @@ export function currentItemLine(message, label) {
   return `${number}${label}: ${body}`;
 }
 
-function cyclePrompt(event, payload, cycleAttempt, sharedContext = "", policyWordLimit = 0, discussionStart = null, currentItem = "", missed = []) {
+function cyclePrompt(event, payload, cycleAttempt, sharedContext = "", policyWordLimit = 0, discussionStart = null, currentItem = "", missed = [], kept = "") {
   const context = String(sharedContext ?? "").trim();
   const preface = context ? [context, ROOM_HISTORY_INSTRUCTION] : [];
   if (event.type === "discussion.cycle_attempt_ready") {
@@ -2696,6 +2902,7 @@ function cyclePrompt(event, payload, cycleAttempt, sharedContext = "", policyWor
       roomTurnFacts({phase, cycleAttempt, policyWordLimit, missed}),
       ...(discussionStart ? [discussionStartBlock(discussionStart)] : []),
       ...(currentItem ? [currentItem] : []),
+      kept,
       roomSupplied("Room phase instruction — server-provided", payload.phaseInstruction),
     ].filter(Boolean).join("\n\n");
   }
@@ -2704,18 +2911,20 @@ function cyclePrompt(event, payload, cycleAttempt, sharedContext = "", policyWor
     return [
       ...preface,
       roomTurnFacts({command: command || "unnamed", policyWordLimit, missed}),
+      kept,
       roomSupplied(`Room command ${command || "unnamed"} — owner instruction`, commandInstruction(payload)),
     ].filter(Boolean).join("\n\n");
   }
   const text = currentItem || String(payload.body ?? payload.text ?? "").trim();
   if (!cycleAttempt) {
-    return [...preface, roomTurnFacts({policyWordLimit, missed}), text].filter(Boolean).join("\n\n");
+    return [...preface, roomTurnFacts({policyWordLimit, missed}), text, kept].filter(Boolean).join("\n\n");
   }
   const {phase, instruction} = cyclePhaseInstruction(cycleAttempt.attempt, cycleAttempt.cycle, payload);
   return [
     ...(context ? [context] : []),
     roomTurnFacts({phase, cycleAttempt, policyWordLimit, missed}),
     text,
+    kept,
     roomSupplied("Room phase instruction — server-provided", instruction),
   ].filter(Boolean).join("\n\n");
 }
@@ -2972,15 +3181,15 @@ function eventPayload(value) {
   } catch { return {}; }
 }
 
-async function retry(operation, signal) {
-  let delay = 500;
-  for (let attempt = 1; ; attempt += 1) {
-    try { return await operation(); } catch (error) {
-      if (signal?.aborted || attempt >= 5 || (error instanceof RoomAPIError && !error.retryable)) throw error;
-      await sleep(delay, signal);
-      delay = Math.min(delay * 2, 8_000);
-    }
-  }
+// P2c-3: the Room says this connector session is gone or not live.
+function sessionLost(error) {
+  return error instanceof RoomAPIError && (error.status === 404 || error.code === "connector_not_active");
+}
+
+// P2c-4: a status code for a failure: the Room code, else a fixed class.
+export function statusErrorCode(error) {
+  if (error instanceof RoomAPIError) return error.code || `http_${error.status}`;
+  return "network";
 }
 
 function safeKey(value) {

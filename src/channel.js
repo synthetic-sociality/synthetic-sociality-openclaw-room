@@ -1,7 +1,8 @@
 import {defineChannelPluginEntry} from "openclaw/plugin-sdk/channel-core";
 import {defineChannelMessageAdapter} from "openclaw/plugin-sdk/channel-message";
 import {buildChannelInboundEventContext} from "openclaw/plugin-sdk/channel-inbound";
-import {loadState} from "./state.js";
+import {dirname, join} from "node:path";
+import {loadState, openClawStateDirectory} from "./state.js";
 import {registerRoomCommands} from "./commands.js";
 import {markChannelActive, markChannelInactive, registerPresenceFallback} from "./presence-fallback.js";
 import {registerRoomHistoryTool} from "./history.js";
@@ -12,9 +13,14 @@ import {outboundIdempotencyKey} from "./outbound.js";
 import {roomErrorDiagnostic} from "./room-client.js";
 import {
   DEFAULT_EXECUTION_FAILURE,
+  HOST_LABEL,
   OPERATIONAL_FALLBACK_EXECUTION_FAILURE,
   RELEASED_ATTEMPT_EXECUTION_FAILURE,
+  statusErrorCode,
 } from "./runtime.js";
+import {BLOCK_MESSAGE, REFUSAL_CODE, scrubDeep, scrubbingLogger, storeReachability, toolCallBlock} from "./secret-isolation.js";
+import {localStatusFor} from "./local-status.js";
+import {ROOM_CONNECTOR_PROVENANCE} from "./release-provenance.js";
 import {
   roomReplyDeliveryPolicy,
 } from "./reply-policy.js";
@@ -62,6 +68,66 @@ export async function hostNoticeKind(payload, info) {
   if ((await hostReplyPayload()).isReplyPayloadNonTerminalToolErrorWarning?.(payload) === true) return "tool_error_warning";
   if (info?.kind === "tool") return "tool_result";
   return "";
+}
+
+// Contract P2c-1: the Room store is the plugin's state root plus the directory
+// of every configured account's state file.
+function roomStoreRoot() {
+  return join(openClawStateDirectory(), ID);
+}
+
+export function roomStoreDirectories(cfg) {
+  const directories = [roomStoreRoot()];
+  try {
+    for (const account of resolvedRoomAccounts(cfg ?? {})) if (account?.stateFile) directories.push(dirname(account.stateFile));
+  } catch {
+    // An unreadable configuration still fences the default store.
+  }
+  return [...new Set(directories)];
+}
+
+// Contract P2c-4: one status file per installation.
+export function roomLocalStatus(logger) {
+  return localStatusFor(join(roomStoreRoot(), "status.json"), {
+    plugin: "openclaw", version: ROOM_CONNECTOR_PROVENANCE.version, hostLabel: HOST_LABEL, logger,
+  });
+}
+
+let secretRefusalLogged = false;
+export function resetSecretRefusalLog() {
+  secretRefusalLogged = false;
+}
+
+function untilAborted(signal) {
+  return new Promise((resolve) => {
+    if (!signal || signal.aborted) resolve();
+    else signal.addEventListener("abort", resolve, {once: true});
+  });
+}
+
+// Contract P2c-1, in every session: a file path inside the Room store (a
+// search root containing it), or a shell call naming it, is refused. A fence
+// error refuses too.
+export function roomToolCallPolicy(api) {
+  return (event) => {
+    try {
+      const cfg = api?.runtime?.config?.current?.() ?? api?.config;
+      const reason = toolCallBlock(event?.toolName, event?.params, roomStoreDirectories(cfg), {derivedPaths: event?.derivedPaths});
+      if (!reason) return undefined;
+      api?.logger?.warn?.(`Room connector refused a ${String(event?.toolName ?? "tool")} tool call that reaches its private state`);
+      return {block: true, blockReason: reason};
+    } catch {
+      api?.logger?.warn?.("Room connector refused a tool call: state fence unavailable");
+      return {block: true, blockReason: BLOCK_MESSAGE};
+    }
+  };
+}
+
+// Contract P2c-1: no persisted tool result carries a Room credential.
+export function roomToolResultScrub(event) {
+  const message = event?.message;
+  const next = scrubDeep(message);
+  return next !== message ? {message: next} : undefined;
 }
 
 const receipt = (eventId, sentAt) => ({
@@ -137,12 +203,30 @@ export function createRoomChannel({makeClient}) {
         const ownership = claimRuntimeOwnership(runtimeOwners, ctx.account);
         let client;
         let registered = false;
+        const localStatus = roomLocalStatus(ctx.log);
         try {
+          // Contract P2c-1: never start while the agent's tools can reach the
+          // store that holds the Room credential. Wait for the host's stop
+          // instead of failing, so the host does not restart into it again.
+          const reasons = storeReachability(ctx.cfg, roomStoreDirectories(ctx.cfg), {stateDir: openClawStateDirectory()});
+          if (reasons.length) {
+            localStatus.setSecretStore("reachable");
+            const saved = await loadState(ctx.account.stateFile).catch(() => null);
+            if (saved?.roomId) localStatus.room(String(saved.roomId), String(saved.membershipId ?? ""), {connection: "stopped", errorCode: REFUSAL_CODE});
+            if (!secretRefusalLogged) {
+              secretRefusalLogged = true;
+              ctx.log?.error?.(`Room connector refused to start: ${REFUSAL_CODE} (${reasons.join(",")}). The agent's file or shell tools could read the Room credential; set tools.fs.workspaceOnly, deny group:runtime or sandbox every agent (mode all, elevated off, no bind over the OpenClaw state directory).`);
+            }
+            ctx.setStatus({...ctx.getStatus(), running: true, connected: false, lastError: REFUSAL_CODE});
+            await untilAborted(ctx.abortSignal);
+            return;
+          }
+          localStatus.setSecretStore("isolated");
           const replyPolicy = roomReplyDeliveryPolicy();
           ctx.setStatus({...ctx.getStatus(), running: true, connected: false, lastError: null});
           await markChannelActive(ctx.accountId);
           registered = true;
-          client = makeClient(ctx.account, {logger: ctx.log, waitForRenewal: true});
+          client = makeClient(ctx.account, {logger: scrubbingLogger(ctx.log), waitForRenewal: true, status: localStatus});
           const session = await client.initialize(ctx.abortSignal);
           live.set(ctx.accountId, {token: ownership.token, client, abortSignal: ctx.abortSignal});
           ctx.setStatus({...ctx.getStatus(), running: true, connected: true, lastConnectedAt: Date.now(), lastError: null});
@@ -170,6 +254,7 @@ export function createRoomChannel({makeClient}) {
             const hostStartedAt = Date.now();
             const sinceRoomEvent = Number.isFinite(event.occurredAt) ? Math.max(0, (hostStartedAt - event.occurredAt) / 1000) : 0;
             ctx.log?.info?.(`[${ctx.accountId}] Room ${event.roomId} seq ${hostSeq} dispatched to the host after waiting ${sinceRoomEvent.toFixed(1)}s since the Room event; later Room events wait for this run`);
+            localStatus.room(String(event.roomId ?? ""), "", {gateWaitSeconds: sinceRoomEvent});
             try {
               await runtime.inbound.run({
               channel: ID,
@@ -325,9 +410,11 @@ export function createRoomChannel({makeClient}) {
         } catch (error) {
           if (!ctx.abortSignal.aborted) {
             ctx.setStatus({...ctx.getStatus(), connected: false, lastError: `Room channel stopped unexpectedly${roomErrorDiagnostic(error)}`});
+            if (client?.state?.roomId) localStatus.room(String(client.state.roomId), "", {errorCode: statusErrorCode(error)});
             throw error;
           }
         } finally {
+          if (client?.state?.roomId) localStatus.room(String(client.state.roomId), String(client.state.membershipId ?? ""), {connection: "stopped"});
           const liveEntry = live.get(ctx.accountId);
           if (liveEntry?.token === ownership.token) live.delete(ctx.accountId);
           try {
@@ -355,6 +442,13 @@ export function createRoomChannel({makeClient}) {
     description: "Native OpenClaw channel for Synthetic Sociality Rooms",
     plugin,
     registerFull: (api) => {
+      // Contract P2c-1: fence the store in every session, and scrub results.
+      if (typeof api?.on === "function") {
+        api.on("before_tool_call", roomToolCallPolicy(api), {priority: 1000});
+        api.on("tool_result_persist", roomToolResultScrub);
+      } else {
+        api?.logger?.warn?.("Room connector: this OpenClaw host offers no tool hooks; the start gate still applies");
+      }
       registerRoomCommands(api);
       registerPresenceFallback(api, {makeClient});
       registerRoomHistoryTool(api);

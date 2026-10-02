@@ -4,6 +4,7 @@ import {registerHooks} from "node:module";
 import {mkdtemp, mkdir, symlink, writeFile} from "node:fs/promises";
 import {tmpdir} from "node:os";
 import {join} from "node:path";
+import {ISOLATED_HOST_CONFIG} from "./support/isolated-host.mjs";
 
 const mocks = {
   "openclaw/plugin-sdk/channel-core": "export const defineChannelPluginEntry = (entry) => entry;",
@@ -46,7 +47,7 @@ function context(account, controller = new AbortController()) {
     account,
     accountId: account.accountId,
     abortSignal: controller.signal,
-    cfg: {},
+    cfg: ISOLATED_HOST_CONFIG,
     channelRuntime: {},
     getStatus: () => status,
     setStatus: (next) => { status = next; },

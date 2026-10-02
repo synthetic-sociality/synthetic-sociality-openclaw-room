@@ -4,7 +4,7 @@ import test from "node:test";
 import {mkdtemp, readFile, writeFile} from "node:fs/promises";
 import {tmpdir} from "node:os";
 import {join} from "node:path";
-import {ARTIFACT_CONTEXT_CHARACTER_LIMIT, HANDOVER_CONTEXT_CHARACTER_LIMIT, canonicalRoomContext, commandInstruction, discussionHandoverContext, sourceArtifactContext, cyclePhaseInstruction, epochConversationId, epochEvidence, eventEpochId, isAssignedEvent, isAssignedMessage, isBoundaryEvent, isLifecycleOnlyCycleTerminal, normalizeEvent, OpenClawRoomRuntime, resolveStandaloneRecipientSelectors, validateActiveEpochPage} from "../src/runtime.js";
+import {ARTIFACT_CONTEXT_CHARACTER_LIMIT, HANDOVER_CONTEXT_CHARACTER_LIMIT, HOST_LABEL, canonicalRoomContext, commandInstruction, discussionHandoverContext, sourceArtifactContext, cyclePhaseInstruction, epochConversationId, epochEvidence, eventEpochId, isAssignedEvent, isAssignedMessage, isBoundaryEvent, isLifecycleOnlyCycleTerminal, normalizeEvent, OpenClawRoomRuntime, resolveStandaloneRecipientSelectors, validateActiveEpochPage} from "../src/runtime.js";
 import {RoomAPIError} from "../src/room-client.js";
 import {loadState, saveState, validateState} from "../src/state.js";
 // Runtimes in this file get a private scratch state file: a runtime may write
@@ -191,7 +191,7 @@ test("initializes one connector session when native startup and event polling ov
   assert.equal(statusRequests, 0, "legacy Room deployments must not be blocked by an unauthenticated /status probe");
   assert.deepEqual(registrationBody.metadata, {
     runtimeName: "OpenClaw", runtimeVersion: "2026.7.1-2",
-    hostLabel: "default", transport: "long_poll", modelDescriptor: "host-selected",
+    hostLabel: HOST_LABEL, transport: "long_poll", modelDescriptor: "host-selected",
   });
   assert.equal((await loadState(stateFile)).messagePayloadDialect, "v2");
   assert.equal(activities.length, 1);
@@ -264,7 +264,7 @@ test("verified build provenance stays embedded without violating strict registra
     if(url.endsWith("/activity"))return new Response(JSON.stringify({acceptedStreamSeq:1}),{status:202}); throw new Error(url);
   }});
   await runtime.initialize();
-  assert.deepEqual(metadata, {runtimeName:"OpenClaw",runtimeVersion:"2026.7.1-2",hostLabel:"default",transport:"long_poll",modelDescriptor:"host-selected"});
+  assert.deepEqual(metadata, {runtimeName:"OpenClaw",runtimeVersion:"2026.7.1-2",hostLabel:HOST_LABEL,transport:"long_poll",modelDescriptor:"host-selected"});
   assert.equal(runtime.releaseProvenance.version,"0.2.26");
   assert.equal(runtime.releaseProvenance.sourceCommit,"a".repeat(40));
   assert.equal(runtime.releaseProvenance.artifactIdentity,"sha256:"+"b".repeat(64));

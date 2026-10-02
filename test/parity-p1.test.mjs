@@ -13,6 +13,7 @@ import {after as afterStateTests} from "node:test";
 import {mkdtemp as mkdtempState, rm as rmState} from "node:fs/promises";
 import {tmpdir as tmpdirState} from "node:os";
 import {join as joinState} from "node:path";
+import {ISOLATED_HOST_CONFIG} from "./support/isolated-host.mjs";
 const TEST_STATE_DIRECTORY = await mkdtempState(joinState(tmpdirState(), "openclaw-room-test-state-"));
 const UNUSED_STATE_FILE = joinState(TEST_STATE_DIRECTORY, "state.json");
 afterStateTests(() => rmState(TEST_STATE_DIRECTORY, {recursive: true, force: true}));
@@ -101,7 +102,7 @@ function channelContext(stateFile, run, controller = new AbortController()) {
     account: {accountId: "default", stateFile},
     accountId: "default",
     abortSignal: controller.signal,
-    cfg: {},
+    cfg: ISOLATED_HOST_CONFIG,
     channelRuntime: {
       inbound: {run},
       routing: {resolveAgentRoute: () => ({agentId: "main", accountId: "default", sessionKey: "session", mainSessionKey: "main"})},

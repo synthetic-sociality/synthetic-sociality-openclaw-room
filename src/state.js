@@ -157,6 +157,18 @@ export function validateState(value) {
     || value.missedSources.some((item) => !item || typeof item.sourceEventId !== "string" || !item.sourceEventId
       || item.sourceEventId.length > 128 || !Number.isSafeInteger(item.sourceSeq) || item.sourceSeq < 0)
   )) throw new Error("Room missed sources are invalid");
+  // Contract P2c-2: at most one kept reply whose turn's authority ended.
+  if (value.keptReply !== undefined) {
+    const kept = value.keptReply;
+    const keys = ["epochId", "producedAt", "reason", "sourceEventId", "sourceSeq", "text"];
+    if (!kept || typeof kept !== "object" || Array.isArray(kept)
+      || JSON.stringify(Object.keys(kept).sort()) !== JSON.stringify(keys)
+      || !keys.filter((key) => key !== "sourceSeq").every((key) => typeof kept[key] === "string")
+      || !Number.isSafeInteger(kept.sourceSeq) || kept.sourceSeq < 0
+      || !kept.text || kept.text.length > 16_000 || !kept.sourceEventId || !kept.epochId) {
+      throw new Error("Room kept reply is invalid");
+    }
+  }
   if (value.terminalEvidence !== undefined && (
     !value.terminalEvidence || typeof value.terminalEvidence !== "object" || Array.isArray(value.terminalEvidence)
   )) throw new Error("Room terminal evidence ledger is invalid");

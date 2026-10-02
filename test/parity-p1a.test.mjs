@@ -21,6 +21,7 @@ import {after as afterStateTests} from "node:test";
 import {mkdtemp as mkdtempState, rm as rmState} from "node:fs/promises";
 import {tmpdir as tmpdirState} from "node:os";
 import {join as joinState} from "node:path";
+import {ISOLATED_HOST_CONFIG} from "./support/isolated-host.mjs";
 const TEST_STATE_DIRECTORY = await mkdtempState(joinState(tmpdirState(), "openclaw-room-test-state-"));
 const UNUSED_STATE_FILE = joinState(TEST_STATE_DIRECTORY, "state.json");
 afterStateTests(() => rmState(TEST_STATE_DIRECTORY, {recursive: true, force: true}));
@@ -355,7 +356,7 @@ test("P1a-07 host fallback notice is never posted; the model reply is", async ()
     let status = {};
     await channel.plugin.gateway.startAccount({
       account: {accountId: "default", stateFile: joinState(TEST_STATE_DIRECTORY, `p1a-07-${Math.random()}.json`)}, accountId: "default",
-      abortSignal: new AbortController().signal, cfg: {},
+      abortSignal: new AbortController().signal, cfg: ISOLATED_HOST_CONFIG,
       channelRuntime: {
         inbound: {run: async ({raw, adapter}) => {
           const turn = adapter.resolveTurn(adapter.ingest(raw));

@@ -7,6 +7,7 @@ import {mkdtemp, readFile, readdir, rm} from "node:fs/promises";
 import {tmpdir} from "node:os";
 import {join} from "node:path";
 import {registerHooks} from "node:module";
+import {ISOLATED_HOST_CONFIG} from "./support/isolated-host.mjs";
 
 const sdkMocks = {
   "openclaw/plugin-sdk/channel-core": "export const defineChannelPluginEntry = (entry) => entry;",
@@ -120,7 +121,7 @@ test("P2a-01 a host wait the connector cannot observe is bounded and falls back"
   const info = [];
   let status = {};
   const ctx = {
-    account: {accountId: "default", stateFile: join(home, "p2a-01.json")}, accountId: "default", cfg: {},
+    account: {accountId: "default", stateFile: join(home, "p2a-01.json")}, accountId: "default", cfg: ISOLATED_HOST_CONFIG,
     abortSignal: new AbortController().signal, getStatus: () => status, setStatus: (next) => { status = next; },
     log: {info: (line) => info.push(line), warn: () => {}, error: () => {}},
     channelRuntime: {
