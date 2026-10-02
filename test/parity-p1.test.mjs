@@ -24,7 +24,7 @@ const home = await mkdtemp(join(tmpdir(), "openclaw-room-parity-p1-"));
 process.env.HOME = home;
 const {createRoomChannel} = await import("../src/channel.js");
 const {
-  OpenClawRoomRuntime, attemptRenewalDelaySeconds, classifyPostRefusal,
+  OpenClawRoomRuntime, attemptRenewalDelaySeconds, classifyPostRefusal, isCycleStartRefusal,
 } = await import("../src/runtime.js");
 const {RoomAPIError, SAFE_API_CODES} = await import("../src/room-client.js");
 const {loadState, saveState, validateState} = await import("../src/state.js");
@@ -836,4 +836,89 @@ test("a transient renewal failure within the lease is retried and the turn is po
     assert.match(line, /^Room attempt renewal failed code=attempt_(renewal|reclaim)_failed sourceSeq=5 attempt=attempt-1 error=TypeError cause=UND_ERR_SOCKET transient; lease remaining \d+ms$/u);
     assert.ok(!line.includes(BODY));
   }
+});
+
+test("a refused cycle start skips its source and the scan continues (canary 2026-10-02 07:49)", async () => {
+  // Live: Zurie was not execution-ready after a failed attempt, so starting
+  // the cycle for the owner's @Zurie message 2964 was refused with 409
+  // cycle_conflict; the channel exited and replayed 2964 forever. Now 2964 is
+  // skipped with that code and acknowledged, and the retry ask 2965 and its
+  // attempt 2966 are processed.
+  const roster = [
+    {membershipId: "owner-tj", displayName: "TJE", role: "human_owner", status: "active"},
+    {membershipId: "zurie", displayName: "Zurie", role: "participant_agent", status: "active"},
+  ];
+  const mention = {id: "message00002964", seq: 2964, type: "message.posted", actorRole: "human_owner", actorId: "owner-tj",
+    payload: {body: "@Zurie your view?", resolvedRecipientMembershipIds: ["zurie"], epochId: "epoch-z"}};
+  const retry = {id: "command00002965", seq: 2965, type: "human.command", actorRole: "human_owner", actorId: "owner-tj",
+    payload: {epochId: "epoch-z", command: {command: "ask", arguments: {retryUnavailable: true, instruction: "Try again."},
+      resolvedTargetMembershipIds: ["zurie"]}}};
+  const ready = {id: "attemptready2966", seq: 2966, type: "discussion.cycle_attempt_ready", actorRole: "system",
+    actorId: "room_coordinator", payload: {cycleId: "cycle-r", epochId: "epoch-z", generation: 1, membershipId: "zurie", round: 1, sourceEventId: retry.id}};
+  const events = [mention, retry, ready];
+  const runtime = new OpenClawRoomRuntime({accountId: "t", stateFile: "/unused", baseUrl: "https://room.example/api"});
+  runtime.state = {version: 1, baseUrl: "https://room.example/api", roomId: "room-1", membershipId: "zurie", credential: SECRET,
+    clientInstanceId: "client-1", messagePayloadDialect: "v2", cursor: 2963, deliveryIntents: {}, terminalEvidence: {},
+    epochSessionRoutingInitialized: true, legacySessionEpochId: ""};
+  runtime.connectorSession = {sessionId: "s"};
+  const snapshots = [];
+  runtime.persistState = async () => { snapshots.push(structuredClone(runtime.state)); };
+  const logs = [];
+  runtime.logger = {info: (line) => logs.push(line), warn: (line) => logs.push(line), error: (line) => logs.push(line)};
+  const starts = [];
+  const acks = [];
+  runtime.client = {
+    readEvents: async (_state, after) => ({activeEpochId: "epoch-z", activeEpochStartsAtSeq: 2900,
+      events: events.filter((item) => item.seq > after)}),
+    roomState: async () => ({headSeq: 2966, activeEpoch: {id: "epoch-z", startsAtSeq: 2900}, activeTopic: {title: "Coding"}, roster, rules: []}),
+    roomPolicy: async () => ({policy: {coordinationMode: "coordinated"}}),
+    listArtifacts: async () => ({items: []}),
+    startDiscussionCycle: async (_state, request) => {
+      starts.push(request.sourceEventId);
+      if (request.sourceEventId === mention.id) throw new RoomAPIError(409, {code: "cycle_conflict", message: "@Zurie your view?"});
+      return {cycle: {id: "cycle-r", generation: 1}};
+    },
+    claimDiscussionAttempt: async () => ({attempt: {id: "attempt-2966", round: 1, membershipId: "zurie"},
+      cycle: {id: "cycle-r", generation: 1, totalTurns: 0, budgets: {totalTurns: 1, perAgentTurns: 1}}}),
+    acknowledge: async (_state, seq) => (acks.push(seq), {acknowledgedSeq: seq}),
+  };
+  runtime.renewAccess = async () => false;
+  runtime.maintainPresence = async () => {};
+  runtime.markContextAcknowledged = async () => {};
+  runtime.startAttemptLease = () => null;
+  const controller = new AbortController();
+  const turns = runtime.assignedTurns(controller.signal);
+  // The channel does not exit: the next yielded turn is the retry's attempt.
+  const {value, done} = await turns.next();
+  controller.abort();
+  await turns.return();
+  assert.equal(done, false);
+  assert.equal(value.sourceEventId, ready.id);
+  assert.deepEqual(starts, [mention.id, retry.id]);
+  // Skipped with the Room's code, durably before its acknowledgement.
+  assert.ok(snapshots.some((state) => JSON.stringify(state.terminalEvidence?.["2964"]) === JSON.stringify({status: "skipped",
+    sourceEventId: mention.id, sourceSeq: 2964, canonicalEventId: "", canonicalSeq: 0, canonicalTs: "", reason: "cycle_conflict"})),
+  JSON.stringify(snapshots.map((state) => state.terminalEvidence)));
+  assert.ok(snapshots.some((state) => state.terminalEvidence?.["2965"]?.reason === "coordination_handled_without_model"));
+  assert.deepEqual(acks.slice(0, 2), [2964, 2965]);
+  assert.ok(runtime.state.cursor >= 2965);
+  assert.ok(logs.includes("Room delivery skipped code=cycle_conflict sourceSeq=2964 attempt=-"), logs.join("\n"));
+  assert.ok(!logs.join("\n").includes("your view"), "no body in the log");
+});
+
+test("cycle-start refusals: coded 4xx is final, session codes and transient errors are not", () => {
+  for (const [error, expected] of [
+    [new RoomAPIError(409, {code: "cycle_conflict"}), true],
+    [new RoomAPIError(409, {code: "cycle_superseded"}), true],
+    [new RoomAPIError(409, {code: "stale_epoch"}), true],
+    [new RoomAPIError(400, {code: "validation_error"}), true],
+    [new RoomAPIError(409, {}), false],
+    [new RoomAPIError(409, {code: "cycle_conflict", retryable: true}), false],
+    [new RoomAPIError(429, {code: "busy"}), false],
+    [new RoomAPIError(503, {code: "cycle_conflict"}), false],
+    [new RoomAPIError(401, {code: "credential_expired"}), false],
+    [new RoomAPIError(403, {code: "credential_revoked"}), false],
+    [new RoomAPIError(409, {code: "connector_not_active"}), false],
+    [new TypeError("fetch failed"), false],
+  ]) assert.equal(isCycleStartRefusal(error), expected, `${error.name} ${error.status ?? ""} ${error.code ?? ""}`);
 });

@@ -141,6 +141,14 @@ export function attemptRenewalDelaySeconds(leaseExpiresAt, now = Date.now()) {
   return Math.max(1, Math.min(30, (Date.parse(leaseExpiresAt) - now) / 3000));
 }
 
+// A coded 4xx refusal of POST /cycles is final for its source event; session
+// and credential codes, 429 and anything retryable keep today's handling.
+const CYCLE_START_SESSION_CODES = new Set(["credential_expired", "credential_revoked", "connector_not_active", "busy"]);
+export function isCycleStartRefusal(error) {
+  return error instanceof RoomAPIError && Boolean(error.code) && !error.retryable
+    && error.status >= 400 && error.status < 500 && error.status !== 429 && !CYCLE_START_SESSION_CODES.has(error.code);
+}
+
 // Milliseconds left on a held attempt's lease; 0 when it has run out or the
 // Room gave no valid expiry (then nothing proves it valid, so no retry).
 export function attemptLeaseRemainingMs(cycleAttempt, now = Date.now()) {
@@ -676,6 +684,13 @@ export class OpenClawRoomRuntime {
           await this.client.acknowledgePeerContribution(this.state, event.id, signal);
         }
         const cycleAttempt = await this.prepareCycleAttempt(event, signal);
+        if (cycleAttempt?.refused) {
+          await this.recordTerminalEvidence(event, "skipped", {reason: cycleAttempt.refused});
+          this.logger?.info?.(`Room delivery skipped ${outcomeLogFields({code: cycleAttempt.refused, sourceSeq: event.seq})}`);
+          await this.ackEvent(event);
+          scanCursor = event.seq;
+          continue;
+        }
         if (cycleAttempt === false) {
           await this.recordTerminalEvidence(event, "skipped", {reason: "coordination_handled_without_model"});
           this.logger?.info?.(`Room delivery skipped ${outcomeLogFields({code: "coordination_handled_without_model", sourceSeq: event.seq})}`);
@@ -1050,6 +1065,7 @@ export class OpenClawRoomRuntime {
     }
     if (isHumanCycleSource(event) || agentSeed) {
       const cycle = await this.ensureDiscussionCycle(event, signal);
+      if (cycle?.refused) return cycle;
       if (!cycle) return false;
       // Starting a cycle publishes the authoritative attempt-ready event.
       // The source message is context only; claiming it here would let the
@@ -1085,7 +1101,8 @@ export class OpenClawRoomRuntime {
     }
     if (!roster.some((member) => String(member.membershipId) === this.state.membershipId)) return null;
     const agents = roster.map((member) => ({membershipId: String(member.membershipId), displayName: String(member.displayName || "Agent")}));
-    return this.client.startDiscussionCycle(this.state, {
+    try {
+      return await this.client.startDiscussionCycle(this.state, {
       epochId: state.activeEpoch.id,
       sourceEventId: event.id,
       policyDigest: "0".repeat(64),
@@ -1093,7 +1110,13 @@ export class OpenClawRoomRuntime {
       roster: agents,
       budgets: {totalTurns: 1, perAgentTurns: 1, maxContributionBytes: 1, maxCycleBytes: 1, maxDuration: 1, maxFollowUps: 0},
       idempotencyKey: safeKey(`openclaw-cycle:${event.id}`),
-    }, signal);
+      }, signal);
+    } catch (error) {
+      // The Room refused to start this cycle (for example cycle_conflict when
+      // this agent is not execution-ready): the source is done, not retried.
+      if (isCycleStartRefusal(error)) return {refused: error.code};
+      throw error;
+    }
   }
 
   async claimAssignedAttempt(cycleId, signal) {

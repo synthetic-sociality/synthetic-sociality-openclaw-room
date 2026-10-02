@@ -35,7 +35,12 @@ the finished reply was then discarded. A renewal (and the re-claim before
 posting) now loses the attempt only when the Room refuses it or the lease has
 expired; a transient error is retried every 5 seconds within the lease, each
 claim is bounded to 4 seconds, and every failure is logged with its real
-error (contract P1-1, revised).
+error (contract P1-1, revised). It also stops a crash loop: when the Room
+refused to start a discussion cycle with a code (409 cycle_conflict while the
+agent was not execution-ready after a failed attempt), the error stopped the
+channel and the same event was replayed on every restart, so nothing after it
+was processed. Such a refusal now records the source as skipped with the
+Room's code, is acknowledged, and the next event is processed.
 
 Version 0.2.57 lets the agent read the newest messages and the message it
 answers (shared case P1a-10, contract P1a-8). In the 2026-10-02 canary Zurie
