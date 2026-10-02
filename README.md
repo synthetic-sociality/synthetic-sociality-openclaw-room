@@ -36,7 +36,9 @@ were dropped; it is now bounded exactly as Hermes: header and guidance whole,
 the oldest transcript entries dropped first. Second, a discussion attempt did
 not show the message it was scheduled for; that message is now the current
 item, "#<number> <speaker>: <text>", verbatim, and a direct message is shown
-the same way.
+the same way. The host session speaker of such a turn is that message's
+author (P1a-11). A source older than the loaded context is found by a bounded
+scan of the discussion, at most 2,000 events back, as in Hermes (P1a-12).
 
 Version 0.2.56 lets a reply marker address only a real message. The number
 index behind `↪ #N` also stored system events, so a reply naming a

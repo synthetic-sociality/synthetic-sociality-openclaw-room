@@ -24,6 +24,8 @@ export const HANDOVER_CONTEXT_CHARACTER_LIMIT = 12_000;
 // The canonical Room context (header, guidance and transcript) is bounded to
 // the same limit as in Hermes; see canonicalRoomContext.
 export const CONTEXT_CHARACTER_LIMIT = 12_000;
+export const CONTEXT_SCAN_LIMIT = 2_000;
+export const CONTEXT_SCAN_CHUNK = 100;
 const CONTEXT_FOOTER = "[/Canonical Room context]";
 
 function validCanonicalTimestamp(value) {
@@ -674,7 +676,7 @@ export class OpenClawRoomRuntime {
         this.contextPolicyWordLimit = 0;
         this.contextDiscussionStart = null;
         this.contextSenderName = "";
-        this.contextCurrentItem = "";
+        this.contextCycleSource = null;
         const sharedContext = await this.sharedRoomContext(event, pageEpoch, signal);
         const normalized = normalizeEvent(
           event,
@@ -686,7 +688,7 @@ export class OpenClawRoomRuntime {
           this.contextPolicyWordLimit,
           this.contextDiscussionStart,
           this.contextSenderName,
-          this.contextCurrentItem,
+          this.contextCycleSource,
         );
         // The model runs while the consumer holds this yield; keep its claimed
         // attempt alive until a terminal outcome is recorded or it returns.
@@ -922,8 +924,21 @@ export class OpenClawRoomRuntime {
     this.contextSenderName = speakerName(state?.roster, event);
     // Delivery contract P1a-8: the message a cycle attempt answers is the
     // current item, not a transcript entry.
-    const sourceMessage = cycleSourceMessage(event, page?.events);
-    this.contextCurrentItem = sourceMessage ? currentItemLine(sourceMessage, speakerLabel(state?.roster, sourceMessage)) : "";
+    // A source older than the loaded page is read by a bounded scan of the
+    // epoch, as in Hermes (context.py cycle_source_message).
+    const sourceMessage = cycleSourceMessage(event, page?.events)
+      ?? (startEvent && String(eventPayload(event?.payload).sourceEventId ?? "") === String(startEvent.id ?? "")
+        ? null
+        : await scanCycleSourceMessage(event, sourceEpoch.startsAtSeq,
+          (after) => this.client.readEvents(this.state, after, {wait: 0, signal})));
+    if (sourceMessage) this.rememberPostNumbers([sourceMessage]);
+    // The host session speaker is the source's author (P1a-7), as in Hermes.
+    this.contextCycleSource = sourceMessage ? {
+      line: currentItemLine(sourceMessage, speakerLabel(state?.roster, sourceMessage)),
+      authorId: sourceMessage.actorId,
+      authorName: speakerLabel(state?.roster, sourceMessage),
+      authorRole: String(sourceMessage.actorRole ?? ""),
+    } : null;
     const roomContext = canonicalRoomContext(state, page?.events, sourceMessage?.id ?? event?.id, policy, sourceEpoch.startsAtSeq, startEvent);
     const library = await this.client.listArtifacts(this.state, signal);
     const artifactContext = await sourceArtifactContext(
@@ -2347,7 +2362,7 @@ export function normalizeEvent(
   policyWordLimit = 0,
   discussionStart = null,
   senderName = "",
-  sourceItem = "",
+  cycleSource = null,
 ) {
   const payload = eventPayload(event.payload);
   const actorRole = String(event.actorRole ?? "");
@@ -2355,8 +2370,15 @@ export function normalizeEvent(
   const speaker = String(senderName ?? "").trim() || speakerLabel([], event);
   // Delivery contract P1a-8: the message this turn answers, numbered and
   // labelled as in the transcript.
-  const currentItem = String(sourceItem ?? "").trim()
+  const currentItem = String(cycleSource?.line ?? "").trim()
     || (event.type === "message.posted" ? currentItemLine(event, speaker) : "");
+  // The speaker is whoever wrote what the turn answers: the discussion start's
+  // author (P1a-5), the cycle source message's author, else the event's actor.
+  const author = discussionStart
+    ? {id: discussionStart.authorId, name: discussionStart.authorName, role: "human"}
+    : cycleSource
+      ? {id: cycleSource.authorId, name: cycleSource.authorName, role: cycleSource.authorRole}
+      : {id: event.actorId, name: speaker, role: actorRole};
   const normalized = {
     id: event.id,
     // Delivery/idempotency identity must remain the unique canonical event.
@@ -2370,9 +2392,9 @@ export function normalizeEvent(
     conversationId: epochId === exactOptionalEpochId(legacySessionEpochId, "Room legacy session epoch")
       ? roomId
       : epochConversationId(roomId, epochId),
-    senderId: discussionStart ? discussionStart.authorId : event.actorId,
-    senderName: discussionStart ? discussionStart.authorName : speaker,
-    senderKind: discussionStart || actorRole === "human" || actorRole.startsWith("human_") ? "human" : "agent",
+    senderId: author.id,
+    senderName: author.name,
+    senderKind: author.role === "human" || author.role.startsWith("human_") ? "human" : "agent",
     text: cyclePrompt(event, payload, cycleAttempt, sharedContext, policyWordLimit, discussionStart, currentItem),
     occurredAt: Date.parse(event.ts) || Date.now(),
     raw: event,
@@ -2450,6 +2472,31 @@ export function cycleSourceMessage(event, events) {
   if (!sourceEventId) return null;
   return (Array.isArray(events) ? events : [])
     .find((item) => item?.type === "message.posted" && String(item.id ?? "") === sourceEventId) ?? null;
+}
+
+// The source message of a cycle attempt that is older than the loaded page.
+// The event API reads forward only and has no read by id, so the epoch is
+// walked backwards in pages of CONTEXT_SCAN_CHUNK, at most CONTEXT_SCAN_LIMIT
+// sequence numbers, never before the epoch start; the walk ends at the event
+// with that id, which counts only when it is a message (Hermes: same limits).
+export async function scanCycleSourceMessage(event, epochStartsAtSeq, readPage) {
+  if (event?.type !== "discussion.cycle_attempt_ready") return null;
+  const sourceEventId = String(eventPayload(event.payload).sourceEventId ?? "").trim();
+  if (!sourceEventId || !Number.isSafeInteger(event.seq)) return null;
+  const floor = Math.max(1, Number(epochStartsAtSeq) || 1);
+  let before = event.seq;
+  let scanned = 0;
+  while (before > floor && scanned < CONTEXT_SCAN_LIMIT) {
+    const width = Math.min(CONTEXT_SCAN_CHUNK, before - floor, CONTEXT_SCAN_LIMIT - scanned);
+    const start = before - width;
+    const page = await readPage(start - 1);
+    const found = (Array.isArray(page?.events) ? page.events : [])
+      .find((item) => String(item?.id ?? "") === sourceEventId && item.seq >= start && item.seq < before);
+    if (found) return found.type === "message.posted" ? found : null;
+    scanned += width;
+    before = start;
+  }
+  return null;
 }
 
 // Delivery contract P1a-8, as Hermes renders its current input:

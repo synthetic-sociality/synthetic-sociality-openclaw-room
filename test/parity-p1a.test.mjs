@@ -9,7 +9,7 @@ import {registerHooks} from "node:module";
 import {
   OPEN_EXCHANGE_PREAMBLE_SHA256, OPEN_EXCHANGE_PREAMBLE_VERSION, OpenClawRoomRuntime, REPLY_MARKER_GUIDANCE,
   CONTEXT_CHARACTER_LIMIT, ROOM_HISTORY_INSTRUCTION, ROOM_PASS_ENVELOPE, canonicalRoomContext, discussionHandoverContext, discussionStartInput, libraryCatalogContext,
-  normalizeEvent, sourceArtifactContext,
+  normalizeEvent, scanCycleSourceMessage, sourceArtifactContext,
 } from "../src/runtime.js";
 import {registerRoomCommands} from "../src/commands.js";
 import {readRoomHistory, registerRoomHistoryTool, resetHistoryScanCache} from "../src/history.js";
@@ -517,7 +517,7 @@ test("P1a-08 speaker labels follow one precedence and four role labels", async (
 test("conformance P1a case names resolve to tests in this file", async () => {
   const source = await readFile(new URL(import.meta.url), "utf8");
   const cases = Object.entries(conformance.parityP1aCases ?? {});
-  assert.equal(cases.length, 10);
+  assert.equal(cases.length, 12);
   for (const [id, name] of cases) {
     assert.ok(name.startsWith(`${id} `), id);
     assert.ok(source.includes(`test(${JSON.stringify(name)},`), name);
@@ -601,60 +601,63 @@ test("P1a-09 reply marker addresses only real messages", async () => {
   }
 });
 
+// The Joined Coding canary of 2026-10-02 (cases P1a-10 to P1a-12): Zurie's
+// turn, built through the runtime from a page of canonical events.
+const roster = [
+  {membershipId: "owner-tj", displayName: "TJE", role: "human_owner", status: "active"},
+  {membershipId: "zurie", displayName: "Zurie", role: "participant_agent", status: "active"},
+  {membershipId: "paula", displayName: "Paula", role: "participant_agent", status: "active"},
+];
+const start = {id: "startevent01002", seq: 1002, type: "discussion.started", actorRole: "human_owner", actorId: "owner-tj",
+  payload: {epoch: {id: "epoch-c", ordinal: 20, startsAtSeq: 1002, status: "active", topic: {title: "Coding"}}}};
+const message = (seq, actorId, actorRole, body, extra = {}) => ({id: `message0000${seq}`, seq, type: "message.posted",
+  actorRole, actorId, payload: {body, epochId: "epoch-c", ...extra}});
+const long = (seq) => `[m${seq}] ${"The formatter pin and the composition boundary stay open until the shared fixture lands. ".repeat(17)}`.slice(0, 1500);
+const earlier = Array.from({length: 16}, (_, index) => {
+  const seq = 1003 + index;
+  return message(seq, index % 2 ? "zurie" : "paula", "participant_agent", long(seq));
+});
+const OWNER = "@Zurie @Paula can you decide who takes what role here in coding. be brief.";
+const owner = message(1020, "owner-tj", "human_owner", OWNER, {resolvedRecipientMembershipIds: ["zurie", "paula"]});
+const zurie = message(1023, "zurie", "participant_agent", "On the formatter pin: keep it until the fixture lands.", {respondsTo: [owner.id]});
+const PAULA = "Roles: Zurie owns the parser, I own review and the fixture. ↪ kept short as asked.";
+const paula = message(1026, "paula", "participant_agent", PAULA, {respondsTo: [zurie.id], resolvedRecipientMembershipIds: ["zurie"]});
+const readyFor = (seq, source) => ({id: `attemptready${seq}`, seq, type: "discussion.cycle_attempt_ready", actorRole: "system",
+  actorId: "room_coordinator", payload: {cycleId: "cycle-c", epochId: "epoch-c", generation: 1, membershipId: "zurie", round: 1, sourceEventId: source.id}});
+
+async function codingTurn(page, ready, reads = []) {
+  const runtime = new OpenClawRoomRuntime({accountId: "t", stateFile: "/unused", baseUrl: "https://room.example/api"});
+  runtime.state = {roomId: "room-1", membershipId: "zurie", cursor: ready.seq - 1, deliveryIntents: {}, terminalEvidence: {},
+    epochSessionRoutingInitialized: true, legacySessionEpochId: ""};
+  runtime.connectorSession = {sessionId: "s"};
+  runtime.persistState = async () => {};
+  const controller = new AbortController();
+  runtime.client = {
+    readEvents: async (_state, after) => (reads.push(after), {activeEpochId: "epoch-c", activeEpochStartsAtSeq: 1002,
+      events: after >= ready.seq - 1 ? [ready] : page.filter((item) => item.seq > after)}),
+    roomState: async () => ({headSeq: ready.seq, activeEpoch: {id: "epoch-c", startsAtSeq: 1002}, activeTopic: {title: "Coding"}, roster, rules: []}),
+    roomPolicy: async () => ({policy: {coordinationMode: "coordinated"}}),
+    listArtifacts: async () => ({items: []}),
+    claimDiscussionAttempt: async () => ({attempt: {id: `attempt-${ready.seq}`, round: 1},
+      cycle: {id: "cycle-c", generation: 1, totalTurns: 0, budgets: {totalTurns: 6, perAgentTurns: 3}}}),
+    acknowledge: async (_state, seq) => ({acknowledgedSeq: seq}),
+  };
+  runtime.renewAccess = async () => false;
+  runtime.maintainPresence = async () => {};
+  runtime.markContextAcknowledged = async () => {};
+  runtime.startAttemptLease = () => null;
+  const turns = runtime.assignedTurns(controller.signal);
+  const {value} = await turns.next();
+  controller.abort();
+  await turns.return();
+  return value;
+}
+
 test("P1a-10 the agent reads the newest messages and the message it answers", async () => {
   // Canary shape, Joined Coding 2026-10-02 06:12 UTC (neutral IDs and text):
   // sixteen ~1,500-character agent messages 1003-1018, the owner's short
   // message 1020, attempt-ready 1022 for Zurie sourced from 1020; then Zurie
   // 1023, Paula 1026 and attempt-ready 1027 for Zurie sourced from 1026.
-  const roster = [
-    {membershipId: "owner-tj", displayName: "TJE", role: "human_owner", status: "active"},
-    {membershipId: "zurie", displayName: "Zurie", role: "participant_agent", status: "active"},
-    {membershipId: "paula", displayName: "Paula", role: "participant_agent", status: "active"},
-  ];
-  const start = {id: "startevent01002", seq: 1002, type: "discussion.started", actorRole: "human_owner", actorId: "owner-tj",
-    payload: {epoch: {id: "epoch-c", ordinal: 20, startsAtSeq: 1002, status: "active", topic: {title: "Coding"}}}};
-  const message = (seq, actorId, actorRole, body, extra = {}) => ({id: `message0000${seq}`, seq, type: "message.posted",
-    actorRole, actorId, payload: {body, epochId: "epoch-c", ...extra}});
-  const long = (seq) => `[m${seq}] ${"The formatter pin and the composition boundary stay open until the shared fixture lands. ".repeat(17)}`.slice(0, 1500);
-  const earlier = Array.from({length: 16}, (_, index) => {
-    const seq = 1003 + index;
-    return message(seq, index % 2 ? "zurie" : "paula", "participant_agent", long(seq));
-  });
-  const OWNER = "@Zurie @Paula can you decide who takes what role here in coding. be brief.";
-  const owner = message(1020, "owner-tj", "human_owner", OWNER, {resolvedRecipientMembershipIds: ["zurie", "paula"]});
-  const zurie = message(1023, "zurie", "participant_agent", "On the formatter pin: keep it until the fixture lands.", {respondsTo: [owner.id]});
-  const PAULA = "Roles: Zurie owns the parser, I own review and the fixture. ↪ kept short as asked.";
-  const paula = message(1026, "paula", "participant_agent", PAULA, {respondsTo: [zurie.id], resolvedRecipientMembershipIds: ["zurie"]});
-  const readyFor = (seq, source) => ({id: `attemptready${seq}`, seq, type: "discussion.cycle_attempt_ready", actorRole: "system",
-    actorId: "room_coordinator", payload: {cycleId: "cycle-c", epochId: "epoch-c", generation: 1, membershipId: "zurie", round: 1, sourceEventId: source.id}});
-
-  async function turn(page, ready) {
-    const runtime = new OpenClawRoomRuntime({accountId: "t", stateFile: "/unused", baseUrl: "https://room.example/api"});
-    runtime.state = {roomId: "room-1", membershipId: "zurie", cursor: ready.seq - 1, deliveryIntents: {}, terminalEvidence: {},
-      epochSessionRoutingInitialized: true, legacySessionEpochId: ""};
-    runtime.connectorSession = {sessionId: "s"};
-    runtime.persistState = async () => {};
-    const controller = new AbortController();
-    runtime.client = {
-      readEvents: async (_state, after) => ({activeEpochId: "epoch-c", activeEpochStartsAtSeq: 1002,
-        events: after >= ready.seq - 1 ? [ready] : page.filter((item) => item.seq > after)}),
-      roomState: async () => ({headSeq: ready.seq, activeEpoch: {id: "epoch-c", startsAtSeq: 1002}, activeTopic: {title: "Coding"}, roster, rules: []}),
-      roomPolicy: async () => ({policy: {coordinationMode: "coordinated"}}),
-      listArtifacts: async () => ({items: []}),
-      claimDiscussionAttempt: async () => ({attempt: {id: `attempt-${ready.seq}`, round: 1},
-        cycle: {id: "cycle-c", generation: 1, totalTurns: 0, budgets: {totalTurns: 6, perAgentTurns: 3}}}),
-      acknowledge: async (_state, seq) => ({acknowledgedSeq: seq}),
-    };
-    runtime.renewAccess = async () => false;
-    runtime.maintainPresence = async () => {};
-    runtime.markContextAcknowledged = async () => {};
-    runtime.startAttemptLease = () => null;
-    const turns = runtime.assignedTurns(controller.signal);
-    const {value} = await turns.next();
-    controller.abort();
-    await turns.return();
-    return value.text;
-  }
 
   const entry = (item, name) => `#${item.seq} ${name}: ${item.payload.body}`;
   const names = {"owner-tj": "TJE", zurie: "Zurie", paula: "Paula"};
@@ -662,7 +665,7 @@ test("P1a-10 the agent reads the newest messages and the message it answers", as
     [owner, [start, ...earlier, owner], [earlier[15], earlier[14], earlier[13]]],
     [paula, [start, ...earlier, owner, zurie, paula], [zurie, owner, earlier[15]]],
   ]) {
-    const text = await turn(page, readyFor(source.seq + 1, source));
+    const {text} = await codingTurn(page, readyFor(source.seq + 1, source));
     const current = entry(source, names[source.actorId]);
     // The source message is the current item, verbatim, exactly once and
     // after the bounded context; it is not a transcript entry.
@@ -693,4 +696,56 @@ test("P1a-10 the agent reads the newest messages and the message it answers", as
   const cut = canonicalRoomContext(state, [owner, huge], "", {}, 1);
   assert.equal(cut.length, CONTEXT_CHARACTER_LIMIT);
   assert.ok(cut.endsWith("…\n[/Canonical Room context]") && !cut.includes("#1020"));
+});
+
+test("P1a-11 the host session speaker is the author of the message the turn answers", async () => {
+  // A cycle turn sourced from a message: the speaker is its author, labelled
+  // per P1a-7. A system source stays Room (system); a discussion start keeps
+  // P1a-5 (case P1a-06).
+  const page = [start, ...earlier, owner, zurie, paula];
+  const unnamed = message(1028, "stranger-9", "participant_agent", "An unlisted agent's note.");
+  const cycleStarted = {id: "cyclestarted1029", seq: 1029, type: "discussion.cycle_started", actorRole: "system",
+    actorId: "room_coordinator", payload: {cycleId: "cycle-c", epochId: "epoch-c"}};
+  for (const [source, name, id, kind] of [
+    [owner, "TJE", "owner-tj", "human"],
+    [paula, "Paula", "paula", "agent"],
+    [unnamed, "Room agent", "stranger-9", "agent"],
+    [cycleStarted, "Room (system)", "room_coordinator", "agent"],
+  ]) {
+    const value = await codingTurn([...page, unnamed, cycleStarted], readyFor(1030, source));
+    assert.equal(value.senderName, name, `#${source.seq}`);
+    assert.equal(value.senderId, id, `#${source.seq}`);
+    assert.equal(value.senderKind, kind, `#${source.seq}`);
+    if (source.type === "message.posted") assert.ok(value.text.includes(`\n${`#${source.seq} ${name}: ${source.payload.body}`}`));
+    else assert.doesNotMatch(value.text, /#1029/u);
+  }
+});
+
+test("P1a-12 a source message older than the loaded context is still the current item", async () => {
+  // The owner's 1020 followed by 70 later events (more than the 50-event
+  // context page): the attempt at 1091 still presents 1020 as its current item.
+  const later = Array.from({length: 70}, (_, index) => ({id: `audit${1021 + index}`, seq: 1021 + index,
+    type: "turn.granted", actorRole: "system", actorId: "room_coordinator", payload: {epochId: "epoch-c"}}));
+  const page = [start, ...earlier, owner, ...later];
+  const reads = [];
+  const value = await codingTurn(page, readyFor(1091, owner), reads);
+  const current = `#1020 TJE: ${OWNER}`;
+  assert.equal(value.text.split(current).length - 1, 1, value.text);
+  assert.ok(value.text.indexOf(current) > value.text.indexOf("[/Canonical Room context]"));
+  assert.equal(value.senderName, "TJE");
+  // Bounded: pages of 100 within the epoch, never before its start.
+  assert.ok(reads.every((after) => after >= 1001), JSON.stringify(reads));
+  // A source that is not in the epoch gets no current item and no substitute.
+  const missing = await codingTurn(page, readyFor(1091, {id: "message-from-elsewhere"}));
+  assert.doesNotMatch(missing.text, /TJE: @Zurie/u);
+  assert.equal(missing.senderName, "Room (system)");
+  // The scan stops after CONTEXT_SCAN_LIMIT sequence numbers.
+  const scans = [];
+  const far = {id: "attemptready9000", seq: 9000, type: "discussion.cycle_attempt_ready", payload: {sourceEventId: "message00001020"}};
+  assert.equal(await scanCycleSourceMessage(far, 1002, async (after) => (scans.push(after), {events: []})), null);
+  assert.equal(scans.length, 20);
+  assert.equal(Math.min(...scans), 9000 - 2_000 - 1);
+  // A found source that is not a message is no current item (P1a-5 and system sources).
+  assert.equal(await scanCycleSourceMessage({...far, seq: 1030, payload: {sourceEventId: start.id}}, 1002,
+    async (after) => ({events: [start].filter((item) => item.seq > after)})), null);
 });

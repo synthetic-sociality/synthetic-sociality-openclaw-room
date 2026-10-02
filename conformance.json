@@ -128,7 +128,9 @@
     "P1a-07": "P1a-07 host fallback notice is never posted; the model reply is",
     "P1a-08": "P1a-08 speaker labels follow one precedence and four role labels",
     "P1a-09": "P1a-09 reply marker addresses only real messages",
-    "P1a-10": "P1a-10 the agent reads the newest messages and the message it answers"
+    "P1a-10": "P1a-10 the agent reads the newest messages and the message it answers",
+    "P1a-11": "P1a-11 the host session speaker is the author of the message the turn answers",
+    "P1a-12": "P1a-12 a source message older than the loaded context is still the current item"
   },
   "presentationAcknowledgementFixtures": {
     "before_coordination_and_model": "receive-boundary acknowledgement precedes coordination and model dispatch",
