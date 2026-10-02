@@ -141,6 +141,15 @@
     "P2a-05": "P2a-05 the state directory is never the filesystem root",
     "P2a-06": "P2a-06 a transient renewal failure keeps a turn with a valid lease"
   },
+  "parityP2cContract": "docs/delivery-lifecycle-contract-v1.md#p2c--secrets-late-replies-self-recovery-2026-10-02",
+  "parityP2cCases": {
+    "P2c-01": "P2c-01 the credential is not readable through the agent's tools and never appears in prompt, tool result or log",
+    "P2c-02": "P2c-02 a late reply is offered once as a fact with its kept text and then cleared",
+    "P2c-03": "P2c-03 after network loss and session expiry the connector reconnects without a restart",
+    "P2c-04": "P2c-04 local status reports load, version, connection and last error without secrets or bodies",
+    "P2c-05": "P2c-05 the reported host label comes from the current machine"
+  },
+  "parityP2cStatusSchema": "synthetic-sociality-room-status-v1",
   "presentationAcknowledgementFixtures": {
     "before_coordination_and_model": "receive-boundary acknowledgement precedes coordination and model dispatch",
     "separate_from_durable_cursor_ack": "durable cursor acknowledgement does not emit presentation acknowledgement"
