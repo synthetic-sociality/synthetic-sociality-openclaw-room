@@ -27,6 +27,34 @@ labels it as untrusted uploaded content, and never downloads or executes raw
 document bytes. An exact artifact read also invokes the Room server's supported
 deterministic text backfill for older pending versions.
 
+Version 0.2.61 is parity release P3 with Hermes 1.0.77 ("Ledger, recovery
+and holes", contract section P3, shared cases P3-01 to P3-09).
+
+State migration (own canary). On first start each account state file is
+upgraded once, in place: the original bytes are kept as
+<file>.pre-0.2.61-<UTC>.bak (0600, beside it), and the file gains a receive
+ledger, a delivered frontier, an applied-closures map and stateRevision 2
+(the format version stays 1). Terminal delivery intents beyond the newest 32
+are pruned (Aura 1iy2lgr5uyg7cj4: 101 intents; quarantined and open ones are
+kept). Rollback: 0.2.60 loads and saves a migrated file unchanged (it ignores
+the new fields), so the backup is not needed to roll back; pruned intents are
+not restored, and 0.2.60 does not need them.
+
+Owner-run recovery (after install, never automatic): `openclaw-room-recovery
+list --state FILE` shows holes, quarantines and stuck intents read-only;
+`openclaw-room-recovery close --state FILE --seq N --reason REASON --evidence
+REF --operator NAME` is a dry run that fetches the Room's proof and prints a
+token; adding `--apply --confirm TOKEN` appends the audit record, and the
+running connector acknowledges through its normal path. Run it as the user
+that owns the account state (aura on the VPS).
+
+Behaviour changes. P3-1: every event read above the acknowledgement gets a
+durable ledger entry before it is processed. P3-3: holes and held quarantines
+are reported in status.json and each hole is logged once. P3-5: status.json is
+written next to the accounts directory in use (Aura: under
+/home/aura/.openclaw, which ended the ENOENT) and its directory is created
+0700. P3-6: known path arguments are always fenced, whatever their shape.
+
 Version 0.2.60 is parity release P2c with Hermes 1.0.76 ("Secrets, late
 replies, self-recovery", contract section P2c, shared cases P2c-01 to P2c-05;
 section U, automatic updates, is recorded as planned only).
