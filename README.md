@@ -27,6 +27,15 @@ labels it as untrusted uploaded content, and never downloads or executes raw
 document bytes. An exact artifact read also invokes the Room server's supported
 deterministic text backfill for older pending versions.
 
+Version 0.2.62 is parity release P4 with Hermes 1.0.78 ("Device link", contract
+section L1, shared cases L1-01 to L1-14). It ships the contract and the shared
+cases only: every L1 case is marked planned here ("OpenClaw translation in P5
+(owner: Hermes first, OpenClaw next)"), and the suite pins the shared signature
+vector (JavaScript JSON.stringify bytes and Ed25519 signatures, identical to
+Hermes). No runtime behaviour changes; the P3 contract clause P3-4 now states
+that a recovery mark counts only for the sealed record digest it was made for,
+which 0.2.62 enforces (a mismatched mark re-checks the Room's proof).
+
 Version 0.2.61 is parity release P3 with Hermes 1.0.77 ("Ledger, recovery
 and holes", contract section P3, shared cases P3-01 to P3-09).
 
