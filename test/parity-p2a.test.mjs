@@ -315,4 +315,37 @@ test("L1-16 a missed source named by the Room replaces the local record and is o
   validateState(state);
   state.missedSources = [{...marked[0], offered: "yes"}];
   assert.throws(() => validateState(state), /missed sources/u);
+
+  // OP-12 P4 r1 item 2: a failed read leaves the Room's source unmarked.
+  const direct = roomRuntime([named, paula], {cursor: 2969});
+  direct.client.readEvents = async () => { throw new Error("network"); };
+  assert.deepEqual(await direct.missedSourceFacts({seq: 2970}, [named], ROSTER, 2900, new Set(), undefined, named.id),
+    {facts: [], offered: [], mark: ""});
+  // OP-12 P4 r1 item 5: the epoch floor also holds for a source on the current page.
+  assert.deepEqual(await direct.missedSourceFacts({seq: 3000}, [before], ROSTER, 2950, new Set(), undefined, before.id),
+    {facts: [], offered: [before.id], mark: before.id});
+  direct.state.missedSources = [{sourceEventId: before.id, sourceSeq: 0}];
+  assert.deepEqual(await direct.missedSourceFacts({seq: 3000}, [before], ROSTER, 2950, new Set(), undefined),
+    {facts: [], offered: [before.id], mark: ""});
+});
+
+// OP-12 P4 r1 (OpenClaw item 2, Hermes H1): a transient failure while offering
+// leaves the Room's source unmarked, so a later turn offers it.
+test("L1-19 a source the Room names as missed is remembered as offered only after its offer succeeded", async () => {
+  const named = message(2966, "owner-tj", "human_owner", "And this one?", {resolvedRecipientMembershipIds: ["zurie"]});
+  const newer = [2967, 2968, 2969].map((seq) => message(seq, "paula", "participant_agent", `Note ${seq}.`));
+  const runtime = roomRuntime([named, ...newer], {cursor: 2969});
+  const read = runtime.client.readEvents;
+  runtime.client.readEvents = async () => { throw new Error("network"); };
+  let result = await runtime.missedSourceFacts({seq: 2970}, [named], ROSTER, 2900, new Set(), undefined, named.id);
+  assert.deepEqual(result, {facts: [], offered: [], mark: ""});
+  await runtime.clearMissedSources(result.offered, {mark: result.mark, attemptReady: true});
+  assert.equal(runtime.state.missedSources, undefined);
+  // The next turn, with the Room still naming it: offered, then marked.
+  runtime.client.readEvents = read;
+  result = await runtime.missedSourceFacts({seq: 2970}, [named], ROSTER, 2900, new Set(), undefined, named.id);
+  assert.equal(result.facts.length, 1);
+  assert.match(result.facts[0], /^Missed earlier: #2966 /u);
+  await runtime.clearMissedSources(result.offered, {mark: result.mark, attemptReady: true});
+  assert.deepEqual(runtime.state.missedSources, [{sourceEventId: named.id, sourceSeq: 0, offered: true}]);
 });

@@ -35,6 +35,7 @@ process.env.HOME = home;
 const {createRoomChannel} = await import("../src/channel.js");
 const {
   OpenClawRoomRuntime, attemptRenewalDelaySeconds, classifyPostRefusal, isCycleStartRefusal, keptReplyBlock, tooLargeKeptReason,
+  keptReplyBound, KEPT_REPLY_HARD_LIMIT, KEPT_REPLY_CHARACTER_LIMIT,
 } = await import("../src/runtime.js");
 const {RoomAPIError, SAFE_API_CODES} = await import("../src/room-client.js");
 const {loadState, saveState, validateState} = await import("../src/state.js");
@@ -941,7 +942,7 @@ test("L1-15 a message_too_large refusal is terminal in open and coordinated Room
     const runtime = p1Runtime();
     runtime.client = recordingClient({
       requestTurn: async () => ({state: "granted", turnId: "turn-1"}),
-      roomState: async () => ({headSeq: 5, activeEpoch: {id: "epoch-1"}, serverLimits: {messageMaxBytes: 16384}}),
+      roomState: async () => ({headSeq: 5, activeEpoch: {id: "epoch-1"}, serverLimits: {messageMaxBytes: 16}}),
       postMessage: async () => {
         runtime.client.calls.push(["post"]);
         throw new RoomAPIError(413, {code: "message_too_large", message: BYTE_CEILING, retryable: false});
@@ -965,10 +966,10 @@ test("L1-15 a message_too_large refusal is terminal in open and coordinated Room
     assert.deepEqual(completions, mode === "coordinated"
       ? [{generation: 3, action: "fail", executionFailure: {layer: "runtime", code: "response_too_large"}}] : [], mode);
     // Kept under P2c-2 with the Room's byte ceiling, never a word count.
-    assert.equal(runtime.state.keptReply.reason, "message_too_large (limit 16384 bytes)", mode);
+    assert.equal(runtime.state.keptReply.reason, "message_too_large (limit 16 bytes)", mode);
     assert.equal(runtime.state.keptReply.text, BODY, mode);
     const offer = keptReplyBlock(runtime.state.keptReply, null, []);
-    assert.ok(offer.includes("\nNot posted: message_too_large (limit 16384 bytes)\n"), offer);
+    assert.ok(offer.includes("\nNot posted: message_too_large (limit 16 bytes)\n"), offer);
     assert.doesNotMatch(offer.replace(BODY, ""), /words/u);
     // A later skip never downgrades it; a replay never posts again.
     await runtime.recordSkipped(SOURCE.id, "model_no_visible_reply");
@@ -982,14 +983,14 @@ test("L1-15 a message_too_large refusal is terminal in open and coordinated Room
     assert.equal(runtime.state.cursor, 5, mode);
     validateState(runtime.state);
   }
-  // A byte number in the refusal wins; a word count is never named; an
-  // unknown ceiling leaves only the code.
-  const stated = new RoomAPIError(413, {code: "message_too_large", message: "this Room allows at most 8000 bytes"});
-  assert.equal(stated.byteLimit, 8000);
-  assert.doesNotMatch(stated.message, /8000/u, "only the number is kept, never the message");
-  assert.equal(tooLargeKeptReason(stated, 16384), "message_too_large (limit 8000 bytes)");
-  assert.equal(tooLargeKeptReason(new RoomAPIError(413, {code: "message_too_large", message: "allows at most 300 words per response"})), "message_too_large");
-  assert.equal(tooLargeKeptReason(new RoomAPIError(413, {code: "message_too_large", message: BYTE_CEILING}), 0), "message_too_large");
+  // The ceiling is named only when the body exceeds it (a cycle byte budget
+  // below the ceiling, or an unknown ceiling, names only the code). The 413
+  // message is never kept (Room server 772ca32 sends no number in it).
+  assert.equal(tooLargeKeptReason("x".repeat(20000), 16384), "message_too_large (limit 16384 bytes)");
+  assert.equal(tooLargeKeptReason("é".repeat(9000), 16384), "message_too_large (limit 16384 bytes)");
+  assert.equal(tooLargeKeptReason("x".repeat(900), 16384), "message_too_large");
+  assert.equal(tooLargeKeptReason("x".repeat(20000), 0), "message_too_large");
+  assert.equal(new RoomAPIError(413, {code: "message_too_large", message: BYTE_CEILING}).byteLimit, undefined);
 
   // Channel: the source is acknowledged, no skip overwrites the evidence, and
   // the attempt the runtime already released is not settled again.
@@ -1012,4 +1013,85 @@ test("L1-15 a message_too_large refusal is terminal in open and coordinated Room
   const channel = createRoomChannel({makeClient: () => client});
   await channel.plugin.gateway.startAccount(channelContext(join(home, "l1-15.json"), hostDeliver(BODY)));
   assert.deepEqual(calls, {settled: [], skipped: [], ack: ["ready-5"]});
+});
+
+// OP-12 P4 r1 item 1: through the real state writer (no persistState stub),
+// including a restart from disk and the acknowledgement.
+test("L1-18 a too-large refusal persists through the real state writer and a restart", async () => {
+  for (const mode of ["open", "coordinated"]) {
+    const stateFile = joinState(TEST_STATE_DIRECTORY, `l1-18-${mode}`, "state.json");
+    const fresh = () => {
+      const runtime = new OpenClawRoomRuntime({accountId: "test", stateFile, baseUrl: "https://room.example/api"});
+      runtime.markTurnPreparing = async () => {};
+      runtime.markTurnPosted = async () => {};
+      runtime.lines = [];
+      runtime.logger = Object.fromEntries(["info", "warn", "error"].map((level) => [level, (line) => runtime.lines.push(line)]));
+      return runtime;
+    };
+    const posts = [];
+    const client = (runtime) => recordingClient({
+      requestTurn: async () => ({state: "granted", turnId: "turn-1"}),
+      roomState: async () => ({headSeq: 5, activeEpoch: {id: "epoch-1"}, serverLimits: {messageMaxBytes: 16}}),
+      postMessage: async () => {
+        posts.push(mode);
+        throw new RoomAPIError(413, {code: "message_too_large", message: "message exceeds byte limit", retryable: false});
+      },
+      acknowledge: async (_state, seq) => ({acknowledgedSeq: seq}),
+    });
+    const first = fresh();
+    first.state = p1Runtime().state;
+    await saveState(stateFile, first.state);
+    first.client = client(first);
+    first.pendingEvent = SOURCE;
+    const cycleAttempt = mode === "coordinated" ? CYCLE() : undefined;
+    const request = {roomId: "room-1", text: BODY, replyToId: "human-1", idempotencyKey: `${SOURCE.id}:final`,
+      sourceEventId: SOURCE.id, sourceEpochId: "epoch-1", ...(cycleAttempt ? {cycleAttempt} : {})};
+    const writes = [];
+    const persist = first.persistState.bind(first);
+    first.persistState = async () => { await persist(); writes.push(structuredClone(first.state)); };
+    assert.deepEqual(await first.postAndFinish(request), {refused: true, reason: "message_too_large"}, mode);
+    // Durable: intent, failed evidence and kept reply in one write (item 6):
+    // the first write that holds the evidence already holds the kept reply.
+    const firstFailed = writes.find((state) => state.terminalEvidence?.["5"]?.status === "failed");
+    assert.ok(firstFailed?.keptReply?.text === BODY, mode);
+    assert.equal(firstFailed.deliveryIntents[request.idempotencyKey].status, "skipped", mode);
+    const saved = await loadState(stateFile);
+    assert.equal(saved.deliveryIntents[request.idempotencyKey].status, "skipped", mode);
+    assert.equal(saved.terminalEvidence["5"].status, "failed", mode);
+    assert.equal(saved.keptReply.reason, "message_too_large (limit 16 bytes)", mode);
+    assert.equal(saved.keptReply.text, BODY, mode);
+    // Restart: the replay never posts again, and the source is acknowledged.
+    const second = fresh();
+    second.state = saved;
+    second.client = client(second);
+    second.pendingEvent = SOURCE;
+    assert.deepEqual(await second.postAndFinish(request), {refused: true, reason: "message_too_large"}, `${mode} restart`);
+    assert.equal(posts.filter((item) => item === mode).length, 1, mode);
+    await second.ackEvent(SOURCE);
+    const acknowledged = await loadState(stateFile);
+    assert.equal(acknowledged.cursor, 5, mode);
+    assert.equal(acknowledged.keptReply.text, BODY, mode);
+  }
+});
+
+// OP-12 P4 r1 (Hermes H2, universal): a reply over the Room's default ceiling
+// (16384 bytes) is kept and offered, not dropped as too long to keep.
+test("a realistic too-large reply is kept within twice the Room's byte ceiling", async () => {
+  assert.equal(keptReplyBound(16384), 32768);
+  assert.equal(keptReplyBound(0), KEPT_REPLY_HARD_LIMIT);
+  assert.equal(keptReplyBound(10 ** 6), KEPT_REPLY_HARD_LIMIT);
+  assert.equal(keptReplyBound(100), KEPT_REPLY_CHARACTER_LIMIT);
+  const runtime = p1Runtime();
+  const long = "word ".repeat(4000).trim(); // 19999 characters, over 16384 bytes
+  runtime.client = recordingClient({
+    roomState: async () => ({headSeq: 5, activeEpoch: {id: "epoch-1"}, serverLimits: {messageMaxBytes: 16384}}),
+    postMessage: async () => { throw new RoomAPIError(413, {code: "message_too_large", message: "message exceeds byte limit"}); },
+  });
+  runtime.pendingEvent = SOURCE;
+  const request = {roomId: "room-1", text: long, replyToId: "human-1", idempotencyKey: `${SOURCE.id}:final`,
+    sourceEventId: SOURCE.id, sourceEpochId: "epoch-1"};
+  assert.deepEqual(await runtime.postAndFinish(request), {refused: true, reason: "message_too_large"});
+  assert.equal(runtime.state.keptReply.text, long);
+  assert.equal(runtime.state.keptReply.reason, "message_too_large (limit 16384 bytes)");
+  validateState(runtime.state);
 });

@@ -36,6 +36,13 @@ export const MISSED_SOURCE_LIMIT = 8;
 // Contract P2c-2: the longest kept reply, in characters. A longer reply is not
 // kept (it is never shortened: the offer repeats the text verbatim).
 export const KEPT_REPLY_CHARACTER_LIMIT = 16_000;
+// Contract L1-12: a reply the Room refused as too large is kept up to twice the
+// Room's byte ceiling (in characters), at most this many; the loader bound.
+export const KEPT_REPLY_HARD_LIMIT = 65_536;
+export function keptReplyBound(messageMaxBytes) {
+  return Number.isSafeInteger(messageMaxBytes) && messageMaxBytes > 0
+    ? Math.min(KEPT_REPLY_HARD_LIMIT, Math.max(KEPT_REPLY_CHARACTER_LIMIT, 2 * messageMaxBytes)) : KEPT_REPLY_HARD_LIMIT;
+}
 export const KEPT_REPLY_OPEN = "[Your own earlier reply, kept: it was produced but not posted]";
 export const KEPT_REPLY_CLOSE = "[/Your own earlier reply]";
 // Contract P2c-5: this machine's label, read when the process starts; never a
@@ -145,12 +152,15 @@ export const RELEASED_ATTEMPT_EXECUTION_FAILURE = Object.freeze({layer: "infrast
 export const OPERATIONAL_FALLBACK_EXECUTION_FAILURE = Object.freeze({layer: "runtime", code: "gateway_operational_error"});
 const RESPONSE_TOO_LARGE_EXECUTION_FAILURE = Object.freeze({layer: "runtime", code: "response_too_large"});
 
-// Contract L1-12: the P2c-2 reason line names the byte ceiling when known:
-// from the refusal itself, else the Room's serverLimits.messageMaxBytes. Never
-// a word count: the word number is guidance and the Room does not refuse on it.
-export function tooLargeKeptReason(error, messageMaxBytes = 0) {
-  const limit = Number.isSafeInteger(error?.byteLimit) && error.byteLimit > 0 ? error.byteLimit : messageMaxBytes;
-  return Number.isSafeInteger(limit) && limit > 0 ? `message_too_large (limit ${limit} bytes)` : "message_too_large";
+// Contract L1-12: the P2c-2 reason line names the Room's byte ceiling
+// (serverLimits.messageMaxBytes from the room state) only when the refused
+// body exceeds it, so the ceiling is certainly the cause. The Room's 413 text
+// carries no number (Room server 772ca32, messages.go:27). Never a word
+// count: the word number is guidance and the Room does not refuse on it.
+export function tooLargeKeptReason(body, messageMaxBytes = 0) {
+  const bytes = Buffer.byteLength(String(body ?? ""), "utf8");
+  return Number.isSafeInteger(messageMaxBytes) && messageMaxBytes > 0 && bytes > messageMaxBytes
+    ? `message_too_large (limit ${messageMaxBytes} bytes)` : "message_too_large";
 }
 
 // Contract L1-13: the Room's missedSourceEventId on an attempt-ready event.
@@ -1016,19 +1026,32 @@ export class OpenClawRoomRuntime {
   }
 
   // Contract L1-12: a message_too_large refusal is terminal. The intent ends
-  // skipped (a state every reader, including 0.2.61, accepts and P3-2
-  // prunes); the source gets terminal evidence failed/message_too_large and
-  // is acknowledged through the normal path; the attempt is released with
-  // response_too_large; the reply is kept for one offer (P2c-2).
+  // skipped/message_too_large (P3-2 prunes it once acknowledged); the source
+  // gets terminal evidence failed/message_too_large, written together with
+  // the intent and the kept reply (P2c-2), and is acknowledged through the
+  // normal path; the attempt is then released with response_too_large.
+  // 0.2.61 cannot load failed evidence above the cursor (rollback note).
   async refuseTooLarge(intent, error, cycleAttempt, signal) {
     const sourceId = intent.identity.sourceEventId;
     const source = this.pendingEvent;
     const bound = Boolean(sourceId) && source?.id === sourceId && Number.isSafeInteger(source.seq) && source.seq >= 1;
+    // Read-only first: the byte ceiling for the kept-reply fact. Every write
+    // below (intent, evidence, kept reply) is then one durable state write.
+    let messageMaxBytes = 0;
+    try {
+      messageMaxBytes = (await this.client.roomState(this.state, signal))?.serverLimits?.messageMaxBytes ?? 0;
+    } catch (stateError) {
+      if (signal?.aborted) throw stateError;
+    }
+    const kept = this.keptReplyFor(intent, tooLargeKeptReason(intent.identity.body, messageMaxBytes), keptReplyBound(messageMaxBytes));
     const previousIntent = structuredClone(intent);
     const previousTerminalEvidence = this.state.terminalEvidence === undefined
       ? undefined : structuredClone(this.state.terminalEvidence);
     const previousLedger = this.state.receiveLedger === undefined ? undefined : structuredClone(this.state.receiveLedger);
+    const previousKept = this.state.keptReply === undefined ? undefined : structuredClone(this.state.keptReply);
     try {
+      if (kept?.kept) this.state.keptReply = kept.kept;
+      else if (kept?.clear) delete this.state.keptReply;
       intent.deliveryState = "skipped";
       intent.status = "skipped";
       intent.lifecycleState = "not_required";
@@ -1047,18 +1070,12 @@ export class OpenClawRoomRuntime {
       else this.state.terminalEvidence = previousTerminalEvidence;
       if (previousLedger === undefined) delete this.state.receiveLedger;
       else this.state.receiveLedger = previousLedger;
+      if (previousKept === undefined) delete this.state.keptReply;
+      else this.state.keptReply = previousKept;
       throw persistError;
     }
     this.logger?.info?.(`Room delivery failed ${outcomeLogFields({code: "message_too_large", sourceSeq: bound ? source.seq : "", attemptId: intent.identity.cycle?.attemptId})}`);
-    let messageMaxBytes = 0;
-    if (!error?.byteLimit) {
-      try {
-        messageMaxBytes = (await this.client.roomState(this.state, signal))?.serverLimits?.messageMaxBytes ?? 0;
-      } catch (stateError) {
-        if (signal?.aborted) throw stateError;
-      }
-    }
-    await this.keepLateReply(intent, tooLargeKeptReason(error, messageMaxBytes));
+    if (kept?.kept) this.logger?.info?.(`Room reply kept, not posted ${outcomeLogFields({code: "message_too_large", sourceSeq: kept.kept.sourceSeq || "", attemptId: intent.identity.cycle?.attemptId})}`);
     const attempt = cycleAttempt ?? (intent.identity.cycle ? {
       cycle: {id: intent.identity.cycle.cycleId, generation: intent.identity.cycle.generation},
       attempt: {id: intent.identity.cycle.attemptId},
@@ -1291,11 +1308,14 @@ export class OpenClawRoomRuntime {
             payload: {sourceEventId: missed.sourceEventId}}, epochStartsAtSeq, readPage);
         }
         offered.push(missed.sourceEventId);
+        if (source && Number.isSafeInteger(source.seq) && source.seq >= epochStartsAtSeq && source.seq < event.seq) {
+          const newer = await countMessagesBetween(source.seq, event.seq, readPage);
+          const time = validCanonicalTimestamp(source.ts) ? `, ${new Date(source.ts).toISOString().slice(11, 16)} UTC` : "";
+          facts.push(`Missed earlier: #${source.seq} ${speakerLabel(roster, source)}${time}; ${newer.count}${newer.complete ? "" : "+"} newer ${newer.count === 1 && newer.complete ? "message" : "messages"} since.`);
+        }
+        // Contract L1-13: remembered as offered only once its offer (or its
+        // clearing by the epoch floor) succeeded; a failed read keeps it.
         if (missed.sourceEventId === serverMissed) mark = serverMissed;
-        if (!source || !Number.isSafeInteger(source.seq) || source.seq < epochStartsAtSeq || source.seq >= event.seq) continue;
-        const newer = await countMessagesBetween(source.seq, event.seq, readPage);
-        const time = validCanonicalTimestamp(source.ts) ? `, ${new Date(source.ts).toISOString().slice(11, 16)} UTC` : "";
-        facts.push(`Missed earlier: #${source.seq} ${speakerLabel(roster, source)}${time}; ${newer.count}${newer.complete ? "" : "+"} newer ${newer.count === 1 && newer.complete ? "message" : "messages"} since.`);
       } catch (error) {
         if (signal?.aborted) throw error;
         // Not offered: it stays for a later turn.
@@ -1309,14 +1329,32 @@ export class OpenClawRoomRuntime {
   // Contract P2c-2: a reply whose turn's authority ended is kept, one per
   // Room (the latest wins), never across discussions (a changed epoch keeps
   // nothing). Best effort: never raises into the delivery path.
+  // The P2c-2 kept reply for an intent, without writing: {kept} to keep,
+  // {clear} when the latest reply is too long to keep (an older one is not
+  // offered in its place), null when nothing changes.
+  keptReplyFor(intent, reason, limit = KEPT_REPLY_CHARACTER_LIMIT) {
+    const text = String(intent?.identity?.body ?? "").trim();
+    const answered = String(intent?.identity?.replyToId || intent?.identity?.sourceEventId || "");
+    const epochId = String(intent?.identity?.sourceEpochId || intent?.identity?.initialEpochId || "");
+    if (!text || !answered || !epochId || reason === "stale_epoch" || reason === "historical_epoch") return null;
+    if (text.length > limit) return {clear: true};
+    let seq = 0;
+    for (const [number, id] of this.postNumberIndex()) if (id === answered) seq = number;
+    return {kept: {
+      sourceEventId: answered,
+      sourceSeq: seq,
+      epochId,
+      producedAt: new Date().toISOString().replace(/\.\d{3}Z$/, "Z"),
+      reason: String(reason || "superseded"),
+      text,
+    }};
+  }
+
   async keepLateReply(intent, reason) {
     try {
-      const text = String(intent?.identity?.body ?? "").trim();
-      const answered = String(intent?.identity?.replyToId || intent?.identity?.sourceEventId || "");
-      const epochId = String(intent?.identity?.sourceEpochId || intent?.identity?.initialEpochId || "");
-      if (!text || !answered || !epochId || reason === "stale_epoch" || reason === "historical_epoch") return;
-      if (text.length > KEPT_REPLY_CHARACTER_LIMIT) {
-        // Latest wins: an older kept reply is not offered in its place.
+      const result = this.keptReplyFor(intent, reason);
+      if (!result) return;
+      if (result.clear) {
         if (this.state.keptReply) {
           delete this.state.keptReply;
           await this.persistState();
@@ -1324,16 +1362,8 @@ export class OpenClawRoomRuntime {
         this.logger?.info?.(`Room reply not kept ${outcomeLogFields({code: "late_reply_too_large", sourceSeq: "", attemptId: intent?.identity?.cycle?.attemptId})}`);
         return;
       }
-      let seq = 0;
-      for (const [number, id] of this.postNumberIndex()) if (id === answered) seq = number;
-      this.state.keptReply = {
-        sourceEventId: answered,
-        sourceSeq: seq,
-        epochId,
-        producedAt: new Date().toISOString().replace(/\.\d{3}Z$/, "Z"),
-        reason: String(reason || "superseded"),
-        text,
-      };
+      const seq = result.kept.sourceSeq;
+      this.state.keptReply = result.kept;
       await this.persistState();
       this.logger?.info?.(`Room reply kept, not posted ${outcomeLogFields({code: reason || "superseded", sourceSeq: seq || "", attemptId: intent?.identity?.cycle?.attemptId})}`);
     } catch (error) {
@@ -2100,8 +2130,8 @@ export class OpenClawRoomRuntime {
               attempt: {id: intent.identity.cycle.attemptId},
               settled: false,
             } : null);
-            await this.releaseAttempt(attempt, intent.deliveryErrorCode === "message_too_large"
-              ? RESPONSE_TOO_LARGE_EXECUTION_FAILURE : RELEASED_ATTEMPT_EXECUTION_FAILURE, signal);
+            // message_too_large never reaches here (contract L1-12, refuseTooLarge).
+            await this.releaseAttempt(attempt, RELEASED_ATTEMPT_EXECUTION_FAILURE, signal);
           } else {
             this.logger?.warn?.(`Room delivery parked for retry ${fields}`);
           }

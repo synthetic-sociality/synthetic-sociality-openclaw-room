@@ -70,10 +70,6 @@ export class RoomAPIError extends Error {
     this.code = code;
     this.fieldPaths = fieldPaths;
     this.retryable = status === 429 || status >= 500 || body?.retryable === true;
-    // Contract L1-12: only the byte ceiling a refusal states, as a number; the
-    // message itself is never kept.
-    const limit = code === "message_too_large" ? /at most (\d{1,9}) bytes/.exec(String(body?.message ?? "")) : null;
-    if (limit) this.byteLimit = Number(limit[1]);
   }
 }
 

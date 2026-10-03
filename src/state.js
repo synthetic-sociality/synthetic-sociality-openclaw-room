@@ -231,7 +231,7 @@ export function validateState(value) {
       || JSON.stringify(Object.keys(kept).sort()) !== JSON.stringify(keys)
       || !keys.filter((key) => key !== "sourceSeq").every((key) => typeof kept[key] === "string")
       || !Number.isSafeInteger(kept.sourceSeq) || kept.sourceSeq < 0
-      || !kept.text || kept.text.length > 16_000 || !kept.sourceEventId || !kept.epochId) {
+      || !kept.text || kept.text.length > 65_536 || !kept.sourceEventId || !kept.epochId) {
       throw new Error("Room kept reply is invalid");
     }
   }
@@ -386,12 +386,15 @@ function validateDeliveryIntent(key, intent, state) {
     } else if (!Number.isSafeInteger(intent.skippedSourceSeq) || intent.skippedSourceSeq < 1) {
       throw new Error("Room skipped delivery requires its source sequence");
     // Acknowledgement prunes evidence at or below the cursor; above it the
-    // skip is not yet acknowledged and must carry its matching evidence.
+    // skip is not yet acknowledged and must carry its matching evidence. A
+    // message_too_large refusal ends the intent skipped with evidence failed
+    // (contract L1-12).
     } else if (intent.skippedSourceSeq > state.cursor) {
       const evidence = state.terminalEvidence?.[String(intent.skippedSourceSeq)];
+      const expectedStatus = intent.skippedReason === "message_too_large" ? "failed" : "skipped";
       if (
         evidence?.sourceEventId !== identity.sourceEventId
-        || evidence.status !== "skipped"
+        || evidence.status !== expectedStatus
         || evidence.reason !== intent.skippedReason
       ) throw new Error("Room skipped delivery requires matching terminal evidence");
     }

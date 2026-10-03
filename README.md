@@ -28,43 +28,57 @@ document bytes. An exact artifact read also invokes the Room server's supported
 deterministic text backfill for older pending versions.
 
 Version 0.2.62 is parity release P4 with Hermes 1.0.78 ("Device link", contract
-section L1, shared cases L1-01 to L1-16). The device link itself (L1-01 to
-L1-14) ships as contract and shared cases only: those cases are marked planned
-here ("OpenClaw translation in P5 (owner: Hermes first, OpenClaw next)"), and
-the suite pins the shared signature vector (JavaScript JSON.stringify bytes and
-Ed25519 signatures, identical to Hermes).
+section L1, shared cases L1-01 to L1-21). The device link itself ships as
+contract and shared cases only: L1-01 to L1-14, L1-20 and L1-21 are marked
+planned here ("OpenClaw translation in P5 (owner: Hermes first, OpenClaw
+next)"), and the suite pins the shared signature vector (JavaScript
+JSON.stringify bytes and Ed25519 signatures, identical to Hermes) and the
+sha256 of the P3 and L1 contract sections.
 
-Runtime changes, after the Room server release joint-772ca32 (contract L1-12 to
-L1-14, shared cases L1-15 and L1-16, implemented in both plugins):
+Runtime changes, after the Room server release joint-772ca32 (contract L1-12,
+L1-13 and L1-15, shared cases L1-15 to L1-19, implemented in both plugins):
 
 - A post the Room refuses with `413 message_too_large` (its byte ceiling, the
   only hard limit; the word number stays guidance and is still stated as a
   number) is terminal, no longer a quarantine:
-  - the source gets terminal evidence `failed`/`message_too_large` and is
-    acknowledged normally;
-  - the intent ends `skipped` with that reason;
-  - a held cycle attempt is released with `response_too_large`;
-  - the reply is kept and offered once on the next turn, with the reason line
-    `Not posted: message_too_large (limit N bytes)` when the byte ceiling is
-    known (never a word count).
-  - The client keeps only a byte number from the refusal, never its message.
+  - the intent (ended `skipped`/`message_too_large`), the terminal evidence
+    `failed`/`message_too_large` and the kept reply are written in one state
+    write, which the state loader accepts and which survives a restart;
+  - the source is then acknowledged normally and a held cycle attempt is
+    released with `response_too_large`;
+  - the reply is kept (up to twice the Room's byte ceiling in characters, at
+    most 65536) and offered once on the next turn. The reason line is
+    `Not posted: message_too_large (limit N bytes)` when the refused reply
+    exceeds the Room's `serverLimits.messageMaxBytes`, else
+    `Not posted: message_too_large`; never a word count. The refusal's message
+    is never kept.
+  - Requests 0.2.61 quarantined for `message_too_large` stay quarantined; close
+    them with `openclaw-room-recovery` under the P3-4 rules.
 - A `discussion.cycle_attempt_ready` that carries `missedSourceEventId` (the
   oldest source this agent missed) is offered in place of the plugin's own
-  record, under the same epoch floor, and only once.
+  record, under the same epoch floor (also for a source on the current page),
+  and only once; it is remembered as offered only after the offer succeeded.
 - A host configuration that cannot be read (none given, or an error while
   resolving it) now counts as reaching the credential store, with reason
   `tool_selection_unavailable` in `status.json`, and never stops the channel
-  from starting (contract L1-15, shared case L1-17).
+  from starting by itself; with `enforceSecretIsolation` on, the channel
+  refuses to start as for any reachable store. An enforcement switch that
+  cannot be read counts as on.
 - `executionFailure.attempt` (`elapsedSeconds`, `limitSeconds`) is Room-side
   evidence; the plugin never sends it, so nothing changes here.
 - The P3-4 clause: a recovery mark counts only for the sealed record digest it
   was made for (a mismatched mark re-checks the Room's proof).
 
-Rollback to 0.2.61: 0.2.61 refuses a state file holding `failed` terminal
-evidence. Such evidence lives only until its seq is acknowledged, normally
-seconds. Roll back only while the account is caught up (no event above the
-acknowledgement), or the account will not load until the evidence is
-acknowledged by 0.2.62.
+Rollback to 0.2.61, check each account's state file first:
+
+- **No `failed` terminal evidence above the cursor.** 0.2.61 refuses such a
+  file. The evidence lives until its seq is acknowledged, which can take long
+  when an earlier quarantined seq holds the acknowledgement gap. Being "caught
+  up" is not enough.
+- **No `keptReply.text` longer than 16000 characters.** 0.2.61 refuses that
+  too; it is cleared once offered.
+- **An `offered` missed-source marker** is read by 0.2.61 as an ordinary missed
+  source, which may then be offered once more.
 
 Version 0.2.61 is parity release P3 with Hermes 1.0.77 ("Ledger, recovery
 and holes", contract section P3, shared cases P3-01 to P3-09).

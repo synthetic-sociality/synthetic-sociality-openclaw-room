@@ -9,7 +9,7 @@ import {createHash, createPrivateKey, createPublicKey, sign, verify} from "node:
 import {mkdtemp, readFile, readdir, rm} from "node:fs/promises";
 import {tmpdir} from "node:os";
 import {join} from "node:path";
-import {TOOL_SELECTION_UNAVAILABLE, storeReachability} from "../src/secret-isolation.js";
+import {TOOL_SELECTION_UNAVAILABLE, secretIsolationEnforced, storeReachability} from "../src/secret-isolation.js";
 
 const conformance = JSON.parse(await readFile(new URL("../conformance.json", import.meta.url), "utf8"));
 const contract = await readFile(new URL("../docs/delivery-lifecycle-contract-v1.md", import.meta.url), "utf8");
@@ -17,9 +17,9 @@ const PLANNED_REASON = "OpenClaw translation in P5 (owner: Hermes first, OpenCla
 const PKCS8_ED25519_PREFIX = Buffer.from("302e020100300506032b657004220420", "hex");
 const sha256 = (bytes) => createHash("sha256").update(bytes).digest("hex");
 
-test("conformance L1 cases: L1-01 to L1-14 planned with the owner's reason, L1-15 and L1-16 implemented", async () => {
+test("conformance L1 cases: planned ones carry the owner's reason and no test, implemented ones exactly one test", async () => {
   const cases = Object.entries(conformance.parityL1Cases ?? {});
-  assert.equal(cases.length, 17);
+  assert.equal(cases.length, 21);
   const directory = new URL("./", import.meta.url);
   const sources = await Promise.all((await readdir(directory)).filter((name) => name.endsWith(".test.mjs"))
     .map((name) => readFile(new URL(name, directory), "utf8")));
@@ -27,7 +27,7 @@ test("conformance L1 cases: L1-01 to L1-14 planned with the owner's reason, L1-1
     assert.equal(id, `L1-${String(index + 1).padStart(2, "0")}`);
     assert.ok(entry.name.startsWith(`${id} `), id);
     const implementing = sources.filter((source) => source.includes(`test(${JSON.stringify(entry.name)},`)).length;
-    if (index < 14) {
+    if (entry.status === "planned") {
       assert.deepEqual(Object.keys(entry), ["name", "status", "reason"]);
       assert.equal(entry.status, "planned");
       assert.equal(entry.reason, PLANNED_REASON);
@@ -93,9 +93,36 @@ test("L1-17 a host whose tool selection cannot be read counts as reaching the st
     assert.deepEqual(storeReachability(hostile, [store], {stateDir: scratch, home: scratch}), [TOOL_SELECTION_UNAVAILABLE]);
     assert.deepEqual(storeReachability({}, () => { throw new Error("no store directories"); }, {stateDir: scratch, home: scratch}),
       [TOOL_SELECTION_UNAVAILABLE]);
+    // The enforcement switch: unreadable counts as on; readable non-true is off.
+    assert.equal(secretIsolationEnforced({get plugins() { throw new Error("host config changed"); }}), true);
+    assert.equal(secretIsolationEnforced({}), false);
+    assert.equal(secretIsolationEnforced({plugins: {entries: {"synthetic-sociality-room": {config: {enforceSecretIsolation: "true"}}}}}), false);
+    assert.equal(secretIsolationEnforced({plugins: {entries: {"synthetic-sociality-room": {config: {enforceSecretIsolation: true}}}}}), true);
     // A readable configuration adds no such code.
     assert.ok(!storeReachability({tools: {}}, [store], {stateDir: scratch, home: scratch}).includes(TOOL_SELECTION_UNAVAILABLE));
   } finally {
     await rm(scratch, {recursive: true, force: true});
+  }
+});
+
+test("the planned and implemented L1 cases are the ones this release names", () => {
+  const status = Object.fromEntries(Object.entries(conformance.parityL1Cases).map(([id, entry]) => [id, entry.status]));
+  const implemented = Object.keys(status).filter((id) => status[id] === "implemented");
+  assert.deepEqual(implemented, ["L1-15", "L1-16", "L1-17", "L1-18", "L1-19"]);
+});
+
+// OP-12 P4 r1 item 9: the P3 and L1 sections are pinned (the same hashes in
+// Hermes' conformance.json): heading through the last non-blank line before
+// the next "## " heading.
+test("the P3 and L1 contract sections match the pinned hashes", () => {
+  const lines = contract.split("\n");
+  for (const [name, digest] of Object.entries(conformance.parityContractSectionSha256)) {
+    const start = lines.findIndex((line) => line.startsWith(`## ${name} `));
+    assert.ok(start >= 0, name);
+    let end = lines.findIndex((line, index) => index > start && line.startsWith("## "));
+    if (end < 0) end = lines.length;
+    const body = lines.slice(start, end);
+    while (body.length && !body.at(-1).trim()) body.pop();
+    assert.equal(sha256(Buffer.from(`${body.join("\n")}\n`, "utf8")), digest, name);
   }
 });

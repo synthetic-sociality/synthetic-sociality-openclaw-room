@@ -29,8 +29,14 @@ export const ENFORCEMENT_SETTING = "enforceSecretIsolation";
 
 // The installation's switch, read from the plugin's own config entry. The
 // manifest declares it boolean; only boolean true enables enforcement.
+// Contract L1-15: a switch that cannot be read (the host configuration throws)
+// counts as on, so an unreadable configuration never weakens enforcement.
 export function secretIsolationEnforced(cfg, pluginId = "synthetic-sociality-room") {
-  return cfg?.plugins?.entries?.[pluginId]?.config?.[ENFORCEMENT_SETTING] === true;
+  try {
+    return cfg?.plugins?.entries?.[pluginId]?.config?.[ENFORCEMENT_SETTING] === true;
+  } catch {
+    return true;
+  }
 }
 export const BLOCK_MESSAGE = "Blocked by the Synthetic Sociality Room connector: its private state holds the Room credential and is not available to agent tools.";
 export const REDACTED = "[redacted Room credential]";
