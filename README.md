@@ -48,6 +48,13 @@ token; adding `--apply --confirm TOKEN` appends the audit record, and the
 running connector acknowledges through its normal path. Run it as the user
 that owns the account state (aura on the VPS).
 
+The audit record's digest is unkeyed and --operator is not authenticated: a
+closure is safe because the Room's proof is checked again when it is applied.
+For secret isolation (P3-7) the tools.deny of every agent must now also cover
+the nodes tool ("nodes" or "group:nodes"), which runs commands on paired
+devices, and no MCP server may be enabled (mcp.servers entries need
+enabled: false); otherwise the store is reported reachable.
+
 Behaviour changes. P3-1: every event read above the acknowledgement gets a
 durable ledger entry before it is processed. P3-3: holes and held quarantines
 are reported in status.json and each hole is logged once. P3-5: status.json is
