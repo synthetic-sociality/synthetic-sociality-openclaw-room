@@ -263,6 +263,24 @@
     "L1-17": {
       "name": "L1-17 a host whose tool selection cannot be read counts as reaching the store with tool_selection_unavailable and still loads",
       "status": "implemented"
+    },
+    "L1-18": {
+      "name": "L1-18 a too-large refusal persists through the real state writer and a restart",
+      "status": "implemented"
+    },
+    "L1-19": {
+      "name": "L1-19 a source the Room names as missed is remembered as offered only after its offer succeeded",
+      "status": "implemented"
+    },
+    "L1-20": {
+      "name": "L1-20 a failed re-link leaves the working link and its key unchanged",
+      "status": "planned",
+      "reason": "OpenClaw translation in P5 (owner: Hermes first, OpenClaw next)"
+    },
+    "L1-21": {
+      "name": "L1-21 the pairing confirmation, the device socket and both local Gateway requests never follow a redirect",
+      "status": "planned",
+      "reason": "OpenClaw translation in P5 (owner: Hermes first, OpenClaw next)"
     }
   },
   "parityL1SignatureVector": {
@@ -289,5 +307,9 @@
     },
     "handshakeInputSha256": "b57282332bfec0ec897e670d2f9bdb065f4a7af4580bd1026c2e7354f94cfd69",
     "handshakeSignatureBase64": "WSmkKmc4G28NYbhVgWMdzqqgzkJZwJy3QKeDltp21CR19RpkGDVqHkgU5NCNELqVbvUgkEO8CfkgzKHMMfNuDQ=="
+  },
+  "parityContractSectionSha256": {
+    "P3": "a689096e24f9fee13e0603006274c303f3435ee823f082a84a63b765deb8906b",
+    "L1": "fb10f46adfeadd5506734f5433ba936386026e2ac09ccb9ab4d983d4b7e42da7"
   }
 }
