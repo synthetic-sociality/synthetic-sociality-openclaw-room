@@ -251,6 +251,14 @@
       "name": "L1-14 the local Gateway is reached with the loopback dashboard's session token and a gated dashboard fails the open with a code",
       "status": "planned",
       "reason": "OpenClaw translation in P5 (owner: Hermes first, OpenClaw next)"
+    },
+    "L1-15": {
+      "name": "L1-15 a message_too_large refusal is terminal in open and coordinated Rooms, acknowledged, and its reply is offered once with the limit",
+      "status": "implemented"
+    },
+    "L1-16": {
+      "name": "L1-16 a missed source named by the Room replaces the local record and is offered once within the epoch floor",
+      "status": "implemented"
     }
   },
   "parityL1SignatureVector": {
