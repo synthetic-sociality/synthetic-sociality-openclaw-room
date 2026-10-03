@@ -186,72 +186,72 @@
     "L1-01": {
       "name": "L1-01 a link token is read at a hidden prompt and accepted only as v1 with every field, an https audience and an unexpired expiry",
       "status": "planned",
-      "reason": "OpenClaw translation in P5 (owner: Hermes first, OpenClaw next)"
+      "reason": "OpenClaw translation in a later release (owner: Hermes first, OpenClaw next)"
     },
     "L1-02": {
       "name": "L1-02 the pairing confirmation is sent to the derived URL with the signed body and only 201 links",
       "status": "planned",
-      "reason": "OpenClaw translation in P5 (owner: Hermes first, OpenClaw next)"
+      "reason": "OpenClaw translation in a later release (owner: Hermes first, OpenClaw next)"
     },
     "L1-03": {
       "name": "L1-03 the signature inputs equal JavaScript JSON.stringify bytes for the shared vector",
       "status": "planned",
-      "reason": "OpenClaw translation in P5 (owner: Hermes first, OpenClaw next)"
+      "reason": "OpenClaw translation in a later release (owner: Hermes first, OpenClaw next)"
     },
     "L1-04": {
       "name": "L1-04 the connect handshake echoes the challenge in one signed proof and refuses a foreign audience",
       "status": "planned",
-      "reason": "OpenClaw translation in P5 (owner: Hermes first, OpenClaw next)"
+      "reason": "OpenClaw translation in a later release (owner: Hermes first, OpenClaw next)"
     },
     "L1-05": {
       "name": "L1-05 limits are read from authentication-complete and fall back per value when absent",
       "status": "planned",
-      "reason": "OpenClaw translation in P5 (owner: Hermes first, OpenClaw next)"
+      "reason": "OpenClaw translation in a later release (owner: Hermes first, OpenClaw next)"
     },
     "L1-06": {
       "name": "L1-06 hermes-opened is sent when the local Gateway opens and frames pass verbatim both ways until close",
       "status": "planned",
-      "reason": "OpenClaw translation in P5 (owner: Hermes first, OpenClaw next)"
+      "reason": "OpenClaw translation in a later release (owner: Hermes first, OpenClaw next)"
     },
     "L1-07": {
       "name": "L1-07 an oversize frame or a channel above the cap ends only that channel",
       "status": "planned",
-      "reason": "OpenClaw translation in P5 (owner: Hermes first, OpenClaw next)"
+      "reason": "OpenClaw translation in a later release (owner: Hermes first, OpenClaw next)"
     },
     "L1-08": {
       "name": "L1-08 an unknown channel ends that channel and an unknown type or version closes the socket",
       "status": "planned",
-      "reason": "OpenClaw translation in P5 (owner: Hermes first, OpenClaw next)"
+      "reason": "OpenClaw translation in a later release (owner: Hermes first, OpenClaw next)"
     },
     "L1-09": {
       "name": "L1-09 revoked and replaced stop the link and keep the key while a pending link retries until the token expires",
       "status": "planned",
-      "reason": "OpenClaw translation in P5 (owner: Hermes first, OpenClaw next)"
+      "reason": "OpenClaw translation in a later release (owner: Hermes first, OpenClaw next)"
     },
     "L1-10": {
       "name": "L1-10 reconnects use bounded backoff with jitter and the device sends its own keepalive",
       "status": "planned",
-      "reason": "OpenClaw translation in P5 (owner: Hermes first, OpenClaw next)"
+      "reason": "OpenClaw translation in a later release (owner: Hermes first, OpenClaw next)"
     },
     "L1-11": {
       "name": "L1-11 unlink deletes the local key and record and leaves the server revoke to the Harness",
       "status": "planned",
-      "reason": "OpenClaw translation in P5 (owner: Hermes first, OpenClaw next)"
+      "reason": "OpenClaw translation in a later release (owner: Hermes first, OpenClaw next)"
     },
     "L1-12": {
       "name": "L1-12 the link key, pairing secret and local Gateway credential are not readable through agent tools and never appear in prompt, tool result, log or status",
       "status": "planned",
-      "reason": "OpenClaw translation in P5 (owner: Hermes first, OpenClaw next)"
+      "reason": "OpenClaw translation in a later release (owner: Hermes first, OpenClaw next)"
     },
     "L1-13": {
       "name": "L1-13 link status is written to the status file as codes only, following the fixed close table",
       "status": "planned",
-      "reason": "OpenClaw translation in P5 (owner: Hermes first, OpenClaw next)"
+      "reason": "OpenClaw translation in a later release (owner: Hermes first, OpenClaw next)"
     },
     "L1-14": {
       "name": "L1-14 the local Gateway is reached with the loopback dashboard's session token and a gated dashboard fails the open with a code",
       "status": "planned",
-      "reason": "OpenClaw translation in P5 (owner: Hermes first, OpenClaw next)"
+      "reason": "OpenClaw translation in a later release (owner: Hermes first, OpenClaw next)"
     },
     "L1-15": {
       "name": "L1-15 a message_too_large refusal is terminal in open and coordinated Rooms, acknowledged, and its reply is offered once with the limit",
@@ -276,12 +276,12 @@
     "L1-20": {
       "name": "L1-20 a failed re-link leaves the working link and its key unchanged",
       "status": "planned",
-      "reason": "OpenClaw translation in P5 (owner: Hermes first, OpenClaw next)"
+      "reason": "OpenClaw translation in a later release (owner: Hermes first, OpenClaw next)"
     },
     "L1-21": {
       "name": "L1-21 the pairing confirmation, the device socket and both local Gateway requests never follow a redirect",
       "status": "planned",
-      "reason": "OpenClaw translation in P5 (owner: Hermes first, OpenClaw next)"
+      "reason": "OpenClaw translation in a later release (owner: Hermes first, OpenClaw next)"
     },
     "L1-22": {
       "name": "L1-22 a discussion start in a coordinated Room starts no cycle and is acknowledged",
@@ -327,11 +327,60 @@
   },
   "parityP5Contract": "docs/delivery-lifecycle-contract-v1.md#p5--cycle-documents-2026-10-03",
   "parityP5Cases": {
-    "P5-01": "P5-01 every turn of a cycle carries the cycle source's attachments once, then the turn source's, within the limits"
+    "P5-01": "P5-01 every turn of a cycle carries the cycle source's attachments once, then the turn source's, within the limits",
+    "P5-02": "P5-02 a slow or unresolvable cycle source costs at most one bounded lookup per cycle and never delays a turn beyond the bound"
   },
+  "parityP6Contract": "docs/delivery-lifecycle-contract-v1.md#p6--clean-start-and-bounds-2026-10-04",
+  "parityP6Cases": {
+    "P6-01": "P6-01 a new discussion runs in a new host session and no block holds an event from before its start",
+    "P6-02": "P6-02 an epoch without a start gives a prompt without earlier events and the turn proceeds",
+    "P6-03": "P6-03 rotate-current-epoch-session is a dry run without --yes and with it authorises one fresh epoch session",
+    "P6-04": "P6-04 the Room guidance is cut by the one shared rule at 3,000 characters"
+  },
+  "parityP6GuidanceVector": [
+    {
+      "name": "cut",
+      "rules": [
+        "Speak in short paragraphs.",
+        "🧭 Keep the owner's brief in view; cite it by section. Name the section you rely on, then the point. Name the section you rely on, then the point. Name the section you rely on, then the point. Name the section you rely on, then the point. Name the section you rely on, then the point. Name the section you rely on, then the point. Name the section you rely on, then the point. Name the section you rely on, then the point. Name the section you rely on, then the point. Name the section you rely on, then the point. Name the section you rely on, then the point. Name the section you rely on, then the point. Name the section you rely on, then the point. Name the section you rely on, then the point. Name the section you rely on, then the point. Name the section you rely on, then the point. Name the section you rely on, then the point. Name the section you rely on, then the point. Name the section you rely on, then the point. Name the section you rely on, then the point. Name the section you rely on, then the point. Name the section you rely on, then the point. Name the section you rely on, then the point. Name the section you rely on, then the point. Name the section you rely on, then the point. Name the section you rely on, then the point. Name the section you rely on, then the point. Name the section you rely on, then the point. Name the section you rely on, then the point. Name the section you rely on, then the point. Name the section you rely on, then the point. Name the section you rely on, then the point. Name the section you rely on, then the point. Name the section you rely on, then the point. Name the section you rely on, then the point. Name the section you rely on, then the point. Name the section you rely on, then the point. Name the section you rely on, then the point. Name the section you rely on, then the point. Name the section you rely on, then the point. Name the section you rely on, then the point. Name the section you rely on, then the point. Name the section you rely on, then the point. Name the section you rely on, then the point. Name the section you rely on, then the point. Name the section you rely on, then the point. Name the section you rely on, then the point. Name the section you rely on, then the point. Name the section you rely on, then the point. Name the section you rely on, then the point. Name the section you rely on, then the point. Name the section you rely on, then the point. Name the section you rely on, then the point. Name the section you rely on, then the point. Name the section you rely on, then the point. Name the section you rely on, then the point. Name the section you rely on, then the point. Name the section you rely on, then the point. Name the section you rely on, then the point. Name the section you rely on, then the point. Name the section you rely on, then the point. Name the section you rely on, then the point. Name the section you rely on, then the point. Name the section you rely on, then the point. Name the section you rely on, then the point. Name the section you rely on, then the point. Name the section you rely on, then the point. Name the section you rely on, then the point. Name the section you rely on, then the point. Name the section you rely on, then the point. ",
+        "Never rendered: after the cut."
+      ],
+      "codePoints": 3000,
+      "sha256": "88c56bd99d2a8133ae001dfcd3a47ba3adf9ffb8d03cd3fc53297328e6674257"
+    },
+    {
+      "name": "drop",
+      "rules": [
+        "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+        "yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy"
+      ],
+      "codePoints": 2999,
+      "sha256": "3e2cf62ec1bc6bddc4c2c724ecd23b189f98373502a36a3bbfb079058a5e16b6"
+    },
+    {
+      "name": "fit",
+      "rules": [
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "c"
+      ],
+      "codePoints": 3000,
+      "sha256": "1083e951aa7f0a2873eff612542fbb18173e3e0a079d7baab465cf1f11966b55"
+    },
+    {
+      "name": "one",
+      "rules": [
+        "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+        "y"
+      ],
+      "codePoints": 2998,
+      "sha256": "21cba6089d814e3dbc4730417dbd276a83383d50738ba37c0a6185c53f23f6ed"
+    }
+  ],
   "parityContractSectionSha256": {
     "P3": "a689096e24f9fee13e0603006274c303f3435ee823f082a84a63b765deb8906b",
-    "L1": "e400931b9658460e47c24f7bff350b1b62ac47733305fdd6bb34e355027a5ea4",
-    "P5": "776afe79731c53035b987217e6879afe51843ad4d2943ee3ccb6ec1b369296ee"
+    "L1": "504b548622321269be64fd64dfcfa83884a2ded2bad092a37b4db379ba632937",
+    "P5": "ea70a9e7270a8165d949b25aae09004bd07cd70e6530ca2a40eabbd0508a97d7",
+    "P6": "672a608c82a5974c4f9ccb920215896b992c83ad7e01ae6c882f8882743bc7fa"
   }
 }
