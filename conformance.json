@@ -259,6 +259,10 @@
     "L1-16": {
       "name": "L1-16 a missed source named by the Room replaces the local record and is offered once within the epoch floor",
       "status": "implemented"
+    },
+    "L1-17": {
+      "name": "L1-17 a host whose tool selection cannot be read counts as reaching the store with tool_selection_unavailable and still loads",
+      "status": "implemented"
     }
   },
   "parityL1SignatureVector": {

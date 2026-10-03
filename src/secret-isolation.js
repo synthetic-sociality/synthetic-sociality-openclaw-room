@@ -94,8 +94,23 @@ function deniesFs(tools) {
   return deny.has("*") || deny.has("group:fs") || ["read", "write", "edit", "apply_patch"].every((item) => deny.has(item));
 }
 
+// Contract L1-15: the host's tool selection could not be read; unknown counts
+// as reaching the store.
+export const TOOL_SELECTION_UNAVAILABLE = "tool_selection_unavailable";
+
 // Reason codes for which the agent's tools can reach the store; [] if none.
-export function storeReachability(cfg, storeDirectories, {stateDir = "", home = homedir()} = {}) {
+// Never throws: a host configuration that cannot be read is reachable.
+export function storeReachability(cfg, storeDirectories, options = {}) {
+  try {
+    const reasons = storeReachabilityOf(cfg, typeof storeDirectories === "function" ? storeDirectories() : storeDirectories, options);
+    if (!cfg || typeof cfg !== "object" || Array.isArray(cfg)) reasons.push(TOOL_SELECTION_UNAVAILABLE);
+    return reasons;
+  } catch {
+    return [TOOL_SELECTION_UNAVAILABLE];
+  }
+}
+
+function storeReachabilityOf(cfg, storeDirectories, {stateDir = "", home = homedir()} = {}) {
   const reasons = new Set();
   const stores = [...new Set(storeDirectories.filter(Boolean).map((item) => resolvedPath(item)))];
   const tools = cfg?.tools ?? {};

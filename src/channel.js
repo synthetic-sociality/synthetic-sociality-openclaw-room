@@ -234,7 +234,7 @@ export function createRoomChannel({makeClient}) {
           // this installation enables enforceSecretIsolation (off by default).
           // A refusal waits for the host's stop instead of failing, so the host
           // does not restart into it again. Fence and scrubbing stay active.
-          const reasons = storeReachability(ctx.cfg, roomStoreDirectories(ctx.cfg), {stateDir: openClawStateDirectory()});
+          const reasons = storeReachability(ctx.cfg, () => roomStoreDirectories(ctx.cfg), {stateDir: openClawStateDirectory()});
           const enforced = secretIsolationEnforced(ctx.cfg);
           localStatus.setSecretStore(reasons.length ? "reachable" : "isolated", reasons, {enforced});
           if (reasons.length && !enforced && !secretRefusalLogged) {

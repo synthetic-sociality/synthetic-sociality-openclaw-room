@@ -51,6 +51,10 @@ L1-14, shared cases L1-15 and L1-16, implemented in both plugins):
 - A `discussion.cycle_attempt_ready` that carries `missedSourceEventId` (the
   oldest source this agent missed) is offered in place of the plugin's own
   record, under the same epoch floor, and only once.
+- A host configuration that cannot be read (none given, or an error while
+  resolving it) now counts as reaching the credential store, with reason
+  `tool_selection_unavailable` in `status.json`, and never stops the channel
+  from starting (contract L1-15, shared case L1-17).
 - `executionFailure.attempt` (`elapsedSeconds`, `limitSeconds`) is Room-side
   evidence; the plugin never sends it, so nothing changes here.
 - The P3-4 clause: a recovery mark counts only for the sealed record digest it

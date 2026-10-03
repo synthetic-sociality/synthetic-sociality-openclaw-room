@@ -6,7 +6,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {createHash, createPrivateKey, createPublicKey, sign, verify} from "node:crypto";
-import {readFile, readdir} from "node:fs/promises";
+import {mkdtemp, readFile, readdir, rm} from "node:fs/promises";
+import {tmpdir} from "node:os";
+import {join} from "node:path";
+import {TOOL_SELECTION_UNAVAILABLE, storeReachability} from "../src/secret-isolation.js";
 
 const conformance = JSON.parse(await readFile(new URL("../conformance.json", import.meta.url), "utf8"));
 const contract = await readFile(new URL("../docs/delivery-lifecycle-contract-v1.md", import.meta.url), "utf8");
@@ -16,7 +19,7 @@ const sha256 = (bytes) => createHash("sha256").update(bytes).digest("hex");
 
 test("conformance L1 cases: L1-01 to L1-14 planned with the owner's reason, L1-15 and L1-16 implemented", async () => {
   const cases = Object.entries(conformance.parityL1Cases ?? {});
-  assert.equal(cases.length, 16);
+  assert.equal(cases.length, 17);
   const directory = new URL("./", import.meta.url);
   const sources = await Promise.all((await readdir(directory)).filter((name) => name.endsWith(".test.mjs"))
     .map((name) => readFile(new URL(name, directory), "utf8")));
@@ -31,7 +34,7 @@ test("conformance L1 cases: L1-01 to L1-14 planned with the owner's reason, L1-1
       // A planned case has no implementing test yet.
       assert.equal(implementing, 0, entry.name);
     } else {
-      // Contract L1-12 and L1-13 are implemented in this release.
+      // Contract L1-12, L1-13 and L1-15 are implemented in this release.
       assert.deepEqual(entry, {name: entry.name, status: "implemented"});
       assert.equal(implementing, 1, entry.name);
     }
@@ -73,4 +76,26 @@ test("the shared L1 signature vector holds for JSON.stringify and node:crypto", 
   assert.ok(verify(null, handshake, publicKey, Buffer.from(vector.handshakeSignatureBase64, "base64")));
   // Literal UTF-8 and no escaping of / < > &, as the contract requires.
   assert.ok(pairing.includes(Buffer.from("Mac128 · Hermes claude </&>", "utf8")));
+});
+
+test("L1-17 a host whose tool selection cannot be read counts as reaching the store with tool_selection_unavailable and still loads", async () => {
+  const scratch = await mkdtemp(join(tmpdir(), "openclaw-room-l1-17-"));
+  try {
+    const store = join(scratch, "synthetic-sociality-room");
+    assert.equal(TOOL_SELECTION_UNAVAILABLE, "tool_selection_unavailable");
+    // No configuration from the host: reachable, with the code.
+    for (const cfg of [undefined, null, "config", []]) {
+      const reasons = storeReachability(cfg, [store], {stateDir: scratch, home: scratch});
+      assert.ok(reasons.includes(TOOL_SELECTION_UNAVAILABLE), String(cfg));
+    }
+    // A failure while resolving never throws: reachable, with the code.
+    const hostile = {get tools() { throw new Error("host config changed"); }};
+    assert.deepEqual(storeReachability(hostile, [store], {stateDir: scratch, home: scratch}), [TOOL_SELECTION_UNAVAILABLE]);
+    assert.deepEqual(storeReachability({}, () => { throw new Error("no store directories"); }, {stateDir: scratch, home: scratch}),
+      [TOOL_SELECTION_UNAVAILABLE]);
+    // A readable configuration adds no such code.
+    assert.ok(!storeReachability({tools: {}}, [store], {stateDir: scratch, home: scratch}).includes(TOOL_SELECTION_UNAVAILABLE));
+  } finally {
+    await rm(scratch, {recursive: true, force: true});
+  }
 });
