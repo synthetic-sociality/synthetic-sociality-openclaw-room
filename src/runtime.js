@@ -128,6 +128,9 @@ export function classifyPostRefusal(error, intent) {
   const skipReason = terminalRefusalReason(error, intent);
   if (skipReason) return {outcome: "skipped", reason: skipReason};
   if (!(error instanceof RoomAPIError)) return {outcome: "retryable", reason: ""};
+  // Contract L1-12: the Room's byte ceiling is a terminal refusal, never a
+  // quarantine.
+  if (error.code === "message_too_large") return {outcome: "too_large", reason: error.code};
   if (SUPERSEDING_POST_REFUSALS.has(error.code)) return {outcome: "superseded", reason: error.code};
   if (error.code === "stale_context") return {outcome: "refresh", reason: error.code};
   return {outcome: error.retryable ? "retryable" : "quarantined", reason: error.code};
@@ -141,6 +144,21 @@ export const DEFAULT_EXECUTION_FAILURE = Object.freeze({layer: "runtime", code: 
 export const RELEASED_ATTEMPT_EXECUTION_FAILURE = Object.freeze({layer: "infrastructure", code: "attempt_timeout"});
 export const OPERATIONAL_FALLBACK_EXECUTION_FAILURE = Object.freeze({layer: "runtime", code: "gateway_operational_error"});
 const RESPONSE_TOO_LARGE_EXECUTION_FAILURE = Object.freeze({layer: "runtime", code: "response_too_large"});
+
+// Contract L1-12: the P2c-2 reason line names the byte ceiling when known:
+// from the refusal itself, else the Room's serverLimits.messageMaxBytes. Never
+// a word count: the word number is guidance and the Room does not refuse on it.
+export function tooLargeKeptReason(error, messageMaxBytes = 0) {
+  const limit = Number.isSafeInteger(error?.byteLimit) && error.byteLimit > 0 ? error.byteLimit : messageMaxBytes;
+  return Number.isSafeInteger(limit) && limit > 0 ? `message_too_large (limit ${limit} bytes)` : "message_too_large";
+}
+
+// Contract L1-13: the Room's missedSourceEventId on an attempt-ready event.
+export function serverMissedSource(payload) {
+  const value = payload?.missedSourceEventId;
+  if (typeof value !== "string" || !value.trim() || value.length > 128) return "";
+  return value === String(payload?.sourceEventId ?? "") ? "" : value;
+}
 
 export function executionFailureFor(value) {
   const layer = String(value?.layer ?? "").trim().toLowerCase();
@@ -391,7 +409,7 @@ function repairIntentBoundToState(deliveryKey, intent, state) {
 }
 
 function validTerminalEvidence(evidence) {
-  if (!evidence || !["posted", "skipped", "cancelled", "superseded", "ignored"].includes(evidence.status)) return false;
+  if (!evidence || !["posted", "skipped", "failed", "cancelled", "superseded", "ignored"].includes(evidence.status)) return false;
   if (!Number.isSafeInteger(evidence.sourceSeq) || evidence.sourceSeq < 1 || !String(evidence.sourceEventId ?? "")) return false;
   return evidence.status === "posted"
     ? Boolean(
@@ -789,7 +807,7 @@ export class OpenClawRoomRuntime {
           this.contextMissedFacts,
           this.contextKeptReply,
         );
-        await this.clearMissedSources(this.contextMissedOffered);
+        await this.clearMissedSources(this.contextMissedOffered, {mark: this.contextMissedMark, attemptReady: this.contextAttemptReady});
         if (this.contextKeptReplyCleared) await this.clearKeptReply();
         // The model runs while the consumer holds this yield; keep its claimed
         // attempt alive until a terminal outcome is recorded or it returns.
@@ -997,6 +1015,59 @@ export class OpenClawRoomRuntime {
     return {superseded: true, reason};
   }
 
+  // Contract L1-12: a message_too_large refusal is terminal. The intent ends
+  // skipped (a state every reader, including 0.2.61, accepts and P3-2
+  // prunes); the source gets terminal evidence failed/message_too_large and
+  // is acknowledged through the normal path; the attempt is released with
+  // response_too_large; the reply is kept for one offer (P2c-2).
+  async refuseTooLarge(intent, error, cycleAttempt, signal) {
+    const sourceId = intent.identity.sourceEventId;
+    const source = this.pendingEvent;
+    const bound = Boolean(sourceId) && source?.id === sourceId && Number.isSafeInteger(source.seq) && source.seq >= 1;
+    const previousIntent = structuredClone(intent);
+    const previousTerminalEvidence = this.state.terminalEvidence === undefined
+      ? undefined : structuredClone(this.state.terminalEvidence);
+    const previousLedger = this.state.receiveLedger === undefined ? undefined : structuredClone(this.state.receiveLedger);
+    try {
+      intent.deliveryState = "skipped";
+      intent.status = "skipped";
+      intent.lifecycleState = "not_required";
+      intent.skippedReason = "message_too_large";
+      if (bound) {
+        intent.skippedSourceSeq = source.seq;
+        const evidence = await this.recordTerminalEvidence(source, "failed", {reason: "message_too_large"});
+        if (evidence?.status === "posted") throw new Error("Refused Room delivery conflicts with posted terminal evidence");
+      } else {
+        await this.persistState();
+      }
+    } catch (persistError) {
+      for (const key of Object.keys(intent)) delete intent[key];
+      Object.assign(intent, previousIntent);
+      if (previousTerminalEvidence === undefined) delete this.state.terminalEvidence;
+      else this.state.terminalEvidence = previousTerminalEvidence;
+      if (previousLedger === undefined) delete this.state.receiveLedger;
+      else this.state.receiveLedger = previousLedger;
+      throw persistError;
+    }
+    this.logger?.info?.(`Room delivery failed ${outcomeLogFields({code: "message_too_large", sourceSeq: bound ? source.seq : "", attemptId: intent.identity.cycle?.attemptId})}`);
+    let messageMaxBytes = 0;
+    if (!error?.byteLimit) {
+      try {
+        messageMaxBytes = (await this.client.roomState(this.state, signal))?.serverLimits?.messageMaxBytes ?? 0;
+      } catch (stateError) {
+        if (signal?.aborted) throw stateError;
+      }
+    }
+    await this.keepLateReply(intent, tooLargeKeptReason(error, messageMaxBytes));
+    const attempt = cycleAttempt ?? (intent.identity.cycle ? {
+      cycle: {id: intent.identity.cycle.cycleId, generation: intent.identity.cycle.generation},
+      attempt: {id: intent.identity.cycle.attemptId},
+      settled: false,
+    } : null);
+    await this.releaseAttempt(attempt, RESPONSE_TOO_LARGE_EXECUTION_FAILURE, signal);
+    return {refused: true, reason: "message_too_large"};
+  }
+
   // A lease lost while the model ran, or a failed re-claim immediately before
   // posting, supersedes the delivery. Only attempts this process claimed and
   // kept alive are re-claimed; a refused post covers every other replay.
@@ -1083,9 +1154,13 @@ export class OpenClawRoomRuntime {
     } : null;
     const roomContext = canonicalRoomContext(state, page?.events, sourceMessage?.id ?? event?.id, policy, sourceEpoch.startsAtSeq, startEvent);
     const answered = new Set([String(event?.id ?? ""), String(sourceMessage?.id ?? ""), String(eventPayload(event?.payload).sourceEventId ?? "")]);
-    const missed = await this.missedSourceFacts(event, page?.events, state?.roster, sourceEpoch.startsAtSeq, answered, signal);
+    const attemptReady = event?.type === "discussion.cycle_attempt_ready";
+    const missed = await this.missedSourceFacts(event, page?.events, state?.roster, sourceEpoch.startsAtSeq, answered, signal,
+      attemptReady ? serverMissedSource(eventPayload(event?.payload)) : "");
     this.contextMissedFacts = missed.facts;
     this.contextMissedOffered = missed.offered;
+    this.contextMissedMark = missed.mark;
+    this.contextAttemptReady = attemptReady;
     const kept = await this.keptReplyOffer(event, page?.events, state?.roster, sourceEpoch, signal);
     this.contextKeptReply = kept.block;
     this.contextKeptReplyCleared = kept.clear;
@@ -1180,10 +1255,23 @@ export class OpenClawRoomRuntime {
   // The fact lines for missed sources, each resolved by bounded reads: its
   // number, speaker label, time and the count of newer messages before this
   // turn. Nothing else; no wording about what to do (P1a-1, P2a-3).
-  async missedSourceFacts(event, pageEvents, roster, epochStartsAtSeq, answeredIds, signal) {
+  // Contract L1-13: a source the Room names (missedSourceEventId) replaces
+  // the local record, which is cleared, and is offered once: the returned
+  // mark is remembered durably.
+  async missedSourceFacts(event, pageEvents, roster, epochStartsAtSeq, answeredIds, signal, serverMissed = "") {
     const facts = [];
     const offered = [];
-    for (const missed of Array.isArray(this.state.missedSources) ? this.state.missedSources : []) {
+    let mark = "";
+    const entries = Array.isArray(this.state.missedSources) ? this.state.missedSources : [];
+    const marks = new Set(entries.filter((item) => item.offered === true).map((item) => item.sourceEventId));
+    let candidates = entries.filter((item) => item.offered !== true);
+    if (serverMissed) {
+      offered.push(...candidates.map((item) => item.sourceEventId));
+      candidates = [];
+      if (marks.has(serverMissed) || answeredIds.has(serverMissed)) mark = serverMissed;
+      else candidates = [{sourceEventId: serverMissed, sourceSeq: 0}];
+    }
+    for (const missed of candidates) {
       // Answered by this turn, or from before the current discussion: cleared
       // without an offer (the same epoch floor as Hermes).
       if (answeredIds.has(missed.sourceEventId) || (missed.sourceSeq > 0 && missed.sourceSeq < epochStartsAtSeq)) {
@@ -1203,6 +1291,7 @@ export class OpenClawRoomRuntime {
             payload: {sourceEventId: missed.sourceEventId}}, epochStartsAtSeq, readPage);
         }
         offered.push(missed.sourceEventId);
+        if (missed.sourceEventId === serverMissed) mark = serverMissed;
         if (!source || !Number.isSafeInteger(source.seq) || source.seq < epochStartsAtSeq || source.seq >= event.seq) continue;
         const newer = await countMessagesBetween(source.seq, event.seq, readPage);
         const time = validCanonicalTimestamp(source.ts) ? `, ${new Date(source.ts).toISOString().slice(11, 16)} UTC` : "";
@@ -1214,7 +1303,7 @@ export class OpenClawRoomRuntime {
         this.logger?.warn?.(`Room missed source unavailable${roomErrorDiagnostic(error)}`);
       }
     }
-    return {facts, offered};
+    return {facts, offered, mark};
   }
 
   // Contract P2c-2: a reply whose turn's authority ended is kept, one per
@@ -1287,9 +1376,17 @@ export class OpenClawRoomRuntime {
   }
 
   // Offered once, then cleared durably before the turn is handed to the host.
-  async clearMissedSources(offered) {
-    if (!offered?.length || !Array.isArray(this.state.missedSources)) return;
-    const remaining = this.state.missedSources.filter((item) => !offered.includes(item.sourceEventId));
+  async clearMissedSources(offered, {mark = "", attemptReady = false} = {}) {
+    const current = Array.isArray(this.state.missedSources) ? this.state.missedSources : [];
+    let remaining = current.filter((item) => !(offered ?? []).includes(item.sourceEventId));
+    if (attemptReady) {
+      // Contract L1-13: each attempt-ready event restates the Room's missed
+      // source; without the field the offered memory ends.
+      remaining = remaining.filter((item) => item.offered !== true);
+      if (mark) remaining = [...remaining.filter((item) => item.sourceEventId !== mark), {sourceEventId: mark, sourceSeq: 0, offered: true}];
+    }
+    remaining = remaining.slice(-MISSED_SOURCE_LIMIT);
+    if (JSON.stringify(remaining) === JSON.stringify(current)) return;
     if (remaining.length) this.state.missedSources = remaining;
     else delete this.state.missedSources;
     await this.persistState();
@@ -1792,6 +1889,9 @@ export class OpenClawRoomRuntime {
       if (intent.deliveryState === "quarantined" || intent.status === "quarantined") {
         throw new Error("OpenClaw Room delivery is quarantined for operator recovery");
       }
+      if (intent.deliveryState === "skipped" && intent.skippedReason === "message_too_large") {
+        return {refused: true, reason: "message_too_large"};
+      }
       if (intent.deliveryState === "skipped") return {skipped: true, reason: String(intent.skippedReason || "skipped")};
       if (intent.deliveryState === "superseded") return {superseded: true, reason: String(intent.supersededReason || "superseded")};
     } else {
@@ -1977,6 +2077,7 @@ export class OpenClawRoomRuntime {
             return {skipped: true, reason: skipReason};
           }
           if (refusal.outcome === "superseded") return this.supersedeDelivery(intent, refusal.reason, cycleAttempt, signal);
+          if (refusal.outcome === "too_large") return this.refuseTooLarge(intent, error, cycleAttempt, signal);
           const quarantined = refusal.outcome === "quarantined"
             || (refusal.outcome === "refresh" && !(error instanceof RoomAPIError && error.retryable));
           intent.deliveryState = quarantined ? "quarantined" : "delivery_pending";

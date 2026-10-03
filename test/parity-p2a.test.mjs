@@ -22,7 +22,8 @@ registerHooks({
   },
 });
 const {createRoomChannel} = await import("../src/channel.js");
-const {OpenClawRoomRuntime, isAssignedEvent} = await import("../src/runtime.js");
+const {OpenClawRoomRuntime, isAssignedEvent, serverMissedSource} = await import("../src/runtime.js");
+const {validateState} = await import("../src/state.js");
 const {RoomAPIError} = await import("../src/room-client.js");
 
 const conformance = JSON.parse(await readFile(new URL("../conformance.json", import.meta.url), "utf8"));
@@ -255,4 +256,63 @@ test("P2a-04 a coordinated ask without retry starts a cycle for its target", asy
   const retry = ask(2984, ["zurie"]);
   retry.payload.command.arguments.retryUnavailable = true;
   assert.equal(isAssignedEvent(retry, "zurie"), true);
+});
+
+// Contract L1-13 (P4, Room server joint-772ca32, R2): the Room may name the
+// member's oldest missed source on an attempt-ready event.
+test("L1-16 a missed source named by the Room replaces the local record and is offered once within the epoch floor", async () => {
+  const mention = message(2964, "owner-tj", "human_owner", "@Zurie your view?", {resolvedRecipientMembershipIds: ["zurie"]});
+  const named = message(2966, "owner-tj", "human_owner", "And this one?", {resolvedRecipientMembershipIds: ["zurie"]});
+  const newer = [2967, 2968].map((seq) => message(seq, "paula", "participant_agent", `Note ${seq}.`, {resolvedRecipientMembershipIds: ["paula"]}));
+  const paula = message(2969, "paula", "participant_agent", "Zurie, over to you.", {resolvedRecipientMembershipIds: ["zurie"]});
+  const withField = (ready, missedSourceEventId) => ({...ready, payload: {...ready.payload, missedSourceEventId}});
+  async function turnFor(ready, missedSources, extraEvents = [], options = {}) {
+    const runtime = roomRuntime([mention, named, ...newer, paula, ...extraEvents, ready], {cursor: ready.seq - 1, ...options});
+    if (missedSources) runtime.state.missedSources = structuredClone(missedSources);
+    const controller = new AbortController();
+    const turns = runtime.assignedTurns(controller.signal);
+    const turn = await nextTurn(turns);
+    controller.abort();
+    await turns.return();
+    return {turn, runtime};
+  }
+  const local = [{sourceEventId: mention.id, sourceSeq: 2964}];
+  const marked = [{sourceEventId: named.id, sourceSeq: 0, offered: true}];
+  // The Room's field replaces the local record, which is cleared.
+  const first = await turnFor(withField(readyFor(2970, paula.id), named.id), local);
+  const fact = first.turn.text.match(/\nMissed earlier: [^\n]*\n/u)?.[0] ?? "";
+  assert.match(fact, /^\nMissed earlier: #2966 TJE, /u, first.turn.text);
+  assert.match(fact, /; 3 newer messages since\.\n$/u);
+  assert.equal(first.turn.text.split("Missed earlier").length - 1, 1);
+  assert.deepEqual(first.runtime.state.missedSources, marked);
+  assert.deepEqual(DENY.filter((word) => fact.toLowerCase().includes(word)), []);
+  // Offered once: a later event repeating the field offers nothing.
+  const again = await turnFor(withField(readyFor(2970, paula.id), named.id), marked);
+  assert.doesNotMatch(again.turn.text, /Missed earlier/u);
+  assert.deepEqual(again.runtime.state.missedSources, marked);
+  // An attempt-ready event without the field ends that memory.
+  const cleared = await turnFor(readyFor(2970, paula.id), marked);
+  assert.doesNotMatch(cleared.turn.text, /Missed earlier/u);
+  assert.equal(cleared.runtime.state.missedSources, undefined);
+  // Without the field the local record is offered as before (P2a-3).
+  const plain = await turnFor(readyFor(2970, paula.id), local);
+  assert.match(plain.turn.text, /\nMissed earlier: #2964 TJE, /u);
+  // The epoch floor: a named source before the active discussion is not offered.
+  const before = message(2900, "owner-tj", "human_owner", "Before the restart.");
+  const late = message(2999, "paula", "participant_agent", "Zurie, your turn.", {resolvedRecipientMembershipIds: ["zurie"]});
+  const floored = roomRuntime([before, late, withField(readyFor(3000, late.id), before.id)], {cursor: 2999, epochStartsAtSeq: 2950});
+  const controller = new AbortController();
+  const turns = floored.assignedTurns(controller.signal);
+  const floorTurn = await nextTurn(turns);
+  controller.abort();
+  await turns.return();
+  assert.doesNotMatch(floorTurn.text, /Missed earlier/u);
+  // A field equal to the attempt's own source is no missed source.
+  assert.equal(serverMissedSource({sourceEventId: "a", missedSourceEventId: "a"}), "");
+  assert.equal(serverMissedSource({sourceEventId: "a", missedSourceEventId: "b"}), "b");
+  // The mark is durable and validated with the state.
+  const state = structuredClone(first.runtime.state);
+  validateState(state);
+  state.missedSources = [{...marked[0], offered: "yes"}];
+  assert.throws(() => validateState(state), /missed sources/u);
 });

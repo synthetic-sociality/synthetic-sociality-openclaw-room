@@ -205,7 +205,8 @@ export function validateState(value) {
   if (value.missedSources !== undefined && (
     !Array.isArray(value.missedSources) || value.missedSources.length > 8
     || value.missedSources.some((item) => !item || typeof item.sourceEventId !== "string" || !item.sourceEventId
-      || item.sourceEventId.length > 128 || !Number.isSafeInteger(item.sourceSeq) || item.sourceSeq < 0)
+      || item.sourceEventId.length > 128 || !Number.isSafeInteger(item.sourceSeq) || item.sourceSeq < 0
+      || (item.offered !== undefined && item.offered !== true))
   )) throw new Error("Room missed sources are invalid");
   // Contract P3-1: receive ledger, delivered frontier, applied closures, revision.
   if (value.stateRevision !== undefined && value.stateRevision !== STATE_REVISION) throw new Error("Room state revision is invalid");
@@ -242,7 +243,7 @@ export function validateState(value) {
     if (!Number.isSafeInteger(seq) || seq < 1 || !evidence || evidence.sourceSeq !== seq || !String(evidence.sourceEventId ?? "")) {
       throw new Error("Room terminal evidence entry is invalid");
     }
-    if (!["posted", "skipped", "cancelled", "superseded", "ignored"].includes(evidence.status)) {
+    if (!["posted", "skipped", "failed", "cancelled", "superseded", "ignored"].includes(evidence.status)) {
       throw new Error("Room terminal evidence status is invalid");
     }
     if (evidence.status === "posted" ? !String(evidence.canonicalEventId ?? "") : !String(evidence.reason ?? "")) {

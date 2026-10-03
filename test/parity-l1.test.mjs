@@ -14,20 +14,27 @@ const PLANNED_REASON = "OpenClaw translation in P5 (owner: Hermes first, OpenCla
 const PKCS8_ED25519_PREFIX = Buffer.from("302e020100300506032b657004220420", "hex");
 const sha256 = (bytes) => createHash("sha256").update(bytes).digest("hex");
 
-test("conformance L1 cases are planned in OpenClaw with the owner's reason", async () => {
+test("conformance L1 cases: L1-01 to L1-14 planned with the owner's reason, L1-15 and L1-16 implemented", async () => {
   const cases = Object.entries(conformance.parityL1Cases ?? {});
-  assert.equal(cases.length, 14);
+  assert.equal(cases.length, 16);
   const directory = new URL("./", import.meta.url);
   const sources = await Promise.all((await readdir(directory)).filter((name) => name.endsWith(".test.mjs"))
     .map((name) => readFile(new URL(name, directory), "utf8")));
   cases.forEach(([id, entry], index) => {
     assert.equal(id, `L1-${String(index + 1).padStart(2, "0")}`);
-    assert.deepEqual(Object.keys(entry), ["name", "status", "reason"]);
     assert.ok(entry.name.startsWith(`${id} `), id);
-    assert.equal(entry.status, "planned");
-    assert.equal(entry.reason, PLANNED_REASON);
-    // A planned case has no implementing test yet.
-    assert.equal(sources.filter((source) => source.includes(`test(${JSON.stringify(entry.name)},`)).length, 0, entry.name);
+    const implementing = sources.filter((source) => source.includes(`test(${JSON.stringify(entry.name)},`)).length;
+    if (index < 14) {
+      assert.deepEqual(Object.keys(entry), ["name", "status", "reason"]);
+      assert.equal(entry.status, "planned");
+      assert.equal(entry.reason, PLANNED_REASON);
+      // A planned case has no implementing test yet.
+      assert.equal(implementing, 0, entry.name);
+    } else {
+      // Contract L1-12 and L1-13 are implemented in this release.
+      assert.deepEqual(entry, {name: entry.name, status: "implemented"});
+      assert.equal(implementing, 1, entry.name);
+    }
   });
   assert.equal(conformance.parityL1Contract, "docs/delivery-lifecycle-contract-v1.md#l1--device-link-2026-10-03");
 });

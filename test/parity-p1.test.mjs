@@ -34,7 +34,7 @@ const home = await mkdtemp(join(tmpdir(), "openclaw-room-parity-p1-"));
 process.env.HOME = home;
 const {createRoomChannel} = await import("../src/channel.js");
 const {
-  OpenClawRoomRuntime, attemptRenewalDelaySeconds, classifyPostRefusal, isCycleStartRefusal,
+  OpenClawRoomRuntime, attemptRenewalDelaySeconds, classifyPostRefusal, isCycleStartRefusal, keptReplyBlock, tooLargeKeptReason,
 } = await import("../src/runtime.js");
 const {RoomAPIError, SAFE_API_CODES} = await import("../src/room-client.js");
 const {loadState, saveState, validateState} = await import("../src/state.js");
@@ -931,4 +931,85 @@ test("cycle-start refusals: coded 4xx is final, session codes and transient erro
     [new RoomAPIError(409, {code: "connector_not_active"}), false],
     [new TypeError("fetch failed"), false],
   ]) assert.equal(isCycleStartRefusal(error), expected, `${error.name} ${error.status ?? ""} ${error.code ?? ""}`);
+});
+
+// Contract L1-12 (P4, Room server joint-772ca32): the word cap now applies in
+// open mode too; a message_too_large refusal is terminal, never a quarantine.
+test("L1-15 a message_too_large refusal is terminal in open and coordinated Rooms, acknowledged, and its reply is offered once with the limit", async () => {
+  const BYTE_CEILING = "message exceeds byte limit"; // the Room's text at 772ca32
+  for (const mode of ["open", "coordinated"]) {
+    const runtime = p1Runtime();
+    runtime.client = recordingClient({
+      requestTurn: async () => ({state: "granted", turnId: "turn-1"}),
+      roomState: async () => ({headSeq: 5, activeEpoch: {id: "epoch-1"}, serverLimits: {messageMaxBytes: 16384}}),
+      postMessage: async () => {
+        runtime.client.calls.push(["post"]);
+        throw new RoomAPIError(413, {code: "message_too_large", message: BYTE_CEILING, retryable: false});
+      },
+    });
+    runtime.pendingEvent = SOURCE;
+    const cycleAttempt = mode === "coordinated" ? CYCLE() : undefined;
+    if (cycleAttempt) runtime.startAttemptLease(SOURCE, cycleAttempt);
+    const request = {roomId: "room-1", text: BODY, replyToId: "human-1", idempotencyKey: `${SOURCE.id}:final`,
+      sourceEventId: SOURCE.id, sourceEpochId: "epoch-1", ...(cycleAttempt ? {cycleAttempt} : {})};
+    assert.deepEqual(await runtime.postAndFinish(request), {refused: true, reason: "message_too_large"}, mode);
+    const intent = runtime.state.deliveryIntents[request.idempotencyKey];
+    assert.equal(intent.status, "skipped", mode);
+    assert.equal(intent.skippedReason, "message_too_large", mode);
+    assert.notEqual(intent.deliveryState, "quarantined", mode);
+    assert.deepEqual(runtime.state.terminalEvidence["5"], {
+      status: "failed", sourceEventId: SOURCE.id, sourceSeq: 5,
+      canonicalEventId: "", canonicalSeq: 0, canonicalTs: "", reason: "message_too_large",
+    }, mode);
+    const completions = runtime.client.calls.filter(([kind]) => kind === "complete").map(([, , body]) => body);
+    assert.deepEqual(completions, mode === "coordinated"
+      ? [{generation: 3, action: "fail", executionFailure: {layer: "runtime", code: "response_too_large"}}] : [], mode);
+    // Kept under P2c-2 with the Room's byte ceiling, never a word count.
+    assert.equal(runtime.state.keptReply.reason, "message_too_large (limit 16384 bytes)", mode);
+    assert.equal(runtime.state.keptReply.text, BODY, mode);
+    const offer = keptReplyBlock(runtime.state.keptReply, null, []);
+    assert.ok(offer.includes("\nNot posted: message_too_large (limit 16384 bytes)\n"), offer);
+    assert.doesNotMatch(offer.replace(BODY, ""), /words/u);
+    // A later skip never downgrades it; a replay never posts again.
+    await runtime.recordSkipped(SOURCE.id, "model_no_visible_reply");
+    assert.equal(runtime.state.terminalEvidence["5"].status, "failed", mode);
+    assert.deepEqual(await runtime.postAndFinish(request), {refused: true, reason: "message_too_large"}, `${mode} replay`);
+    assert.equal(runtime.client.calls.filter(([kind]) => kind === "post").length, 1, mode);
+    // The Room acknowledgement frontier accepts the evidence.
+    runtime.client.acknowledge = async (_state, seq) => ({acknowledgedSeq: seq});
+    runtime.persistState = async () => {};
+    await runtime.ackEvent(SOURCE);
+    assert.equal(runtime.state.cursor, 5, mode);
+    validateState(runtime.state);
+  }
+  // A byte number in the refusal wins; a word count is never named; an
+  // unknown ceiling leaves only the code.
+  const stated = new RoomAPIError(413, {code: "message_too_large", message: "this Room allows at most 8000 bytes"});
+  assert.equal(stated.byteLimit, 8000);
+  assert.doesNotMatch(stated.message, /8000/u, "only the number is kept, never the message");
+  assert.equal(tooLargeKeptReason(stated, 16384), "message_too_large (limit 8000 bytes)");
+  assert.equal(tooLargeKeptReason(new RoomAPIError(413, {code: "message_too_large", message: "allows at most 300 words per response"})), "message_too_large");
+  assert.equal(tooLargeKeptReason(new RoomAPIError(413, {code: "message_too_large", message: BYTE_CEILING}), 0), "message_too_large");
+
+  // Channel: the source is acknowledged, no skip overwrites the evidence, and
+  // the attempt the runtime already released is not settled again.
+  const calls = {settled: [], skipped: [], ack: []};
+  const event = {
+    id: "ready-5", sourceEventId: "ready-5", respondsToId: "human-1", roomId: "room-1", epochId: "epoch-1",
+    conversationId: "room-1:epoch:x", senderId: "system", senderName: "Room", senderKind: "human",
+    text: "turn", occurredAt: 1, raw: {}, cycleAttempt: CYCLE(),
+  };
+  const client = {
+    initialize: async () => ({sessionId: "session-1"}),
+    assignedTurns: async function* () { yield event; },
+    markTurnReading: async () => {},
+    postAndFinish: async () => ({refused: true, reason: "message_too_large"}),
+    settleDiscussionAttempt: async (_attempt, action) => calls.settled.push(action),
+    recordSkipped: async (eventId, reason) => calls.skipped.push([eventId, reason]),
+    ack: async (eventId) => calls.ack.push(eventId),
+    close: async () => {},
+  };
+  const channel = createRoomChannel({makeClient: () => client});
+  await channel.plugin.gateway.startAccount(channelContext(join(home, "l1-15.json"), hostDeliver(BODY)));
+  assert.deepEqual(calls, {settled: [], skipped: [], ack: ["ready-5"]});
 });

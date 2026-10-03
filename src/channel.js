@@ -180,7 +180,7 @@ export function createRoomChannel({makeClient}) {
           signal: ctx.signal,
         });
         // The epoch-path supersede carries no reason; its evidence says historical_epoch.
-        if (sent.skipped || sent.superseded) throw new Error(`Room did not accept the post: ${sent.reason || (sent.superseded ? "historical_epoch" : "skipped")}`);
+        if (sent.skipped || sent.superseded || sent.refused) throw new Error(`Room did not accept the post: ${sent.reason || (sent.superseded ? "historical_epoch" : "skipped")}`);
         return {messageId: sent.eventId, receipt: receipt(sent.eventId, sent.sentAt)};
       },
     },
@@ -396,6 +396,13 @@ export function createRoomChannel({makeClient}) {
                           cycleSettled = true;
                           return {visibleReplySent: false};
                         }
+                        if (sent.refused) {
+                          // Contract L1-12: terminal evidence is recorded and
+                          // the attempt released; the source is acknowledged.
+                          deliveryOutcome = "refused";
+                          cycleSettled = true;
+                          return {visibleReplySent: false};
+                        }
                         if (sent.skipped) {
                           deliveryOutcome = "skipped";
                           skipReason = sent.reason;
@@ -431,7 +438,7 @@ export function createRoomChannel({makeClient}) {
             // A quarantined source stays isolated without evidence and a parked
             // one replays; neither is acknowledged here. The scan moves on.
             if (deliveryOutcome === "quarantined" || deliveryOutcome === "delivery_pending") continue;
-            if (!visibleReplySent && deliveryOutcome !== "superseded") {
+            if (!visibleReplySent && !["superseded", "refused"].includes(deliveryOutcome)) {
               await client.recordSkipped(event.id, skipReason || (operationalFallbackSuppressed ? "gateway_operational_error"
                 : deliveryOutcome === "failed" ? "delivery_failed" : "model_no_visible_reply"));
             }
