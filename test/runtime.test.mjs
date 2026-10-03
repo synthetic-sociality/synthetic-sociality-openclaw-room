@@ -1513,7 +1513,7 @@ test("fixture 132-134 acknowledges the timed-out terminal as lifecycle-only", as
   assert.deepEqual(acknowledgements, [132, 133, 134]);
   assert.deepEqual(evidence, [
     [132, "superseded", "historical_epoch"],
-    [133, "ignored", "not_assigned_or_technical"],
+    [133, "ignored", "discussion_start_not_a_trigger"], // contract L1-16
     [134, "ignored", "prior_epoch_lifecycle"],
   ]);
   assert.equal(runtime.state.cursor, 134);

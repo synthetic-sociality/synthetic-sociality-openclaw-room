@@ -187,10 +187,12 @@ export function attemptRenewalDelaySeconds(leaseExpiresAt, now = Date.now()) {
 
 // A coded 4xx refusal of POST /cycles is final for its source event; session
 // and credential codes, 429 and anything retryable keep today's handling.
-const CYCLE_START_SESSION_CODES = new Set(["credential_expired", "credential_revoked", "connector_not_active", "busy"]);
+const CYCLE_START_SESSION_CODES = new Set(["credential_expired", "credential_revoked", "connector_not_active", "busy", "credential_renewal_pending"]);
+// Contract L1-18: a coded, non-retryable 4xx (not 429) refusal that is not a
+// session code is terminal for its source, whether or not the code is known.
 export function isCycleStartRefusal(error) {
-  return error instanceof RoomAPIError && Boolean(error.code) && !error.retryable
-    && error.status >= 400 && error.status < 500 && error.status !== 429 && !CYCLE_START_SESSION_CODES.has(error.code);
+  return error instanceof RoomAPIError && Boolean(error.refusalCode) && !error.retryable
+    && error.status >= 400 && error.status < 500 && error.status !== 429 && !CYCLE_START_SESSION_CODES.has(error.refusalCode);
 }
 
 // Milliseconds left on a held attempt's lease; 0 when it has run out or the
@@ -765,7 +767,11 @@ export class OpenClawRoomRuntime {
           continue;
         }
         if (!isAssignedEvent(event, this.state.membershipId)) {
-          await this.recordTerminalEvidence(event, "ignored", {reason: "not_assigned_or_technical"});
+          // Contract L1-16: a discussion start is never a trigger here (OpenClaw
+          // does not start a cycle from it in any mode).
+          await this.recordTerminalEvidence(event, "ignored", {
+            reason: event.type === "discussion.started" ? "discussion_start_not_a_trigger" : "not_assigned_or_technical",
+          });
           await this.ackEvent(event);
           scanCursor = event.seq;
           continue;
@@ -1459,7 +1465,7 @@ export class OpenClawRoomRuntime {
     } catch (error) {
       // The Room refused to start this cycle (for example cycle_conflict when
       // this agent is not execution-ready): the source is done, not retried.
-      if (isCycleStartRefusal(error)) return {refused: error.code};
+      if (isCycleStartRefusal(error)) return {refused: error.refusalCode};
       throw error;
     }
   }

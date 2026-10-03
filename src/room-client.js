@@ -20,6 +20,9 @@ export const SAFE_API_CODES = new Set([
   "invitation_invalid",
   "message_too_large",
   "request_validation_failed",
+  // Contract L1-18: the Room's refusal of a cycle whose source is not eligible
+  // (a discussion start).
+  "source_not_eligible",
   // ADR 0089: the Room refused a counted open-mode post beyond the reply cap.
   "reply_cap_reached",
   "stale_context",
@@ -70,6 +73,9 @@ export class RoomAPIError extends Error {
     this.code = code;
     this.fieldPaths = fieldPaths;
     this.retryable = status === 429 || status >= 500 || body?.retryable === true;
+    // Contract L1-18: the shape of any server code (as Hermes' _REFUSAL_CODE),
+    // so an unknown cycle-start refusal is still terminal for its source.
+    this.refusalCode = typeof body?.code === "string" && /^[a-z][a-z0-9_]{0,63}$/u.test(body.code) ? body.code : "";
   }
 }
 

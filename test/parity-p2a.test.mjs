@@ -349,3 +349,77 @@ test("L1-19 a source the Room names as missed is remembered as offered only afte
   await runtime.clearMissedSources(result.offered, {mark: result.mark, attemptReady: true});
   assert.deepEqual(runtime.state.missedSources, [{sourceEventId: named.id, sourceSeq: 0, offered: true}]);
 });
+
+// Owner request 2026-10-03 (contract L1-16 to L1-18).
+test("L1-22 a discussion start in a coordinated Room starts no cycle and is acknowledged", async () => {
+  const start = {id: "start00002964", seq: 2964, ts: ts(2964), type: "discussion.started", actorRole: "human_owner", actorId: "owner-tj",
+    payload: {epoch: {id: "epoch-z", startsAtSeq: 2900, topic: {title: "Coding"}}}};
+  const mention = message(2965, "owner-tj", "human_owner", "@Zurie your view?", {resolvedRecipientMembershipIds: ["zurie"]});
+  for (const mode of ["coordinated", "open"]) {
+    const runtime = roomRuntime([start, mention, readyFor(2966, mention.id)], {cursor: 2963, mode});
+    const evidence = [];
+    const record = runtime.recordTerminalEvidence.bind(runtime);
+    runtime.recordTerminalEvidence = async (event, status, options) => {
+      evidence.push([event.seq, status, options?.reason]);
+      return record(event, status, options);
+    };
+    const controller = new AbortController();
+    const turns = runtime.assignedTurns(controller.signal);
+    const turn = await nextTurn(turns);
+    controller.abort();
+    await turns.return();
+    // No cycle from the start; the first human message carries the topic.
+    assert.ok(runtime.starts.every((request) => request.sourceEventId !== start.id), mode);
+    assert.ok(runtime.state.cursor >= 2964, `${mode}: the start is acknowledged`);
+    assert.match(turn.text, /Current discussion: Coding/u, mode);
+    assert.deepEqual(evidence.find(([seq]) => seq === 2964), [2964, "ignored", "discussion_start_not_a_trigger"], mode);
+  }
+});
+
+test("L1-23 every human role, including human_member and agent_owner, is a cycle source", async () => {
+  for (const role of ["human", "human_owner", "human_member", "human_admin", "agent_owner"]) {
+    const guest = message(2964, "guest-1", role, "@Zurie your view?", {resolvedRecipientMembershipIds: ["zurie"]});
+    const runtime = roomRuntime([guest, readyFor(2965, guest.id)], {cursor: 2963, mode: "coordinated"});
+    const controller = new AbortController();
+    const turns = runtime.assignedTurns(controller.signal);
+    await nextTurn(turns);
+    controller.abort();
+    await turns.return();
+    assert.deepEqual(runtime.starts.map((request) => request.sourceEventId), [guest.id], role);
+  }
+  for (const role of ["participant_agent", "room_master"]) {
+    const peer = message(2964, "paula", role, "Plain note.", {});
+    const runtime = roomRuntime([peer, message(2965, "owner-tj", "human_owner", "@Zurie?", {resolvedRecipientMembershipIds: ["zurie"]}),
+      readyFor(2966, "message00002965")], {cursor: 2963, mode: "coordinated"});
+    const controller = new AbortController();
+    const turns = runtime.assignedTurns(controller.signal);
+    await nextTurn(turns);
+    controller.abort();
+    await turns.return();
+    assert.ok(!runtime.starts.some((request) => request.sourceEventId === peer.id), role);
+  }
+});
+
+test("L1-24 a non-retryable 4xx cycle-start refusal with an unknown code is skipped and acknowledged, never a stopped channel", async () => {
+  for (const [code, status] of [["source_not_eligible", 409], ["a_code_no_list_names", 422]]) {
+    const mention = message(2964, "owner-tj", "human_owner", "@Zurie your view?", {resolvedRecipientMembershipIds: ["zurie"]});
+    const later = message(2965, "owner-tj", "human_owner", "@Zurie and this?", {resolvedRecipientMembershipIds: ["zurie"]});
+    const runtime = roomRuntime([mention, later, readyFor(2966, later.id)], {cursor: 2963, start: (request) => {
+      if (request.sourceEventId === mention.id) throw new RoomAPIError(status, {code, retryable: false});
+      return {cycle: {id: "cycle-new", generation: 1}};
+    }});
+    const controller = new AbortController();
+    const turns = runtime.assignedTurns(controller.signal);
+    const turn = await nextTurn(turns);
+    controller.abort();
+    await turns.return();
+    assert.equal(turn.sourceEventId, "attemptready2966", code);
+    assert.ok(runtime.state.cursor >= 2964, `${code}: acknowledged`);
+  }
+  const {isCycleStartRefusal} = await import("../src/runtime.js");
+  assert.equal(isCycleStartRefusal(new RoomAPIError(422, {code: "a_code_no_list_names", retryable: false})), true);
+  for (const [code, status, retryable] of [["a_code_no_list_names", 422, true], ["a_code_no_list_names", 429, false],
+    ["busy", 409, false], ["credential_renewal_pending", 409, false], ["Not A Code", 409, false]]) {
+    assert.equal(isCycleStartRefusal(new RoomAPIError(status, {code, retryable})), false, `${code} ${status} ${retryable}`);
+  }
+});
