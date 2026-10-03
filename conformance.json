@@ -98,6 +98,7 @@
     "message_too_large",
     "reply_cap_reached",
     "request_validation_failed",
+    "source_not_eligible",
     "stale_context",
     "stale_epoch",
     "turn_expired",
@@ -281,6 +282,18 @@
       "name": "L1-21 the pairing confirmation, the device socket and both local Gateway requests never follow a redirect",
       "status": "planned",
       "reason": "OpenClaw translation in P5 (owner: Hermes first, OpenClaw next)"
+    },
+    "L1-22": {
+      "name": "L1-22 a discussion start in a coordinated Room starts no cycle and is acknowledged",
+      "status": "implemented"
+    },
+    "L1-23": {
+      "name": "L1-23 every human role, including human_member and agent_owner, is a cycle source",
+      "status": "implemented"
+    },
+    "L1-24": {
+      "name": "L1-24 a non-retryable 4xx cycle-start refusal with an unknown code is skipped and acknowledged, never a stopped channel",
+      "status": "implemented"
     }
   },
   "parityL1SignatureVector": {
@@ -310,6 +323,6 @@
   },
   "parityContractSectionSha256": {
     "P3": "a689096e24f9fee13e0603006274c303f3435ee823f082a84a63b765deb8906b",
-    "L1": "fb10f46adfeadd5506734f5433ba936386026e2ac09ccb9ab4d983d4b7e42da7"
+    "L1": "f5642c26a7966735f0ee3126301fbd88e4bc67297ef5e76f0a933e69a54a2204"
   }
 }
