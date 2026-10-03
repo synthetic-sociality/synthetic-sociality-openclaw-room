@@ -387,7 +387,8 @@ test("L1-23 every human role, including human_member and agent_owner, is a cycle
     await turns.return();
     assert.deepEqual(runtime.starts.map((request) => request.sourceEventId), [guest.id], role);
   }
-  for (const role of ["participant_agent", "room_master"]) {
+  // "human_" exactly, never any role that only starts with "human" (r2 item 11).
+  for (const role of ["participant_agent", "room_master", "humanoid", "human-owner"]) {
     const peer = message(2964, "paula", role, "Plain note.", {});
     const runtime = roomRuntime([peer, message(2965, "owner-tj", "human_owner", "@Zurie?", {resolvedRecipientMembershipIds: ["zurie"]}),
       readyFor(2966, "message00002965")], {cursor: 2963, mode: "coordinated"});
@@ -417,9 +418,63 @@ test("L1-24 a non-retryable 4xx cycle-start refusal with an unknown code is skip
     assert.ok(runtime.state.cursor >= 2964, `${code}: acknowledged`);
   }
   const {isCycleStartRefusal} = await import("../src/runtime.js");
+  // OP-12 P4 r2 C1: the refusal code is bounded to 64 characters, as in Hermes.
+  const sixtyFour = `a${"b".repeat(63)}`;
+  assert.equal(new RoomAPIError(409, {code: sixtyFour}).refusalCode, sixtyFour);
+  assert.equal(new RoomAPIError(409, {code: `${sixtyFour}c`}).refusalCode, "");
+  assert.equal(new RoomAPIError(409, {code: "Upper_case"}).refusalCode, "");
+  assert.equal(isCycleStartRefusal(new RoomAPIError(409, {code: `${sixtyFour}c`, retryable: false})), false);
   assert.equal(isCycleStartRefusal(new RoomAPIError(422, {code: "a_code_no_list_names", retryable: false})), true);
   for (const [code, status, retryable] of [["a_code_no_list_names", 422, true], ["a_code_no_list_names", 429, false],
     ["busy", 409, false], ["credential_renewal_pending", 409, false], ["Not A Code", 409, false]]) {
     assert.equal(isCycleStartRefusal(new RoomAPIError(status, {code, retryable})), false, `${code} ${status} ${retryable}`);
   }
+});
+
+test("L1-25 a 401 or 403 cycle-start refusal is a session failure, never a skipped source, and a skipped human command stays a missed source", async () => {
+  const mention = message(2964, "owner-tj", "human_owner", "@Zurie your view?", {resolvedRecipientMembershipIds: ["zurie"]});
+  // 401 and 403, whatever the code: thrown (the session path), never skipped or acknowledged.
+  for (const [status, code] of [[401, "unauthorized"], [403, "forbidden"], [401, "a_code_no_list_names"]]) {
+    const runtime = roomRuntime([mention, readyFor(2965, mention.id)], {cursor: 2963, start: () => {
+      throw new RoomAPIError(status, {code, retryable: false});
+    }});
+    const controller = new AbortController();
+    const turns = runtime.assignedTurns(controller.signal);
+    await assert.rejects(nextTurn(turns), RoomAPIError, `${status} ${code}`);
+    controller.abort();
+    assert.equal(runtime.state.cursor, 2963, `${status} ${code}: not acknowledged`);
+    assert.equal(runtime.state.terminalEvidence?.["2964"], undefined, `${status} ${code}: not skipped`);
+  }
+  // Every other refusal stays terminal for its source (404, 409 room_closed).
+  for (const [status, code] of [[404, "not_found"], [409, "room_closed"]]) {
+    const later = message(2965, "owner-tj", "human_owner", "@Zurie and this?", {resolvedRecipientMembershipIds: ["zurie"]});
+    const runtime = roomRuntime([mention, later, readyFor(2966, later.id)], {cursor: 2963, start: (request) => {
+      if (request.sourceEventId === mention.id) throw new RoomAPIError(status, {code, retryable: false});
+      return {cycle: {id: "cycle-new", generation: 1}};
+    }});
+    const controller = new AbortController();
+    const turns = runtime.assignedTurns(controller.signal);
+    const turn = await nextTurn(turns);
+    controller.abort();
+    await turns.return();
+    assert.equal(turn.sourceEventId, "attemptready2966", code);
+    assert.ok(runtime.state.cursor >= 2964, `${code}: acknowledged`);
+  }
+  // A skipped human command stays a missed source and is offered.
+  const ask = {id: "command00002965", seq: 2965, ts: ts(2965), type: "human.command", actorRole: "human_owner", actorId: "owner-tj",
+    payload: {epochId: "epoch-z", command: {command: "ask", arguments: {instruction: "Your view, Zurie?"},
+      resolvedTargetMembershipIds: ["zurie"], targetSelectors: [{kind: "membership", membershipId: "zurie"}]}}};
+  const paula = message(2966, "paula", "participant_agent", "Zurie, over to you.", {resolvedRecipientMembershipIds: ["zurie"]});
+  const runtime = roomRuntime([ask, paula, readyFor(2967, paula.id)], {cursor: 2964, start: (request) => {
+    if (request.sourceEventId === ask.id) throw new RoomAPIError(409, {code: "source_not_eligible", retryable: false});
+    return {cycle: {id: "cycle-new", generation: 1}};
+  }});
+  const controller = new AbortController();
+  const turns = runtime.assignedTurns(controller.signal);
+  const turn = await nextTurn(turns);
+  controller.abort();
+  await turns.return();
+  assert.match(turn.text, /\nMissed earlier: #2965 TJE, /u, turn.text);
+  const {MISSED_SOURCE_EVENT_TYPES} = await import("../src/runtime.js");
+  assert.equal(MISSED_SOURCE_EVENT_TYPES.has("discussion.started"), false);
 });

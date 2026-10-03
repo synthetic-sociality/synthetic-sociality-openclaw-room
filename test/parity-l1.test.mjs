@@ -19,7 +19,7 @@ const sha256 = (bytes) => createHash("sha256").update(bytes).digest("hex");
 
 test("conformance L1 cases: planned ones carry the owner's reason and no test, implemented ones exactly one test", async () => {
   const cases = Object.entries(conformance.parityL1Cases ?? {});
-  assert.equal(cases.length, 24);
+  assert.equal(cases.length, 25);
   const directory = new URL("./", import.meta.url);
   const sources = await Promise.all((await readdir(directory)).filter((name) => name.endsWith(".test.mjs"))
     .map((name) => readFile(new URL(name, directory), "utf8")));
@@ -108,7 +108,7 @@ test("L1-17 a host whose tool selection cannot be read counts as reaching the st
 test("the planned and implemented L1 cases are the ones this release names", () => {
   const status = Object.fromEntries(Object.entries(conformance.parityL1Cases).map(([id, entry]) => [id, entry.status]));
   const implemented = Object.keys(status).filter((id) => status[id] === "implemented");
-  assert.deepEqual(implemented, ["L1-15", "L1-16", "L1-17", "L1-18", "L1-19", "L1-22", "L1-23", "L1-24"]);
+  assert.deepEqual(implemented, ["L1-15", "L1-16", "L1-17", "L1-18", "L1-19", "L1-22", "L1-23", "L1-24", "L1-25"]);
 });
 
 // OP-12 P4 r1 item 9: the P3 and L1 sections are pinned (the same hashes in

@@ -190,10 +190,18 @@ export function attemptRenewalDelaySeconds(leaseExpiresAt, now = Date.now()) {
 const CYCLE_START_SESSION_CODES = new Set(["credential_expired", "credential_revoked", "connector_not_active", "busy", "credential_renewal_pending"]);
 // Contract L1-18: a coded, non-retryable 4xx (not 429) refusal that is not a
 // session code is terminal for its source, whether or not the code is known.
+// 401 and 403 are session/authorisation failures whatever their code (the Room
+// answers 401 `unauthorized`): they throw, and the source is processed again.
 export function isCycleStartRefusal(error) {
   return error instanceof RoomAPIError && Boolean(error.refusalCode) && !error.retryable
-    && error.status >= 400 && error.status < 500 && error.status !== 429 && !CYCLE_START_SESSION_CODES.has(error.refusalCode);
+    && error.status >= 400 && error.status < 500 && ![401, 403, 429].includes(error.status)
+    && !CYCLE_START_SESSION_CODES.has(error.refusalCode);
 }
+
+// Contract L1-18: the human sources whose refused cycle start is offered as a
+// missed source. A discussion start is not one: it is never a trigger (L1-16)
+// and its topic reaches the agent as "Current discussion".
+export const MISSED_SOURCE_EVENT_TYPES = new Set(["message.posted", "human.command"]);
 
 // Milliseconds left on a held attempt's lease; 0 when it has run out or the
 // Room gave no valid expiry (then nothing proves it valid, so no retry).
@@ -785,7 +793,7 @@ export class OpenClawRoomRuntime {
         const cycleAttempt = await this.prepareCycleAttempt(event, signal);
         if (cycleAttempt?.refused) {
           // Refused before the model ran: offered on the next turn (P2a-3).
-          if (event.type === "message.posted") await this.noteMissedSource(String(event.id), event.seq);
+          if (MISSED_SOURCE_EVENT_TYPES.has(event.type)) await this.noteMissedSource(String(event.id), event.seq);
           await this.recordTerminalEvidence(event, "skipped", {reason: cycleAttempt.refused});
           this.logger?.info?.(`Room delivery skipped ${outcomeLogFields({code: cycleAttempt.refused, sourceSeq: event.seq})}`);
           await this.ackEvent(event);
@@ -1304,14 +1312,14 @@ export class OpenClawRoomRuntime {
       try {
         const readPage = (after) => this.client.readEvents(this.state, after, {wait: 0, signal});
         let source = (Array.isArray(pageEvents) ? pageEvents : [])
-          .find((item) => item?.type === "message.posted" && String(item.id ?? "") === missed.sourceEventId);
+          .find((item) => MISSED_SOURCE_EVENT_TYPES.has(item?.type) && String(item.id ?? "") === missed.sourceEventId);
         if (!source && missed.sourceSeq > 0) {
           source = ((await readPage(missed.sourceSeq - 1))?.events ?? [])
-            .find((item) => item?.type === "message.posted" && String(item.id ?? "") === missed.sourceEventId && item.seq === missed.sourceSeq);
+            .find((item) => MISSED_SOURCE_EVENT_TYPES.has(item?.type) && String(item.id ?? "") === missed.sourceEventId && item.seq === missed.sourceSeq);
         }
         if (!source) {
           source = await scanCycleSourceMessage({type: "discussion.cycle_attempt_ready", seq: event.seq,
-            payload: {sourceEventId: missed.sourceEventId}}, epochStartsAtSeq, readPage);
+            payload: {sourceEventId: missed.sourceEventId}}, epochStartsAtSeq, readPage, MISSED_SOURCE_EVENT_TYPES);
         }
         offered.push(missed.sourceEventId);
         if (source && Number.isSafeInteger(source.seq) && source.seq >= epochStartsAtSeq && source.seq < event.seq) {
@@ -3108,7 +3116,7 @@ export function cycleSourceMessage(event, events) {
 // walked backwards in pages of CONTEXT_SCAN_CHUNK, at most CONTEXT_SCAN_LIMIT
 // sequence numbers, never before the epoch start; the walk ends at the event
 // with that id, which counts only when it is a message (Hermes: same limits).
-export async function scanCycleSourceMessage(event, epochStartsAtSeq, readPage) {
+export async function scanCycleSourceMessage(event, epochStartsAtSeq, readPage, types = new Set(["message.posted"])) {
   if (event?.type !== "discussion.cycle_attempt_ready") return null;
   const sourceEventId = String(eventPayload(event.payload).sourceEventId ?? "").trim();
   if (!sourceEventId || !Number.isSafeInteger(event.seq)) return null;
@@ -3121,7 +3129,7 @@ export async function scanCycleSourceMessage(event, epochStartsAtSeq, readPage) 
     const page = await readPage(start - 1);
     const found = (Array.isArray(page?.events) ? page.events : [])
       .find((item) => String(item?.id ?? "") === sourceEventId && item.seq >= start && item.seq < before);
-    if (found) return found.type === "message.posted" ? found : null;
+    if (found) return types.has(found.type) ? found : null;
     scanned += width;
     before = start;
   }

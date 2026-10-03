@@ -28,7 +28,7 @@ document bytes. An exact artifact read also invokes the Room server's supported
 deterministic text backfill for older pending versions.
 
 Version 0.2.62 is parity release P4 with Hermes 1.0.78 ("Device link", contract
-section L1, shared cases L1-01 to L1-24). The device link itself ships as
+section L1, shared cases L1-01 to L1-25). The device link itself ships as
 contract and shared cases only: L1-01 to L1-14, L1-20 and L1-21 are marked
 planned here ("OpenClaw translation in P5 (owner: Hermes first, OpenClaw
 next)"), and the suite pins the shared signature vector (JavaScript
@@ -76,6 +76,10 @@ L1-13 and L1-15, shared cases L1-15 to L1-19, implemented in both plugins):
     acknowledged; before, it stopped the channel. `source_not_eligible` is a
     known code, and `credential_renewal_pending` joins the session codes, as in
     Hermes.
+  - An HTTP 401 or 403 on a cycle start is a session or authorisation failure
+    whatever its code (the Room answers 401 `unauthorized`): it stops the
+    channel as in 0.2.61 and the source is processed again, never skipped. A
+    skipped human message or human command is offered once as a missed source.
 - `executionFailure.attempt` (`elapsedSeconds`, `limitSeconds`) is Room-side
   evidence; the plugin never sends it, so nothing changes here.
 - The P3-4 clause: a recovery mark counts only for the sealed record digest it
