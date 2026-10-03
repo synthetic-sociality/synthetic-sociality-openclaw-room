@@ -1,7 +1,7 @@
 import {defineChannelPluginEntry} from "openclaw/plugin-sdk/channel-core";
 import {defineChannelMessageAdapter} from "openclaw/plugin-sdk/channel-message";
 import {buildChannelInboundEventContext} from "openclaw/plugin-sdk/channel-inbound";
-import {dirname, join, resolve} from "node:path";
+import {basename, dirname, join, resolve} from "node:path";
 import {loadState, openClawStateDirectory} from "./state.js";
 import {registerRoomCommands} from "./commands.js";
 import {markChannelActive, markChannelInactive, registerPresenceFallback} from "./presence-fallback.js";
@@ -94,7 +94,12 @@ export function roomStoreDirectories(cfg) {
 export function roomStatusPath(cfg) {
   try {
     const account = resolvedRoomAccounts(cfg ?? {}).find((item) => item?.stateFile);
-    if (account) return join(dirname(dirname(resolve(account.stateFile))), "status.json");
+    if (account) {
+      // An `accounts/` directory's parent; any other layout: the state file's
+      // own directory (the same rule as Hermes: next to the state in use).
+      const directory = dirname(resolve(account.stateFile));
+      return join(basename(directory) === "accounts" ? dirname(directory) : directory, "status.json");
+    }
   } catch {
     // An unreadable configuration falls back to the plugin root.
   }

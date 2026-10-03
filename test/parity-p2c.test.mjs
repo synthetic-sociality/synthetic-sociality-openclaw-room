@@ -218,10 +218,17 @@ test("P2c-01 the credential is not readable through the agent's tools and never 
 
   // 3. The start gate.
   const gate = (cfg) => isolation.storeReachability(cfg, [STORE], {stateDir});
-  assert.deepEqual(gate({}), ["fs_tools_unfenced", "host_shell_tools"]);
-  assert.deepEqual(gate({tools: {fs: {workspaceOnly: true}}}), ["host_shell_tools"]);
+  assert.deepEqual(gate({}), ["fs_tools_unfenced", "host_shell_tools", "remote_command_tool"]);
+  assert.deepEqual(gate({tools: {fs: {workspaceOnly: true}}}), ["host_shell_tools", "remote_command_tool"]);
   assert.deepEqual(gate(ISOLATED_HOST_CONFIG), []);
-  const sandboxed = {tools: {fs: {workspaceOnly: true}, elevated: {enabled: false}}, agents: {defaults: {sandbox: {mode: "all"}}}};
+  // P3-7 (OP-12 P3): the nodes tool (remote commands on paired devices) and an
+  // enabled MCP server reach the host outside both routes.
+  assert.deepEqual(gate({tools: {fs: {workspaceOnly: true}, deny: ["group:runtime"]}}), ["remote_command_tool"]);
+  assert.deepEqual(gate({tools: {fs: {workspaceOnly: true}, deny: ["group:runtime", "nodes"]}}), []);
+  assert.deepEqual(gate({...ISOLATED_HOST_CONFIG, agents: {list: [{id: "x", tools: {alsoAllow: ["nodes"]}}]}}), []);
+  assert.deepEqual(gate({...ISOLATED_HOST_CONFIG, mcp: {servers: {files: {command: "npx"}}}}), ["mcp_server_enabled"]);
+  assert.deepEqual(gate({...ISOLATED_HOST_CONFIG, mcp: {servers: {files: {command: "npx", enabled: false}}}}), []);
+  const sandboxed = {tools: {fs: {workspaceOnly: true}, elevated: {enabled: false}, deny: ["group:nodes"]}, agents: {defaults: {sandbox: {mode: "all"}}}};
   assert.deepEqual(gate(sandboxed), []);
   assert.deepEqual(gate({...sandboxed, tools: {...sandboxed.tools, elevated: {}}}), ["host_shell_tools"]);
   assert.deepEqual(gate({...sandboxed, tools: {...sandboxed.tools, exec: {host: "gateway"}}}), ["host_shell_tools"]);
@@ -269,11 +276,11 @@ test("P2c-01 the credential is not readable through the agent's tools and never 
   assert.equal(reporting.made, 2, "report-only: the account starts");
   assert.notEqual(reporting.first.lastError, "secret_store_reachable");
   assert.equal(reporting.lines.error.length, 0);
-  const reports = reporting.lines.warn.filter((line) => line.includes("secret_store_reachable (fs_tools_unfenced,host_shell_tools)"));
+  const reports = reporting.lines.warn.filter((line) => line.includes("secret_store_reachable (fs_tools_unfenced,host_shell_tools,remote_command_tool)"));
   assert.equal(reports.length, 1, reporting.lines.warn.join(" | "));
   assert.match(reports[0], /reporting only/);
   assert.deepEqual([reporting.written.secretStore, reporting.written.secretStoreReasons, reporting.written.secretIsolationEnforced],
-    ["reachable", ["fs_tools_unfenced", "host_shell_tools"], false]);
+    ["reachable", ["fs_tools_unfenced", "host_shell_tools", "remote_command_tool"], false]);
   // Only boolean true enables enforcement (the manifest declares a boolean).
   const stringly = await startOnce({plugins: {entries: {"synthetic-sociality-room": {config: {enforceSecretIsolation: "true"}}}}});
   assert.equal(stringly.made, 2);
@@ -283,7 +290,7 @@ test("P2c-01 the credential is not readable through the agent's tools and never 
     assert.equal(refused.made, 0, "enforced: no client");
     assert.equal(refused.first.lastError, "secret_store_reachable");
     assert.equal(refused.lines.error.length, 1);
-    assert.match(refused.lines.error[0], /refused to start: secret_store_reachable \(fs_tools_unfenced,host_shell_tools\)/);
+    assert.match(refused.lines.error[0], /refused to start: secret_store_reachable \(fs_tools_unfenced,host_shell_tools,remote_command_tool\)/);
     assert.deepEqual([refused.written.secretStore, refused.written.secretIsolationEnforced], ["reachable", true]);
     assert.doesNotMatch(JSON.stringify(refused.written), new RegExp(FAKE_CREDENTIAL));
   }

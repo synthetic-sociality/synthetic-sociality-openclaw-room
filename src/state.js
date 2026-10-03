@@ -24,6 +24,14 @@ export async function migrateStateFile(path, state, {now = new Date()} = {}) {
   const backup = `${path}.pre-0.2.61-${stamp}.bak`;
   await copyFile(path, backup, fsConstants.COPYFILE_EXCL);
   await chmod(backup, 0o600);
+  // The copy is durable before the migrated state replaces the original.
+  const copy = await open(backup, "r");
+  try {
+    await copy.sync();
+  } finally {
+    await copy.close();
+  }
+  await syncDirectory(dirname(path));
   const next = structuredClone(state);
   const ack = Number(next.cursor) || 0;
   next.receiveLedger = {};

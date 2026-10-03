@@ -274,6 +274,27 @@ test("P3-02 an older state file is upgraded once, in place, without data loss an
   assert.equal(recovery.ledgerReport(seeded).holeSeqs.join(","), "11");
 });
 
+test("P3-02 an older state file is upgraded once, in place, without data loss and with a copy of the original (at initialize)", async () => {
+  // The runtime migrates during initialize, before registration.
+  const original = await auraShapedState();
+  const stateFile = await account(original, "initialize");
+  const runtime = new OpenClawRoomRuntime({accountId: "member-1", stateFile, baseUrl: "https://room.example/api"});
+  const order = [];
+  runtime.renewAccess = async () => { order.push(["renew", runtime.state.stateRevision]); return false; };
+  runtime.registerConnector = async () => { order.push(["register", runtime.state.stateRevision]); runtime.connectorSession = {sessionId: "s"}; return runtime.connectorSession; };
+  runtime.repairPendingLifecycles = async () => {};
+  runtime.publishPresence = async () => {};
+  runtime.runHeartbeat = () => {};
+  runtime.logger = {info: (line) => order.push(["log", line]), warn: () => {}, error: () => {}};
+  await runtime.initialize();
+  assert.deepEqual(order.filter(([kind]) => kind !== "log"), [["renew", 2], ["register", 2]]);
+  assert.ok(order.some(([kind, line]) => kind === "log" && /Room state upgraded to revision 2/.test(line)));
+  const onDisk = await loadState(stateFile);
+  assert.equal(onDisk.stateRevision, 2);
+  assert.equal((await readdir(dirname(stateFile))).filter((name) => name.includes(".pre-0.2.61-")).length, 1);
+  await runtime.close?.();
+});
+
 test("P3-03 terminal intents beyond the newest 32 are pruned and quarantined or open intents never are", async () => {
   const state = await auraShapedState({terminal: 45});
   state.deliveryIntents["lifecycle:final"] = {status: "lifecycle_pending", deliveryState: "posted", lifecycleState: "pending"};
@@ -423,6 +444,47 @@ test("P3-07 a recovery closure is refused without the Room's proof that the even
   assert.ok(runtime.logs.some((line) => /recovery closure for seq 379 not applied: not_proven/.test(line)));
   assert.deepEqual([refused.acks, runtime.state.cursor, runtime.state.appliedRecoveryClosures], [[], 378, {}]);
   assert.equal(runtime.state.receiveLedger["379"].status, "quarantined");
+
+  // A sealed record for another binding (client instance, membership, Room)
+  // is never applied to this account.
+  for (const [field, value] of [["clientInstanceId", "other-instance"], ["membership", "member-2"], ["room", "room-2"]]) {
+    const file = await account(paulaState(), `mismatch-${field}`);
+    const record = recovery.buildRecord({connector: "openclaw/test", roomId: "room-1", membershipId: "member-1", clientInstanceId: "client-1",
+      seq: 379, reason: "cycle_terminal", evidenceRef: `cycle:${CYCLE}`, proven,
+      prior: {kind: "quarantine", intentKey: "ev379:final", lastErrorCode: "cycle_superseded"}, operator: "o"});
+    record[field] = value;
+    record.confirmToken = recovery.confirmToken(record);
+    recovery.appendRecord(recovery.journalPath(file), recovery.seal(record));
+    const room = proofRoom();
+    const other = runtimeFor(await loadState(file), file, room);
+    await other.applyRecoveryClosures();
+    assert.deepEqual([room.acks, other.state.appliedRecoveryClosures, other.state.cursor], [[], {}, 378], field);
+  }
+
+  // OP-12 P3 F3: a transient error is retried at the next iteration (logged
+  // once); a final Room error retires only that record (logged once).
+  const sealed = recovery.seal(recovery.buildRecord({connector: "openclaw/test", roomId: "room-1", membershipId: "member-1",
+    clientInstanceId: "client-1", seq: 379, reason: "cycle_terminal", evidenceRef: `cycle:${CYCLE}`, proven,
+    prior: {kind: "quarantine", intentKey: "ev379:final", lastErrorCode: "cycle_superseded"}, operator: "o"}));
+  const flakyFile = await account(paulaState(), "flaky");
+  recovery.appendRecord(recovery.journalPath(flakyFile), sealed);
+  const flaky = proofRoom();
+  const failures = [new RoomAPIError(503, {code: "", retryable: true}), Object.assign(new TypeError("fetch failed"), {cause: {code: "ETIMEDOUT"}})];
+  const cycle = flaky.getDiscussionCycle;
+  flaky.getDiscussionCycle = async (...args) => { if (failures.length) throw failures.shift(); return cycle(...args); };
+  const flakyRuntime = runtimeFor(await loadState(flakyFile), flakyFile, flaky);
+  for (let round = 0; round < 3; round += 1) await flakyRuntime.applyRecoveryClosures();
+  assert.deepEqual([flaky.acks, flakyRuntime.state.cursor], [[382], 382]);
+  assert.equal(flakyRuntime.logs.filter((line) => line.includes("not applied yet (retrying)")).length, 1, flakyRuntime.logs.join(" | "));
+  const finalFile = await account(paulaState(), "final");
+  recovery.appendRecord(recovery.journalPath(finalFile), sealed);
+  const broken = proofRoom();
+  broken.getDiscussionCycle = async () => { throw new RoomAPIError(404, {code: "not_found"}); };
+  const brokenRuntime = runtimeFor(await loadState(finalFile), finalFile, broken);
+  await brokenRuntime.applyRecoveryClosures();
+  await brokenRuntime.applyRecoveryClosures();
+  assert.equal(brokenRuntime.logs.filter((line) => /recovery closure for seq 379 not applied: http_404/.test(line)).length, 1);
+  assert.deepEqual([broken.acks, brokenRuntime.state.appliedRecoveryClosures], [[], {}]);
 });
 
 test("P3-08 the status file is written next to the state in use and its directory is created 0700", async () => {
@@ -432,6 +494,9 @@ test("P3-08 the status file is written next to the state in use and its director
   const path = roomStatusPath(cfg);
   assert.equal(path, join(home, "aura-home", ".openclaw", "synthetic-sociality-room", "status.json"));
   assert.equal(roomStatusPath({}), join(home, "openclaw", "synthetic-sociality-room", "status.json"));
+  // A state file outside an accounts/ layout: its own directory.
+  const custom = {channels: {"synthetic-sociality-room": {baseUrl: "https://room.example/api", stateFile: join(home, "elsewhere", "room-state.json")}}};
+  assert.equal(roomStatusPath(custom), join(home, "elsewhere", "status.json"));
   const status = new LocalStatus(path, {plugin: "openclaw", version: "test", hostLabel: "h"});
   assert.equal(status.write(), true);
   assert.equal((await stat(dirname(path))).mode & 0o777, 0o700);
@@ -452,5 +517,5 @@ test("P3-09 a known path argument is resolved whatever its shape and denied tool
   assert.equal(policy({toolName: "read", params: {path: "notes.md"}}, {workspaceDir: join(stateDir, "workspace")}), undefined);
   // Denied shell tools with fenced file tools: isolated (P3-7, P2c-1).
   assert.deepEqual(isolation.storeReachability(ISOLATED_HOST_CONFIG, [store], {stateDir}), []);
-  assert.deepEqual(isolation.storeReachability({tools: {fs: {workspaceOnly: true}}}, [store], {stateDir}), ["host_shell_tools"]);
+  assert.deepEqual(isolation.storeReachability({tools: {fs: {workspaceOnly: true}}}, [store], {stateDir}), ["host_shell_tools", "remote_command_tool"]);
 });

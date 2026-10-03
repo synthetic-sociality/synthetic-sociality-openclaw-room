@@ -1641,31 +1641,48 @@ export class OpenClawRoomRuntime {
     let records;
     try {
       records = closuresFor(readRecords(journalPath(stateFile)), this.state.roomId, this.state.membershipId, this.state.clientInstanceId);
-    } catch {
+    } catch (error) {
+      if (!this.journalUnreadableLogged) {
+        this.journalUnreadableLogged = true;
+        this.logger?.warn?.(`Room recovery journal could not be read: ${error?.code || error?.name || "error"}`);
+      }
       return;
     }
     this.refusedClosures ??= new Set();
+    this.closureNotices ??= new Set();
     for (const seq of [...records.keys()].sort((a, b) => a - b)) {
       const record = records.get(seq);
       const marker = `${seq}:${record.recordDigest}`;
-      if (seq <= this.state.cursor || this.state.appliedRecoveryClosures?.[String(seq)] || this.refusedClosures.has(marker)) continue;
+      const recorded = Boolean(this.state.appliedRecoveryClosures?.[String(seq)]);
+      if (seq <= this.state.cursor || this.refusedClosures.has(marker)) continue;
+      const event = {id: record.eventId, seq};
       try {
-        priorState(this.state, seq);
-        const proven = await serverProof(roomForState(this.client, this.state, signal), this.state.membershipId, seq, record.reason, record.evidenceRef);
-        if (proven.eventId !== record.eventId) throw new RecoveryRefused("evidence_mismatch", "the Room's event differs from the record");
+        if (!recorded) {
+          priorState(this.state, seq);
+          const proven = await serverProof(roomForState(this.client, this.state, signal), this.state.membershipId, seq, record.reason, record.evidenceRef);
+          if (proven.eventId !== record.eventId) throw new RecoveryRefused("evidence_mismatch", "the Room's event differs from the record");
+          // Recorded before completion: a transient acknowledgement failure is
+          // retried without proving it again.
+          this.state.appliedRecoveryClosures ??= {};
+          this.state.appliedRecoveryClosures[String(seq)] = {recordDigest: record.recordDigest, appliedAt: new Date().toISOString()};
+          await this.recordTerminalEvidence(event, "ignored", {reason: `${CLOSURE_EVIDENCE_PREFIX}${record.reason}`});
+        }
+        await this.ackEvent(event);
       } catch (error) {
         if (signal?.aborted) throw error;
-        this.refusedClosures.add(marker);
-        this.logger?.warn?.(`Room recovery closure for seq ${seq} not applied: ${error?.code || "unavailable"}`);
+        // OP-12 P3 F3: only a refusal or a final Room error retires the
+        // record; network, timeout and retryable Room errors are retried at
+        // the next iteration. Each outcome is logged once.
+        const final = error instanceof RecoveryRefused || (error instanceof RoomAPIError && !error.retryable);
+        const notice = `${marker}:${final ? "refused" : "transient"}`;
+        if (!this.closureNotices.has(notice)) {
+          this.closureNotices.add(notice);
+          this.logger?.warn?.(`Room recovery closure for seq ${seq} not applied${final ? "" : " yet (retrying)"}: ${error instanceof RecoveryRefused ? error.code : statusErrorCode(error)}`);
+        }
+        if (final) this.refusedClosures.add(marker);
         continue;
       }
-      const event = {id: record.eventId, seq};
-      await this.recordTerminalEvidence(event, "ignored", {reason: `${CLOSURE_EVIDENCE_PREFIX}${record.reason}`});
-      this.state.appliedRecoveryClosures ??= {};
-      this.state.appliedRecoveryClosures[String(seq)] = {recordDigest: record.recordDigest, appliedAt: new Date().toISOString()};
-      await this.persistState();
-      await this.ackEvent(event);
-      this.logger?.warn?.(`Room recovery closure applied: seq ${seq}, reason ${record.reason}, operator ${record.operator}`);
+      if (!recorded) this.logger?.warn?.(`Room recovery closure applied: seq ${seq}, reason ${record.reason}, operator ${record.operator}`);
     }
   }
 

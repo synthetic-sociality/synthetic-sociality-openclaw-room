@@ -126,6 +126,18 @@ export function storeReachability(cfg, storeDirectories, {stateDir = "", home = 
     const host = String(bind).split(":")[0].trim();
     return host && (host.startsWith("/") || host.startsWith("~")) && stores.some((store) => overlaps(resolvedPath(host, home), store));
   })) reasons.add("sandbox_bind_covers_store");
+  // Contract P3-7: tools outside both routes. `nodes` runs commands on paired
+  // devices (the computer-use / remote-command class; a paired node can be
+  // this host); an enabled MCP server runs on the gateway host.
+  const deniesNodes = (agentTools) => {
+    const deny = new Set([...list(tools?.deny), ...list(agentTools?.deny)]);
+    return deny.has("*") || deny.has("nodes") || deny.has("group:nodes");
+  };
+  if (!deniesNodes(undefined) || agents.some((agent) => !deniesNodes(agent.tools))) reasons.add("remote_command_tool");
+  const servers = cfg?.mcp?.servers;
+  if (servers && typeof servers === "object" && Object.values(servers).some((entry) => !(entry && entry.enabled === false))) {
+    reasons.add("mcp_server_enabled");
+  }
   return [...reasons];
 }
 
