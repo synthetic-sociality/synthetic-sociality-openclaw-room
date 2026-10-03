@@ -485,6 +485,49 @@ test("P3-07 a recovery closure is refused without the Room's proof that the even
   await brokenRuntime.applyRecoveryClosures();
   assert.equal(brokenRuntime.logs.filter((line) => /recovery closure for seq 379 not applied: http_404/.test(line)).length, 1);
   assert.deepEqual([broken.acks, brokenRuntime.state.appliedRecoveryClosures], [[], {}]);
+
+  // OP-12 P3 delta: a local write failure (ENOSPC once) is retried; the
+  // evidence is written at the next iteration and the acknowledgement moves.
+  const diskFile = await account(paulaState(), "enospc");
+  recovery.appendRecord(recovery.journalPath(diskFile), sealed);
+  const diskRoom = proofRoom();
+  const diskRuntime = runtimeFor(await loadState(diskFile), diskFile, diskRoom);
+  let full = true;
+  const persist = diskRuntime.persistState.bind(diskRuntime);
+  diskRuntime.persistState = async () => {
+    if (full) {
+      full = false;
+      delete diskRuntime.state.terminalEvidence["379"];
+      throw Object.assign(new Error("no space left on device"), {code: "ENOSPC", syscall: "write"});
+    }
+    return persist();
+  };
+  await diskRuntime.applyRecoveryClosures();
+  assert.deepEqual(diskRoom.acks, []);
+  assert.ok(diskRuntime.state.appliedRecoveryClosures["379"], "the mark is set before the evidence");
+  await diskRuntime.applyRecoveryClosures();
+  assert.deepEqual([diskRoom.acks, diskRuntime.state.cursor], [[382], 382]);
+  assert.equal(diskRuntime.logs.filter((line) => line.includes("not applied yet (retrying): local_write_failed")).length, 1, diskRuntime.logs.join(" | "));
+  // A mark that reached disk without its evidence (then a restart) heals too.
+  const markedFile = await account({...paulaState(), appliedRecoveryClosures: {"379": {recordDigest: sealed.recordDigest, appliedAt: "2026-10-03T00:00:00Z"}}}, "marked");
+  recovery.appendRecord(recovery.journalPath(markedFile), sealed);
+  const markedRoom = proofRoom();
+  const restarted = runtimeFor(await loadState(markedFile), markedFile, markedRoom);
+  await restarted.applyRecoveryClosures();
+  assert.deepEqual([markedRoom.acks, restarted.state.cursor], [[382], 382]);
+  assert.equal((await loadState(markedFile)).cursor, 382);
+
+  // An undecodable line or a record whose proof is not an object is skipped;
+  // the valid record still applies (as Hermes).
+  const notObject = {...sealed, proof: "not-an-object"};
+  notObject.recordDigest = recovery.recordDigest(notObject);
+  const messyFile = await account(paulaState(), "messy");
+  await writeFile(recovery.journalPath(messyFile), Buffer.concat([
+    Buffer.from('{"version":1,"verb":"close","operator":"'), Buffer.from([0xff, 0xfe]), Buffer.from('"}\n'),
+    Buffer.from(`${JSON.stringify(notObject)}\n`), Buffer.from([0xc3, 0x28, 0x0a]), Buffer.from(`${"[".repeat(200000)}\n`), Buffer.from(`${recovery.canonical(sealed)}\n`),
+  ]), {mode: 0o600});
+  assert.deepEqual(recovery.readRecords(recovery.journalPath(messyFile)).map((item) => item.recordDigest), [sealed.recordDigest]);
+  assert.throws(() => recovery.confirmToken(notObject), /proof must be an object/);
 });
 
 test("P3-08 the status file is written next to the state in use and its directory is created 0700", async () => {

@@ -1661,17 +1661,23 @@ export class OpenClawRoomRuntime {
           priorState(this.state, seq);
           const proven = await serverProof(roomForState(this.client, this.state, signal), this.state.membershipId, seq, record.reason, record.evidenceRef);
           if (proven.eventId !== record.eventId) throw new RecoveryRefused("evidence_mismatch", "the Room's event differs from the record");
-          // Recorded before completion: a transient acknowledgement failure is
-          // retried without proving it again.
+          // Recorded before completion: a failed evidence write or
+          // acknowledgement is retried without proving it again.
           this.state.appliedRecoveryClosures ??= {};
           this.state.appliedRecoveryClosures[String(seq)] = {recordDigest: record.recordDigest, appliedAt: new Date().toISOString()};
+        }
+        // OP-12 P3 delta: a recorded closure whose evidence is missing (a
+        // failed write, in memory or on disk) records it again; the mark never
+        // stands without evidence at the next acknowledgement.
+        if (!this.terminalEvidenceFor(event)) {
           await this.recordTerminalEvidence(event, "ignored", {reason: `${CLOSURE_EVIDENCE_PREFIX}${record.reason}`});
         }
         await this.ackEvent(event);
       } catch (error) {
         if (signal?.aborted) throw error;
-        // OP-12 P3 F3: only a refusal or a final Room error retires the
-        // record; network, timeout and retryable Room errors are retried at
+        // Contract P3-4: only a refusal of the proof or a final Room error
+        // retires the record; any other failure (network, timeout, retryable
+        // Room error, local write failure, unexpected exception) is retried at
         // the next iteration. Each outcome is logged once.
         const final = error instanceof RecoveryRefused || (error instanceof RoomAPIError && !error.retryable);
         const notice = `${marker}:${final ? "refused" : "transient"}`;
@@ -3328,6 +3334,8 @@ function sessionLost(error) {
 // P2c-4: a status code for a failure: the Room code, else a fixed class.
 export function statusErrorCode(error) {
   if (error instanceof RoomAPIError) return error.code || `http_${error.status}`;
+  // A filesystem error (ENOSPC, EIO, EACCES ...) is local, not the network.
+  if (typeof error?.code === "string" && typeof error?.syscall === "string") return "local_write_failed";
   return "network";
 }
 

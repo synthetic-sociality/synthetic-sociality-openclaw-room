@@ -192,9 +192,14 @@ export function roomForState(client, state, signal) {
 
 // --- audit record -------------------------------------------------------------
 
+function isPlainObject(value) {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
 export function confirmToken(record) {
+  if (!isPlainObject(record?.proof)) throw new Error("audit record proof must be an object");
   const stable = Object.fromEntries(Object.entries(record).filter(([key]) => !TOKEN_EXCLUDED.has(key)));
-  stable.proof = Object.fromEntries(Object.entries(record.proof ?? {}).filter(([key]) => key !== "fetchedAt"));
+  stable.proof = Object.fromEntries(Object.entries(record.proof).filter(([key]) => key !== "fetchedAt"));
   return sha256(canonical(stable)).slice(0, 16);
 }
 
@@ -250,8 +255,12 @@ export function readRecords(path) {
     if (!line.trim()) continue;
     let record;
     try { record = JSON.parse(line); } catch { continue; }
-    if (record?.version === 1 && record.verb === "close" && record.recordDigest === recordDigest(record)
-      && record.confirmToken === confirmToken(record)) records.push(record);
+    try {
+      if (record?.version === 1 && record.verb === "close" && isPlainObject(record.proof) && isPlainObject(record.priorState)
+        && record.recordDigest === recordDigest(record) && record.confirmToken === confirmToken(record)) records.push(record);
+    } catch {
+      // Contract P3-4: an unreadable record is skipped, never fatal.
+    }
   }
   return records;
 }
