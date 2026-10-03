@@ -27,6 +27,36 @@ labels it as untrusted uploaded content, and never downloads or executes raw
 document bytes. An exact artifact read also invokes the Room server's supported
 deterministic text backfill for older pending versions.
 
+Version 0.2.63 is parity release P5 with Hermes 1.0.79 ("Cycle documents",
+contract section P5, shared case P5-01; contract L1-18 amended in wording):
+
+- The documents attached to the message that started a discussion cycle reach
+  every turn of that cycle (contract P5-1). Before, an attempt whose source was
+  the previous contribution carried only that contribution's attachments, so a
+  brief attached by the owner was read on the first turn and after a pass only.
+  - The cycle's source is the `sourceEventId` of the claimed cycle (the claim
+    response carries the cycle). It is taken from the loaded page, otherwise
+    from the bounded epoch scan, and remembered per cycle.
+  - The cycle source's attachments come first, then those of the turn's own
+    source when that is another message (also when that source was found by
+    the scan); each exact version appears once.
+  - The limits are unchanged: at most 8 attachments and 64,000 characters, cut
+    at the limit as before. The library catalog and the untrusted-content
+    framing are unchanged. A message outside a cycle carries its own
+    attachments only, as before.
+  - When the cycle's source cannot be resolved (outside the scan bound, or a
+    Room error) the turn proceeds without it and logs one line with code
+    `cycle_source_unresolved`.
+- 401/403 on a cycle start (contract L1-18, wording): OpenClaw throws and stops
+  the channel, as in 0.2.61; the source stays unacknowledged.
+- Tests for the surviving mutations of OP-12 P4 r3 finding 4: the `human_`
+  role prefix is checked at each of its two sites on its own.
+- Not in this release: the OpenClaw device link (`/tokenwerk-link`) moves to
+  the next release; the planned L1 cases stay planned.
+
+No state migration and nothing new on disk: 0.2.63 loads a 0.2.62 state file
+unchanged, and a rollback to 0.2.62 needs no step.
+
 Version 0.2.62 is parity release P4 with Hermes 1.0.78 ("Device link", contract
 section L1, shared cases L1-01 to L1-25). The device link itself ships as
 contract and shared cases only: L1-01 to L1-14, L1-20 and L1-21 are marked

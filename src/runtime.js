@@ -202,6 +202,11 @@ export function isCycleStartRefusal(error) {
 // missed source. A discussion start is not one: it is never a trigger (L1-16)
 // and its topic reaches the agent as "Current discussion".
 export const MISSED_SOURCE_EVENT_TYPES = new Set(["message.posted", "human.command"]);
+// Contract P5-1: the event types a cycle's source can be (a message, a human
+// command, or the discussion start of P1a-5), and how many resolved cycle
+// sources are remembered (Hermes: the same).
+export const CYCLE_DOCUMENT_SOURCE_TYPES = new Set(["message.posted", "human.command", "discussion.started"]);
+export const CYCLE_DOCUMENT_SOURCE_CACHE = 32;
 
 // Milliseconds left on a held attempt's lease; 0 when it has run out or the
 // Room gave no valid expiry (then nothing proves it valid, so no retry).
@@ -816,7 +821,7 @@ export class OpenClawRoomRuntime {
         this.contextMissedOffered = [];
         this.contextKeptReply = "";
         this.contextKeptReplyCleared = false;
-        const sharedContext = await this.sharedRoomContext(event, pageEpoch, signal);
+        const sharedContext = await this.sharedRoomContext(event, pageEpoch, signal, cycleAttempt || null);
         const normalized = normalizeEvent(
           event,
           this.state.roomId,
@@ -1132,7 +1137,7 @@ export class OpenClawRoomRuntime {
     return reason;
   }
 
-  async sharedRoomContext(event, sourceEpoch, signal) {
+  async sharedRoomContext(event, sourceEpoch, signal, cycleAttempt = null) {
     // Conversation Policy, saved Add guidance and canonical transcript are
     // mandatory model input. If any read fails, leave the event unacknowledged
     // and fail closed so a later retry cannot answer without owner guidance.
@@ -1195,17 +1200,56 @@ export class OpenClawRoomRuntime {
     const kept = await this.keptReplyOffer(event, page?.events, state?.roster, sourceEpoch, signal);
     this.contextKeptReply = kept.block;
     this.contextKeptReplyCleared = kept.clear;
+    // Contract P5-1: the cycle's source message keeps its attachments on every
+    // turn of the cycle; never a failed or delayed turn.
+    const pageEvents = Array.isArray(page?.events) ? page.events : [];
+    const cycleSource = await this.cycleDocumentSource(cycleAttempt, [sourceMessage, event, ...pageEvents].filter(Boolean),
+      event, sourceEpoch.startsAtSeq, signal);
     const library = await this.client.listArtifacts(this.state, signal);
     const artifactContext = await sourceArtifactContext(
       event,
-      page?.events,
+      sourceMessage ? [...pageEvents, sourceMessage] : page?.events,
       (artifactId) => this.client.getArtifact(this.state, artifactId, signal),
       library?.items,
+      cycleSource,
     );
     const combined = [roomContext, handoverContext, artifactContext].filter(Boolean).join("\n\n");
     // Bounded size telemetry for the pilot: character counts only, never content.
     this.logger?.info?.(`Room ${this.state.roomId} context sizes for ${String(event?.id ?? "")}: transcript=${roomContext.length} handover=${handoverContext.length} documents=${artifactContext.length} total=${combined.length}`);
     return combined;
+  }
+
+  // The source message of the claimed cycle, for its attachments (P5-1). The
+  // claim response carries the cycle, whose sourceEventId names the message
+  // that started it (Room server 772ca32 cycles.go Cycle, written once at
+  // cycle start). Taken from the loaded context, otherwise from the bounded
+  // epoch scan, and remembered per cycle. When it cannot be resolved the turn
+  // proceeds without it and one coded line is logged (Hermes: the same).
+  async cycleDocumentSource(cycleAttempt, loaded, event, epochStartsAtSeq, signal) {
+    const cycle = cycleAttempt && typeof cycleAttempt === "object" ? cycleAttempt.cycle : null;
+    const sourceEventId = cycle && typeof cycle === "object" ? String(cycle.sourceEventId ?? "").trim() : "";
+    if (!sourceEventId) return null;
+    const found = loaded.find((item) => String(item?.id ?? "") === sourceEventId);
+    if (found) return found;
+    this.cycleSourceEvents ??= new Map();
+    const key = `${String(cycle.id ?? "")}\0${sourceEventId}`;
+    if (this.cycleSourceEvents.has(key)) return this.cycleSourceEvents.get(key);
+    let scanned = null;
+    let reason = "not_found";
+    try {
+      scanned = await scanEpochEvent(sourceEventId, Number(event?.seq), epochStartsAtSeq,
+        (after) => this.client.readEvents(this.state, after, {wait: 0, signal}), CYCLE_DOCUMENT_SOURCE_TYPES);
+    } catch (error) {
+      if (signal?.aborted) throw error;
+      reason = singleLine(error?.name || "Error");
+    }
+    if (!scanned) {
+      this.logger?.warn?.(`Room ${this.state.roomId} cycle source documents unavailable: code cycle_source_unresolved cycle ${String(cycle.id ?? "") || "-"} source ${sourceEventId} reason ${reason}`);
+      return null;
+    }
+    this.cycleSourceEvents.set(key, scanned);
+    while (this.cycleSourceEvents.size > CYCLE_DOCUMENT_SOURCE_CACHE) this.cycleSourceEvents.delete(this.cycleSourceEvents.keys().next().value);
+    return scanned;
   }
 
   async epochHandoverContext(event, sourceEpoch, pageEvents, signal) {
@@ -3119,9 +3163,15 @@ export function cycleSourceMessage(event, events) {
 export async function scanCycleSourceMessage(event, epochStartsAtSeq, readPage, types = new Set(["message.posted"])) {
   if (event?.type !== "discussion.cycle_attempt_ready") return null;
   const sourceEventId = String(eventPayload(event.payload).sourceEventId ?? "").trim();
-  if (!sourceEventId || !Number.isSafeInteger(event.seq)) return null;
+  return scanEpochEvent(sourceEventId, event.seq, epochStartsAtSeq, readPage, types);
+}
+
+// The bounded backward walk of scanCycleSourceMessage for any event id before
+// beforeSeq (P5-1 reads the cycle's own source with it).
+export async function scanEpochEvent(sourceEventId, beforeSeq, epochStartsAtSeq, readPage, types = new Set(["message.posted"])) {
+  if (!sourceEventId || !Number.isSafeInteger(beforeSeq)) return null;
   const floor = Math.max(1, Number(epochStartsAtSeq) || 1);
-  let before = event.seq;
+  let before = beforeSeq;
   let scanned = 0;
   while (before > floor && scanned < CONTEXT_SCAN_LIMIT) {
     const width = Math.min(CONTEXT_SCAN_CHUNK, before - floor, CONTEXT_SCAN_LIMIT - scanned);
@@ -3244,7 +3294,11 @@ export function commandInstruction(payload = {}) {
   return String(payload?.visibleText ?? "").trim();
 }
 
-export async function sourceArtifactContext(event, events, fetchArtifact, library = []) {
+// Contract P5-1: on a turn of a discussion cycle, cycleSource is the cycle's
+// source message; its attachments come first, then those of the turn's own
+// source when that is another message. Each exact version is rendered once
+// (Hermes: context.py source_artifact_context).
+export async function sourceArtifactContext(event, events, fetchArtifact, library = [], cycleSource = null) {
   const payload = eventPayload(event?.payload);
   const sourceEventId = String(payload.sourceEventId ?? "").trim();
   let source = event?.type === "message.posted" ? event : null;
@@ -3252,9 +3306,19 @@ export async function sourceArtifactContext(event, events, fetchArtifact, librar
     source = [event, ...(Array.isArray(events) ? events : [])]
       .find((item) => String(item?.id ?? "") === sourceEventId) ?? null;
   }
-  const attachments = Array.isArray(source?.payload?.attachments) ? source.payload.attachments : [];
-  const entries = attachments.map((manifest) => ({manifest, artifact: null}));
-  const known = new Set(attachments.map((item) => `${String(item?.artifactId ?? "")}\0${String(item?.versionId ?? "")}`));
+  const attachmentsOf = (item) => (Array.isArray(item?.payload?.attachments) ? item.payload.attachments : []);
+  const attachments = [...(cycleSource && typeof cycleSource === "object" ? attachmentsOf(cycleSource) : []), ...attachmentsOf(source)];
+  const entries = [];
+  const known = new Set();
+  for (const manifest of attachments) {
+    if (!manifest || typeof manifest !== "object") continue;
+    const artifactId = String(manifest.artifactId ?? "");
+    const versionId = String(manifest.versionId ?? "");
+    const key = `${artifactId}\0${versionId}`;
+    if (artifactId && versionId && known.has(key)) continue;
+    known.add(key);
+    entries.push({manifest, artifact: null});
+  }
   entries.splice(MAX_SOURCE_ATTACHMENTS);
   const catalog = libraryCatalogContext(library, known);
   if (!entries.length) return catalog;
