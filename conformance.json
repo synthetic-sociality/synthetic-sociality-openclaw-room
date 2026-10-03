@@ -294,6 +294,10 @@
     "L1-24": {
       "name": "L1-24 a non-retryable 4xx cycle-start refusal with an unknown code is skipped and acknowledged, never a stopped channel",
       "status": "implemented"
+    },
+    "L1-25": {
+      "name": "L1-25 a 401 or 403 cycle-start refusal is a session failure, never a skipped source, and a skipped human command stays a missed source",
+      "status": "implemented"
     }
   },
   "parityL1SignatureVector": {
@@ -323,6 +327,6 @@
   },
   "parityContractSectionSha256": {
     "P3": "a689096e24f9fee13e0603006274c303f3435ee823f082a84a63b765deb8906b",
-    "L1": "f5642c26a7966735f0ee3126301fbd88e4bc67297ef5e76f0a933e69a54a2204"
+    "L1": "ac4eb8a938f91a5c20fac6872708dbd4381ea6761201b94ab00574959a0e5d24"
   }
 }
