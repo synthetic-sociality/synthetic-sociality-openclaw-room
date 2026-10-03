@@ -27,6 +27,56 @@ labels it as untrusted uploaded content, and never downloads or executes raw
 document bytes. An exact artifact read also invokes the Room server's supported
 deterministic text backfill for older pending versions.
 
+Version 0.2.64 is parity release P6 with Hermes 1.0.80 ("Clean start and
+bounds", contract section P6, shared cases P6-01 to P6-04; P5-2 amended,
+shared case P5-02):
+
+- A new discussion starts clean (contract P6-1). This was already the
+  behaviour and is now a rule with a shared case: nothing from before the
+  discussion start enters a prompt except the Room title and purpose, the
+  guidance and policy lines, the library catalog, a handover the start command
+  carried, and the documents of the current cycle's source. Each discussion
+  runs in a new OpenClaw session. The growth of input tokens inside one
+  discussion (the host replays each earlier prompt) is not changed here; it is
+  designed separately.
+- An epoch without a start (`activeEpochStartsAtSeq` missing or below 1,
+  contract P6-2) no longer stops the channel: an event page with a valid epoch
+  id and no start is processed with the start unknown, the prompt holds no
+  earlier event, and one line with code `epoch_start_unknown` is logged.
+  Missed sources and a kept reply are neither offered nor cleared on such a
+  turn. A page without a valid epoch id, or with a start of another shape,
+  still fails closed.
+- New operator command, the same as Hermes' (contract P6-3):
+  `openclaw-room-recovery rotate-current-epoch-session (--state FILE |
+  --account ID) [--yes]`. Without `--yes` it prints the account's epoch
+  routing and changes nothing. With `--yes` it writes a request beside the
+  state, `<state>.rotate-epoch-session.json` (0600); the connector consumes it
+  once at its next start, and the discussion active then gets a fresh epoch
+  session instead of the legacy per-Room one. The command never writes the
+  state file itself, so a running connector cannot overwrite it. A request for
+  another membership is left in place and logged as
+  `rotation_request_invalid`.
+- Cycle-source lookup bounded (contract P5-2, OP-12 P5 review finding 1): an
+  unresolved cycle source is remembered per cycle like a found one (32
+  cycles), and the whole lookup of a turn has one time bound,
+  `CYCLE_DOCUMENT_SOURCE_TIMEOUT_MS` (10 seconds), also when a page read hangs.
+  A remembered outcome counts only for the same epoch start, and a remembered
+  source never below it (review note 2).
+- Room guidance bound (contract P6-4): 3,000 characters counted in code points,
+  cut by the rule Hermes uses (whole lines while they fit, the first line that
+  does not fit cut with `…`, later lines dropped), pinned by a shared vector.
+  Before, the joined guidance was cut flat at 3,000 UTF-16 units with no
+  ellipsis.
+- Tests for the mutations the P5 review found surviving (scanned turn source's
+  attachments, cycle-source types, cache bound, cycle source outside a cycle).
+- Wording: the planned L1 cases now say the OpenClaw device link follows "in a
+  later release".
+
+No state migration: 0.2.64 loads a 0.2.63 state file unchanged. The only new
+file on disk is the rotation request, written only by the new command and
+removed when consumed; 0.2.63 ignores it, so a rollback needs no step (delete
+an unconsumed request by hand if the rotation is no longer wanted).
+
 Version 0.2.63 is parity release P5 with Hermes 1.0.79 ("Cycle documents",
 contract section P5, shared case P5-01; contract L1-18 amended in wording):
 

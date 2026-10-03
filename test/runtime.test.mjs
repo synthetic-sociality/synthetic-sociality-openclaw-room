@@ -1360,13 +1360,16 @@ test("active epoch page metadata is an inseparable validated pair and sequence i
     id: "epoch-new", startsAtSeq: 10,
   });
   for (const page of [
-    {activeEpochId: "epoch-new"},
     {activeEpochStartsAtSeq: 10},
     {activeEpochId: "", activeEpochStartsAtSeq: 10},
     {activeEpochId: 7, activeEpochStartsAtSeq: 10},
-    {activeEpochId: "epoch-new", activeEpochStartsAtSeq: 0},
     {activeEpochId: "epoch-new", activeEpochStartsAtSeq: 1.5},
   ]) assert.throws(() => validateActiveEpochPage(page), /active epoch/i);
+  // Contract P6-2: a valid id without a start (missing or below 1) is the
+  // start unknown, never a stopped channel (test/parity-p6.test.mjs).
+  for (const page of [{activeEpochId: "epoch-new"}, {activeEpochId: "epoch-new", activeEpochStartsAtSeq: 0}]) {
+    assert.deepEqual(validateActiveEpochPage(page), {id: "epoch-new", startsAtSeq: 0});
+  }
 
   assert.equal(eventEpochId({seq: 9, payload: {}}, "epoch-new", 10), "");
   assert.equal(eventEpochId({seq: 10, payload: {}}, "epoch-new", 10), "epoch-new");

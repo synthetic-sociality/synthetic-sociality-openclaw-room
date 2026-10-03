@@ -10,11 +10,13 @@ import {
   REASONS, appendRecord, buildRecord, describe, journalPath, ledgerReport, priorState, renderRecord,
   roomForState, seal, serverProof, stuckIntents,
 } from "./recovery.js";
+import {routingSummary, rotationRequestPath, rotationRequestPending, writeRotationRequest} from "./epoch-rotation.js";
 
 export const USAGE = [
   "Usage: openclaw-room-recovery list (--state FILE | --account ID)",
   "       openclaw-room-recovery close (--state FILE | --account ID) --seq N --reason REASON --evidence REF --operator NAME [--apply --confirm TOKEN]",
   `       REASON: ${REASONS.join(" | ")}; REF: cycle:<cycleId> or epoch:<epochId>`,
+  "       openclaw-room-recovery rotate-current-epoch-session (--state FILE | --account ID) [--yes]",
 ].join("\n");
 
 export async function runRecoveryCli(argv, {
@@ -22,8 +24,11 @@ export async function runRecoveryCli(argv, {
   makeClient = (state) => new RoomClient({baseUrl: state.baseUrl, credential: state.credential}),
 } = {}) {
   const [verb, ...rest] = argv;
-  if (!["list", "close"].includes(verb)) throw new Error(USAGE);
-  const {values} = parseArgs({args: rest, strict: true, options: {
+  if (!["list", "close", "rotate-current-epoch-session"].includes(verb)) throw new Error(USAGE);
+  const rotation = verb === "rotate-current-epoch-session";
+  const {values} = parseArgs({args: rest, strict: true, options: rotation ? {
+    state: {type: "string"}, account: {type: "string"}, yes: {type: "boolean"},
+  } : {
     state: {type: "string"}, account: {type: "string"}, seq: {type: "string"}, reason: {type: "string"},
     evidence: {type: "string"}, operator: {type: "string"}, apply: {type: "boolean"}, confirm: {type: "string"},
   }});
@@ -32,6 +37,17 @@ export async function runRecoveryCli(argv, {
   const state = await loadState(stateFile);
   write(`state: ${stateFile}`);
   write(`${state.roomId} membership ${state.membershipId}`);
+  if (rotation) {
+    // Contract P6-3: a dry run without --yes; with it, a request the
+    // connector consumes once at its next start (Hermes: the same command).
+    if (!values.yes) {
+      write(`Dry run. ${routingSummary(state, rotationRequestPending(stateFile))} With --yes, the epoch active at the next gateway start gets a fresh epoch session for this membership only; nothing else changes.`);
+      return 0;
+    }
+    writeRotationRequest(stateFile, state);
+    write(`Current-epoch session rotation authorized in ${rotationRequestPath(stateFile)}. Restart the OpenClaw gateway to apply it to this membership only.`);
+    return 0;
+  }
   if (verb === "list") {
     describe(ledgerReport(state), stuckIntents(state), write);
     const applied = Object.keys(state.appliedRecoveryClosures ?? {}).map(Number).sort((a, b) => a - b);

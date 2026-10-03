@@ -13,7 +13,7 @@ import {TOOL_SELECTION_UNAVAILABLE, secretIsolationEnforced, storeReachability} 
 
 const conformance = JSON.parse(await readFile(new URL("../conformance.json", import.meta.url), "utf8"));
 const contract = await readFile(new URL("../docs/delivery-lifecycle-contract-v1.md", import.meta.url), "utf8");
-const PLANNED_REASON = "OpenClaw translation in P5 (owner: Hermes first, OpenClaw next)";
+const PLANNED_REASON = "OpenClaw translation in a later release (owner: Hermes first, OpenClaw next)";
 const PKCS8_ED25519_PREFIX = Buffer.from("302e020100300506032b657004220420", "hex");
 const sha256 = (bytes) => createHash("sha256").update(bytes).digest("hex");
 
