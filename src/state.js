@@ -1,9 +1,44 @@
 import {randomUUID} from "node:crypto";
-import {open, readFile, rename, mkdir, chmod, lstat, link, unlink} from "node:fs/promises";
+import {open, readFile, rename, mkdir, chmod, lstat, link, unlink, copyFile} from "node:fs/promises";
+import {constants as fsConstants} from "node:fs";
 import {dirname, join, resolve} from "node:path";
 import {homedir} from "node:os";
 import {validateRenewalJournal} from "./credential-renewal.js";
 import {rememberSecrets} from "./secret-isolation.js";
+import {pruneTerminalIntents} from "./recovery.js";
+
+// Contract P3-1: the state revision that carries the receive ledger. The file
+// format `version` stays 1, so OpenClaw Room 0.2.60 still loads a migrated
+// file (it accepts unknown top-level fields and ignores them).
+export const STATE_REVISION = 2;
+const LEDGER_STATUSES = new Set(["received", "quarantined", "posted", "skipped", "failed", "cancelled", "superseded", "ignored"]);
+
+// Contract P3-1: upgrade an account state once, in place. The original bytes
+// are kept first as <file>.pre-0.2.61-<UTC>.bak (0600; not *.json, so account
+// discovery ignores it). Adds the receive ledger (from terminal evidence above
+// the cursor), the delivered frontier and the applied-closure map, applies the
+// terminal-intent retention, and changes nothing else. Idempotent.
+export async function migrateStateFile(path, state, {now = new Date()} = {}) {
+  if (state?.stateRevision === STATE_REVISION) return {state, migrated: false, backup: "", pruned: []};
+  const stamp = now.toISOString().replace(/[-:]/g, "").replace(/\.\d{3}Z$/, "Z");
+  const backup = `${path}.pre-0.2.61-${stamp}.bak`;
+  await copyFile(path, backup, fsConstants.COPYFILE_EXCL);
+  await chmod(backup, 0o600);
+  const next = structuredClone(state);
+  const ack = Number(next.cursor) || 0;
+  next.receiveLedger = {};
+  for (const [seq, evidence] of Object.entries(next.terminalEvidence ?? {})) {
+    if (Number(seq) > ack && typeof evidence?.sourceEventId === "string" && evidence.sourceEventId) {
+      next.receiveLedger[seq] = {eventId: evidence.sourceEventId, status: evidence.status};
+    }
+  }
+  next.deliveredCursor = Math.max(ack, ...Object.keys(next.receiveLedger).map(Number));
+  next.appliedRecoveryClosures ??= {};
+  next.stateRevision = STATE_REVISION;
+  const pruned = pruneTerminalIntents(next);
+  await saveState(path, next);
+  return {state: next, migrated: true, backup, pruned};
+}
 
 export function openClawStateDirectory({env = process.env, home = homedir()} = {}) {
   const configured = String(env.OPENCLAW_STATE_DIR ?? "").trim();
@@ -164,6 +199,21 @@ export function validateState(value) {
     || value.missedSources.some((item) => !item || typeof item.sourceEventId !== "string" || !item.sourceEventId
       || item.sourceEventId.length > 128 || !Number.isSafeInteger(item.sourceSeq) || item.sourceSeq < 0)
   )) throw new Error("Room missed sources are invalid");
+  // Contract P3-1: receive ledger, delivered frontier, applied closures, revision.
+  if (value.stateRevision !== undefined && value.stateRevision !== STATE_REVISION) throw new Error("Room state revision is invalid");
+  if (value.deliveredCursor !== undefined && (!Number.isSafeInteger(value.deliveredCursor) || value.deliveredCursor < 0)) {
+    throw new Error("Room delivered cursor is invalid");
+  }
+  if (value.receiveLedger !== undefined && (
+    !value.receiveLedger || typeof value.receiveLedger !== "object" || Array.isArray(value.receiveLedger)
+    || Object.entries(value.receiveLedger).some(([seq, entry]) => !/^[1-9]\d*$/.test(seq) || !entry || typeof entry !== "object"
+      || typeof entry.eventId !== "string" || !entry.eventId || entry.eventId.length > 128 || !LEDGER_STATUSES.has(entry.status))
+  )) throw new Error("Room receive ledger is invalid");
+  if (value.appliedRecoveryClosures !== undefined && (
+    !value.appliedRecoveryClosures || typeof value.appliedRecoveryClosures !== "object" || Array.isArray(value.appliedRecoveryClosures)
+    || Object.entries(value.appliedRecoveryClosures).some(([seq, entry]) => !/^[1-9]\d*$/.test(seq) || !entry
+      || typeof entry.recordDigest !== "string" || typeof entry.appliedAt !== "string")
+  )) throw new Error("Room applied recovery closures are invalid");
   // Contract P2c-2: at most one kept reply whose turn's authority ended.
   if (value.keptReply !== undefined) {
     const kept = value.keptReply;

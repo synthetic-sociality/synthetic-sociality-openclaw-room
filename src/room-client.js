@@ -220,6 +220,15 @@ export class RoomClient {
     });
   }
 
+  // Contract P3-4 proofs: canonical events of one epoch. An epoch-filtered read
+  // never advances the member's delivered seq on the Room.
+  readEpochEvents(session, after, epochId, signal) {
+    const query = new URLSearchParams({after: String(Math.max(0, after)), limit: "10", epochId: String(epochId)});
+    return this.request(`/rooms/${encodeURIComponent(session.roomId)}/events?${query}`, {
+      credential: session.credential, signal, expected: [200],
+    });
+  }
+
   acknowledge(session, acknowledgedSeq, signal) {
     return this.request(`/rooms/${encodeURIComponent(session.roomId)}/acknowledgements`, {
       method: "POST", body: {acknowledgedSeq}, credential: session.credential, signal, expected: [200],

@@ -37,6 +37,8 @@ export const REDACTED = "[redacted Room credential]";
 export const STORE_DIRECTORY_NAME = "synthetic-sociality-room";
 const SHELL_TOOLS = new Set(["exec", "bash", "process"]);
 const SEARCH_TOOLS = new Set(["grep", "find", "ls", "glob", "search", "list"]);
+// Contract P3-6: path arguments always resolved, whatever their shape.
+const KNOWN_PATH_KEYS = ["path", "file_path", "file", "cwd", "dir", "directory", "root", "workdir"];
 const RUNTIME_DENIES = new Set(["*", "group:runtime"]);
 const PATCH_FILE_LINE = /^\*\*\* (?:Update|Add|Delete) File: (.+)$|^\*\*\* Move to: (.+)$/gm;
 const SECRET_KEY = /credential|secret|token/i;
@@ -135,6 +137,14 @@ function* stringLeaves(value, depth = 0) {
 }
 
 function* pathCandidates(toolName, params, derivedPaths) {
+  // Contract P3-6: a known path argument is a path whatever its shape
+  // ("synthetic-sociality-room", "state.json").
+  for (const key of KNOWN_PATH_KEYS) {
+    const value = params && typeof params === "object" ? params[key] : undefined;
+    for (const item of Array.isArray(value) ? value : [value]) {
+      if (typeof item === "string" && item.trim() && item.length < 4096 && !item.includes("\n")) yield item.trim();
+    }
+  }
   for (const text of stringLeaves(params)) {
     const candidate = text.trim();
     if (candidate && candidate.length < 4096 && !candidate.includes("\n") && (

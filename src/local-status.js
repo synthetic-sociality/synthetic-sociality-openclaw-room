@@ -6,8 +6,8 @@
 // renewal secret, message body, reply text or prompt: every value is a fixed
 // code, an identifier, a number or a time.
 import {randomUUID} from "node:crypto";
-import {closeSync, fsyncSync, openSync, renameSync, statSync, unlinkSync, writeSync} from "node:fs";
-import {dirname, join} from "node:path";
+import {chmodSync, closeSync, existsSync, fsyncSync, mkdirSync, openSync, renameSync, statSync, unlinkSync, writeSync} from "node:fs";
+import {dirname, join, resolve} from "node:path";
 
 export const STATUS_SCHEMA = "synthetic-sociality-room-status-v1";
 const CONNECTION_STATES = new Set(["connecting", "connected", "reconnecting", "stopped"]);
@@ -62,7 +62,7 @@ export class LocalStatus {
   }
 
   // Update one Room entry; write only when something changed.
-  room(roomId, membershipId = "", {connection, errorCode, connected = false, gateWaitSeconds} = {}) {
+  room(roomId, membershipId = "", {connection, errorCode, connected = false, gateWaitSeconds, ledger} = {}) {
     if (!roomId) return;
     const entry = this.data.rooms[roomId] ??= {
       membershipId: String(membershipId ?? ""),
@@ -72,6 +72,10 @@ export class LocalStatus {
       lastErrorAt: null,
       lastGateWaitSeconds: 0,
       lastGateWaitAt: null,
+      acknowledgedSeq: 0,
+      holeSeqs: [],
+      quarantinedSeqs: [],
+      ledgerCode: "",
     };
     const before = JSON.stringify(entry);
     if (membershipId) entry.membershipId = String(membershipId);
@@ -83,6 +87,13 @@ export class LocalStatus {
     if (errorCode !== undefined) {
       entry.lastErrorCode = code(errorCode);
       if (entry.lastErrorCode) entry.lastErrorAt = now();
+    }
+    if (ledger) {
+      // Contract P3-3: holes and quarantines as codes and seqs only.
+      entry.acknowledgedSeq = Number(ledger.acknowledgedSeq) || 0;
+      entry.holeSeqs = (ledger.holeSeqs ?? []).map(Number).slice(0, 32);
+      entry.quarantinedSeqs = (ledger.quarantinedSeqs ?? []).map(Number).slice(0, 32);
+      entry.ledgerCode = code(ledger.ledgerCode ?? "");
     }
     if (gateWaitSeconds !== undefined) {
       entry.lastGateWaitSeconds = Math.round(Math.max(0, Number(gateWaitSeconds) || 0) * 10) / 10;
@@ -97,6 +108,13 @@ export class LocalStatus {
     const directory = dirname(this.path);
     const temporary = join(directory, `.status-${randomUUID()}.tmp`);
     try {
+      // Contract P3-5: create the state's directory 0700 when it is missing,
+      // never a filesystem root or a top-level directory (P2a-5).
+      if (!existsSync(directory)) {
+        if (resolve(directory).split(/[\\/]+/u).filter(Boolean).length < 2) throw Object.assign(new Error("top-level"), {code: "EPERM"});
+        mkdirSync(directory, {recursive: true, mode: 0o700});
+        chmodSync(directory, 0o700);
+      }
       if (!statSync(directory).isDirectory()) return false;
       const fd = openSync(temporary, "wx", 0o600);
       try {

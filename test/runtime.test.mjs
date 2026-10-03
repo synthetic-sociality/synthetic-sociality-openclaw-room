@@ -432,6 +432,8 @@ test("receive-boundary acknowledgement precedes coordination and model dispatch"
     deliveryIntents: {}, terminalEvidence: {},
   };
   runtime.connectorSession = {sessionId: "session-1"};
+  // This partial state is never saved (the P3-1 ledger write would persist it).
+  runtime.persistState = async () => {};
   runtime.client = {
     readEvents: async () => ({
       activeEpochId: "epoch-1", activeEpochStartsAtSeq: 1,

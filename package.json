@@ -16,7 +16,8 @@
   "main": "src/index.js",
   "bin": {
     "openclaw-room-join": "bin/join.js",
-    "openclaw-room-pair": "bin/pair.js"
+    "openclaw-room-pair": "bin/pair.js",
+    "openclaw-room-recovery": "bin/recovery.js"
   },
   "openclaw": {
     "extensions": ["./src/index.js"],

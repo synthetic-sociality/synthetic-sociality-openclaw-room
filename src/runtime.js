@@ -2,12 +2,16 @@ import {createHash, randomUUID} from "node:crypto";
 import {hostname} from "node:os";
 import {dirname, join} from "node:path";
 import {RoomAPIError, RoomClient, roomErrorDiagnostic} from "./room-client.js";
-import {loadState, saveNewState, saveState} from "./state.js";
+import {loadState, migrateStateFile, saveNewState, saveState} from "./state.js";
 import {activateRoomChannel} from "./activation.js";
 import {ROOM_CONNECTOR_PROVENANCE} from "./release-provenance.js";
 import {renewCredential} from "./credential-renewal.js";
 import {speakerLabel, speakerName} from "./speaker.js";
 import {rememberSecrets} from "./secret-isolation.js";
+import {
+  CLOSURE_EVIDENCE_PREFIX, RecoveryRefused, closuresFor, journalPath, ledgerReport, priorState,
+  pruneTerminalIntents, readRecords, roomForState, serverProof,
+} from "./recovery.js";
 
 export const OPEN_EXCHANGE_PREAMBLE_VERSION = "Open Exchange – Room Behaviour Preamble v1";
 // Delivery contract P1a: the connector holds no behavioural text. A Room may
@@ -489,6 +493,13 @@ export class OpenClawRoomRuntime {
     signal?.throwIfAborted();
     if (this.closed || this.account.enabled === false || this.state.enabled === false || this.state.revoked === true) throw new Error("Room account is disabled, revoked or closed");
     if (this.account.baseUrl && this.state.baseUrl !== this.account.baseUrl) throw new Error("Configured Room origin does not match private reconnect state");
+    // Contract P3-1: upgrade a pre-ledger state once, in place, keeping the
+    // original bytes beside it.
+    const migration = await migrateStateFile(this.account.stateFile, this.state);
+    this.state = migration.state;
+    if (migration.migrated) {
+      this.logger?.info?.(`Room state upgraded to revision 2 (receive ledger); original kept as ${migration.backup.split("/").at(-1)}; ${migration.pruned.length} terminal delivery intents pruned`);
+    }
     this.client = new RoomClient({baseUrl: this.state.baseUrl, credential: this.state.credential, fetchImpl: this.fetchImpl});
     rememberSecrets(this.state);
     this.reportStatus({connection: "connecting"});
@@ -621,6 +632,7 @@ export class OpenClawRoomRuntime {
     let scanCursor = this.state.cursor;
     while (!signal.aborted && !this.closed) {
       await this.renewAccess(signal);
+      await this.applyRecoveryClosures(signal);
       const page = await this.readEventsResilient(Math.max(scanCursor, this.state.cursor), signal);
       const pageEpoch = validateActiveEpochPage(page);
       const pageActiveEpochId = pageEpoch.id;
@@ -639,10 +651,12 @@ export class OpenClawRoomRuntime {
       // presence here prevents a failed timer task from leaving a locally
       // green but remotely expired connector.
       await this.maintainPresenceResilient(signal);
+      this.reportLedger();
       for (const event of page.events ?? []) {
         if (event.seq <= this.state.cursor) continue;
         if (this.isQuarantinedEvent(event)) {
           // No replay, superseding, deletion or fabricated terminal receipt.
+          await this.markLedger(event, "quarantined");
           if (this.pendingEvent?.id === event.id) this.pendingEvent = null;
           scanCursor = event.seq;
           continue;
@@ -665,6 +679,10 @@ export class OpenClawRoomRuntime {
           canonicalPriorEpochId,
         );
         if (historical) this.assertHistoricalIntentSafety(event);
+        // Contract P3-1: a durable ledger entry before the event is processed
+        // (after its canonical checks, so a malformed event still fails closed
+        // without any state change).
+        await this.recordReceived([event]);
         const existingTerminalEvidence = this.terminalEvidenceFor(event);
         if (await this.recoverPostedEvidence(event)) {
           this.pendingEvent = event;
@@ -1374,6 +1392,11 @@ export class OpenClawRoomRuntime {
     if (!validTerminalEvidence(evidence)) throw new Error("Room terminal evidence is invalid");
     this.state.terminalEvidence ??= {};
     this.state.terminalEvidence[String(event.seq)] = evidence;
+    // Contract P3-1: the ledger entry ends in its terminal outcome.
+    if (event.seq > this.state.cursor) {
+      this.state.receiveLedger ??= {};
+      this.state.receiveLedger[String(event.seq)] = {eventId: String(event.id), status};
+    }
     await this.persistState();
     return evidence;
   }
@@ -1550,8 +1573,100 @@ export class OpenClawRoomRuntime {
     this.state.terminalEvidence = Object.fromEntries(
       Object.entries(this.state.terminalEvidence ?? {}).filter(([seq]) => Number(seq) > authoritative),
     );
+    this.state.receiveLedger = Object.fromEntries(
+      Object.entries(this.state.receiveLedger ?? {}).filter(([seq]) => Number(seq) > authoritative),
+    );
+    // Contract P3-2: terminal intents beyond the newest 32 are pruned.
+    const pruned = pruneTerminalIntents(this.state);
+    if (pruned.length) this.logger?.info?.(`Room pruned ${pruned.length} terminal delivery intents`);
     await saveState(this.account.stateFile, this.state);
     if (this.pendingEvent && (this.pendingEvent.seq <= authoritative || this.pendingEvent.id === event.id)) this.pendingEvent = null;
+  }
+
+  // Contract P3-1: ledger entries for a page, persisted before processing.
+  async recordReceived(events) {
+    this.state.receiveLedger ??= {};
+    let changed = false;
+    for (const event of Array.isArray(events) ? events : []) {
+      if (!Number.isSafeInteger(event?.seq) || event.seq <= this.state.cursor || !event.id) continue;
+      const key = String(event.seq);
+      if (!this.state.receiveLedger[key]) {
+        const evidence = this.terminalEvidenceFor(event);
+        this.state.receiveLedger[key] = {eventId: String(event.id),
+          status: evidence?.status ?? (this.isQuarantinedEvent(event) ? "quarantined" : "received")};
+        changed = true;
+      }
+      if (event.seq > (Number(this.state.deliveredCursor) || 0)) {
+        this.state.deliveredCursor = event.seq;
+        changed = true;
+      }
+    }
+    if (changed) await this.persistState();
+  }
+
+  async markLedger(event, status) {
+    if (!Number.isSafeInteger(event?.seq) || event.seq <= this.state.cursor) return;
+    const key = String(event.seq);
+    if (this.state.receiveLedger?.[key]?.status === status) return;
+    this.state.receiveLedger ??= {};
+    this.state.receiveLedger[key] = {eventId: String(event.id), status};
+    await this.persistState();
+  }
+
+  // Contract P3-3: holes and held quarantines as status codes; each hole is
+  // logged once. Never closes anything.
+  reportLedger() {
+    let report;
+    try {
+      report = ledgerReport(this.state);
+    } catch {
+      return null;
+    }
+    this.loggedHoles ??= new Set();
+    for (const seq of report.holeSeqs) {
+      if (this.loggedHoles.has(seq)) continue;
+      this.loggedHoles.add(seq);
+      this.logger?.warn?.(`Room ${this.state.roomId} ack_hole seq ${seq}: no ledger entry and no evidence above the acknowledgement ${report.acknowledgedSeq}; only an audited recovery close can close it`);
+    }
+    this.reportStatus({ledger: report});
+    return report;
+  }
+
+  // Contract P3-4: apply sealed audit records through the normal ack path,
+  // after re-checking the Room's proof. A record that fails is logged once and
+  // left unapplied; nothing else changes. The quarantined intent is kept.
+  async applyRecoveryClosures(signal) {
+    const stateFile = this.account?.stateFile;
+    if (!stateFile || !this.state) return;
+    let records;
+    try {
+      records = closuresFor(readRecords(journalPath(stateFile)), this.state.roomId, this.state.membershipId, this.state.clientInstanceId);
+    } catch {
+      return;
+    }
+    this.refusedClosures ??= new Set();
+    for (const seq of [...records.keys()].sort((a, b) => a - b)) {
+      const record = records.get(seq);
+      const marker = `${seq}:${record.recordDigest}`;
+      if (seq <= this.state.cursor || this.state.appliedRecoveryClosures?.[String(seq)] || this.refusedClosures.has(marker)) continue;
+      try {
+        priorState(this.state, seq);
+        const proven = await serverProof(roomForState(this.client, this.state, signal), this.state.membershipId, seq, record.reason, record.evidenceRef);
+        if (proven.eventId !== record.eventId) throw new RecoveryRefused("evidence_mismatch", "the Room's event differs from the record");
+      } catch (error) {
+        if (signal?.aborted) throw error;
+        this.refusedClosures.add(marker);
+        this.logger?.warn?.(`Room recovery closure for seq ${seq} not applied: ${error?.code || "unavailable"}`);
+        continue;
+      }
+      const event = {id: record.eventId, seq};
+      await this.recordTerminalEvidence(event, "ignored", {reason: `${CLOSURE_EVIDENCE_PREFIX}${record.reason}`});
+      this.state.appliedRecoveryClosures ??= {};
+      this.state.appliedRecoveryClosures[String(seq)] = {recordDigest: record.recordDigest, appliedAt: new Date().toISOString()};
+      await this.persistState();
+      await this.ackEvent(event);
+      this.logger?.warn?.(`Room recovery closure applied: seq ${seq}, reason ${record.reason}, operator ${record.operator}`);
+    }
   }
 
   postNumberIndex() {

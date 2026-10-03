@@ -1,7 +1,7 @@
 import {defineChannelPluginEntry} from "openclaw/plugin-sdk/channel-core";
 import {defineChannelMessageAdapter} from "openclaw/plugin-sdk/channel-message";
 import {buildChannelInboundEventContext} from "openclaw/plugin-sdk/channel-inbound";
-import {dirname, join} from "node:path";
+import {dirname, join, resolve} from "node:path";
 import {loadState, openClawStateDirectory} from "./state.js";
 import {registerRoomCommands} from "./commands.js";
 import {markChannelActive, markChannelInactive, registerPresenceFallback} from "./presence-fallback.js";
@@ -87,8 +87,22 @@ export function roomStoreDirectories(cfg) {
 }
 
 // Contract P2c-4: one status file per installation.
-export function roomLocalStatus(logger) {
-  return localStatusFor(join(roomStoreRoot(), "status.json"), {
+// Contract P3-5: next to the state actually in use: the parent of the first
+// configured account's state directory (<...>/synthetic-sociality-room for
+// .../accounts/<id>.json), else the plugin root under OPENCLAW_STATE_DIR. On
+// Aura the accounts live outside OPENCLAW_STATE_DIR (2026-10-02 ENOENT).
+export function roomStatusPath(cfg) {
+  try {
+    const account = resolvedRoomAccounts(cfg ?? {}).find((item) => item?.stateFile);
+    if (account) return join(dirname(dirname(resolve(account.stateFile))), "status.json");
+  } catch {
+    // An unreadable configuration falls back to the plugin root.
+  }
+  return join(roomStoreRoot(), "status.json");
+}
+
+export function roomLocalStatus(logger, cfg) {
+  return localStatusFor(roomStatusPath(cfg), {
     plugin: "openclaw", version: ROOM_CONNECTOR_PROVENANCE.version, hostLabel: HOST_LABEL, logger,
   });
 }
@@ -208,7 +222,7 @@ export function createRoomChannel({makeClient}) {
         const ownership = claimRuntimeOwnership(runtimeOwners, ctx.account);
         let client;
         let registered = false;
-        const localStatus = roomLocalStatus(ctx.log);
+        const localStatus = roomLocalStatus(ctx.log, ctx.cfg);
         try {
           // Contract P2c-1: report whether the agent's tools can reach the
           // store that holds the Room credential; refuse to start only when
@@ -457,12 +471,12 @@ export function createRoomChannel({makeClient}) {
       // stop marks the plugin unloaded. Only the gateway's full registration,
       // never a CLI discovery pass.
       const gatewayLoad = api?.registrationMode === "full";
-      if (gatewayLoad) roomLocalStatus(api?.logger).setLoaded(true);
+      if (gatewayLoad) roomLocalStatus(api?.logger, api?.config).setLoaded(true);
       // Contract P2c-1: fence the store in every session, and scrub results.
       if (typeof api?.on === "function") {
         api.on("before_tool_call", roomToolCallPolicy(api), {priority: 1000});
         api.on("tool_result_persist", roomToolResultScrub);
-        if (gatewayLoad) api.on("gateway_stop", () => { roomLocalStatus(api?.logger).setLoaded(false); });
+        if (gatewayLoad) api.on("gateway_stop", () => { roomLocalStatus(api?.logger, api?.runtime?.config?.current?.() ?? api?.config).setLoaded(false); });
       } else {
         api?.logger?.warn?.("Room connector: this OpenClaw host offers no tool hooks; the start gate still applies");
       }
