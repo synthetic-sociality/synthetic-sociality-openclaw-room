@@ -461,6 +461,22 @@ test("P3-07 a recovery closure is refused without the Room's proof that the even
     assert.deepEqual([room.acks, other.state.appliedRecoveryClosures, other.state.cursor], [[], {}, 378], field);
   }
 
+  // P3 final review: a mark counts as recorded only for its own record. A mark
+  // with another digest plus a valid record runs the proof again.
+  for (const [cycleState, applied] of [["interrupted", true], ["running", false]]) {
+    const staleFile = await account({...paulaState(), appliedRecoveryClosures: {"379": {recordDigest: "0".repeat(64), appliedAt: "2026-10-03T00:00:00Z"}}}, `stale-${cycleState}`);
+    const current = recovery.seal(recovery.buildRecord({connector: "openclaw/test", roomId: "room-1", membershipId: "member-1", clientInstanceId: "client-1",
+      seq: 379, reason: "cycle_terminal", evidenceRef: `cycle:${CYCLE}`, proven,
+      prior: {kind: "quarantine", intentKey: "ev379:final", lastErrorCode: "cycle_superseded"}, operator: "o"}));
+    recovery.appendRecord(recovery.journalPath(staleFile), current);
+    const staleRoom = proofRoom({cycleState});
+    const staleRuntime = runtimeFor(await loadState(staleFile), staleFile, staleRoom);
+    await staleRuntime.applyRecoveryClosures();
+    assert.ok(staleRoom.reads.some((read) => Array.isArray(read) && read[0] === "cycle"), `${cycleState}: the proof was checked again`);
+    if (applied) assert.deepEqual([staleRoom.acks, staleRuntime.state.appliedRecoveryClosures["379"].recordDigest], [[382], current.recordDigest]);
+    else assert.deepEqual([staleRoom.acks, staleRuntime.state.cursor], [[], 378]);
+  }
+
   // OP-12 P3 F3: a transient error is retried at the next iteration (logged
   // once); a final Room error retires only that record (logged once).
   const sealed = recovery.seal(recovery.buildRecord({connector: "openclaw/test", roomId: "room-1", membershipId: "member-1",

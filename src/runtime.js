@@ -1653,7 +1653,10 @@ export class OpenClawRoomRuntime {
     for (const seq of [...records.keys()].sort((a, b) => a - b)) {
       const record = records.get(seq);
       const marker = `${seq}:${record.recordDigest}`;
-      const recorded = Boolean(this.state.appliedRecoveryClosures?.[String(seq)]);
+      // A mark counts only for the record it was made for: a mark with a
+      // different digest (another record for this seq) is not recorded, so the
+      // Room's proof is checked again for the current record.
+      const recorded = this.state.appliedRecoveryClosures?.[String(seq)]?.recordDigest === record.recordDigest;
       if (seq <= this.state.cursor || this.refusedClosures.has(marker)) continue;
       const event = {id: record.eventId, seq};
       try {
