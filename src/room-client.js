@@ -62,8 +62,29 @@ function validationFieldPaths(body) {
   return [...new Set(candidates.map(normalizeFieldPath).filter(Boolean))].slice(0, 32);
 }
 
+// Contract P2c-3a: a bounded Retry-After, in seconds (a delta or an HTTP
+// date), at most 120 s; 0 when absent or unreadable (Hermes parse_retry_after).
+export const RETRY_AFTER_MAXIMUM_SECONDS = 120;
+export function parseRetryAfter(raw, now = Date.now()) {
+  const value = String(raw ?? "").trim();
+  if (!value) return 0;
+  let seconds = /^[+-]?(\d+(\.\d*)?|\.\d+)$/u.test(value) ? Number(value) : (Date.parse(value) - now) / 1000;
+  if (!Number.isFinite(seconds)) return 0;
+  seconds = Math.max(0, seconds);
+  return Math.min(RETRY_AFTER_MAXIMUM_SECONDS, seconds);
+}
+
+// A response with the expected status whose body is not JSON (an old
+// deployment's HTML fallback); retryable under P2c-3a where a loop retries.
+export class RoomResponseError extends Error {
+  constructor(message = "Room API returned malformed JSON") {
+    super(message);
+    this.name = "RoomResponseError";
+  }
+}
+
 export class RoomAPIError extends Error {
-  constructor(status, body) {
+  constructor(status, body, {retryAfter = 0} = {}) {
     const code = typeof body?.code === "string" && SAFE_API_CODES.has(body.code) ? body.code : "";
     const fieldPaths = validationFieldPaths(body);
     const diagnostics = [`status=${status}`, ...(code ? [`code=${code}`] : []), ...(fieldPaths.length ? [`fields=${fieldPaths.join(",")}`] : [])];
@@ -73,6 +94,8 @@ export class RoomAPIError extends Error {
     this.code = code;
     this.fieldPaths = fieldPaths;
     this.retryable = status === 429 || status >= 500 || body?.retryable === true;
+    // Contract P2c-3a: seconds from the response's Retry-After, at most 120.
+    this.retryAfter = Math.max(0, Math.min(RETRY_AFTER_MAXIMUM_SECONDS, Number(retryAfter) || 0));
     // Contract L1-18: the shape of any server code (as Hermes' _REFUSAL_CODE),
     // so an unknown cycle-start refusal is still terminal for its source.
     this.refusalCode = typeof body?.code === "string" && /^[a-z][a-z0-9_]{0,63}$/u.test(body.code) ? body.code : "";
@@ -111,10 +134,19 @@ export class RoomClient {
     });
     const raw = await readBounded(response, MAX_RESPONSE_BYTES);
     let decoded = {};
+    const accepted = expected.includes(response.status);
     if (raw) {
-      try { decoded = JSON.parse(raw); } catch { throw new Error("Room API returned malformed JSON"); }
+      try {
+        decoded = JSON.parse(raw);
+      } catch {
+        // A proxy's HTML error page keeps its status (P2c-3a: a 502 is a 502).
+        if (accepted) throw new RoomResponseError();
+        decoded = {};
+      }
     }
-    if (!expected.includes(response.status)) throw new RoomAPIError(response.status, decoded);
+    if (!accepted) {
+      throw new RoomAPIError(response.status, decoded, {retryAfter: parseRetryAfter(response.headers?.get?.("retry-after"))});
+    }
     return decoded;
   }
 

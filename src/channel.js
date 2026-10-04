@@ -19,7 +19,7 @@ import {
   statusErrorCode,
 } from "./runtime.js";
 import {BLOCK_MESSAGE, REFUSAL_CODE, agentWorkspace, scrubDeep, scrubbingLogger, secretIsolationEnforced, storeReachability, toolCallBlock} from "./secret-isolation.js";
-import {localStatusFor} from "./local-status.js";
+import {WEB_READ_TOOL_NAMES, localStatusFor} from "./local-status.js";
 import {ROOM_CONNECTOR_PROVENANCE} from "./release-provenance.js";
 import {
   roomReplyDeliveryPolicy,
@@ -131,6 +131,11 @@ export function roomToolCallPolicy(api) {
   return (event, ctx) => {
     try {
       const cfg = api?.runtime?.config?.current?.() ?? api?.config;
+      // Contract P2c-6: a web reading tool the host offered in a Room turn
+      // (the host's session key is agent:<agent>:<channel>:<kind>:<peer>).
+      if (String(ctx?.sessionKey ?? "").split(":")[2] === ID && WEB_READ_TOOL_NAMES.includes(event?.toolName)) {
+        try { roomLocalStatus(api?.logger, cfg).noteWebReadTool(event.toolName); } catch {}
+      }
       const stateDir = openClawStateDirectory();
       // Relative paths resolve where the tool runs: the hook context's
       // workspace or cwd when the host provides one (2026.7.1-2 does not),
@@ -227,6 +232,7 @@ export function createRoomChannel({makeClient}) {
         const ownership = claimRuntimeOwnership(runtimeOwners, ctx.account);
         let client;
         let registered = false;
+        let lastHostRunEndedAt = 0;
         const localStatus = roomLocalStatus(ctx.log, ctx.cfg);
         try {
           // Contract P2c-1: report whether the agent's tools can reach the
@@ -284,7 +290,10 @@ export function createRoomChannel({makeClient}) {
             const hostStartedAt = Date.now();
             const sinceRoomEvent = Number.isFinite(event.occurredAt) ? Math.max(0, (hostStartedAt - event.occurredAt) / 1000) : 0;
             ctx.log?.info?.(`[${ctx.accountId}] Room ${event.roomId} seq ${hostSeq} dispatched to the host after waiting ${sinceRoomEvent.toFixed(1)}s since the Room event; later Room events wait for this run`);
-            localStatus.room(String(event.roomId ?? ""), "", {gateWaitSeconds: sinceRoomEvent});
+            // P2c-4 (ISSUE-023): the coded reason when the event arrived while an
+            // earlier host run of this account still held the session.
+            const waitedOnHost = Number.isFinite(event.occurredAt) && event.occurredAt < lastHostRunEndedAt;
+            localStatus.room(String(event.roomId ?? ""), "", {gateWaitSeconds: sinceRoomEvent, gateWaitReason: waitedOnHost ? "host_run_busy" : ""});
             try {
               await runtime.inbound.run({
               channel: ID,
@@ -423,6 +432,7 @@ export function createRoomChannel({makeClient}) {
               });
               handlerCompleted = true;
             } finally {
+              lastHostRunEndedAt = Date.now();
               ctx.log?.info?.(`[${ctx.accountId}] Room ${event.roomId} seq ${hostSeq} host run ended after ${((Date.now() - hostStartedAt) / 1000).toFixed(1)}s`);
               // A parked reply replays its exact frozen post and keeps its attempt.
               if (event.cycleAttempt && !cycleSettled && deliveryOutcome !== "delivery_pending") {

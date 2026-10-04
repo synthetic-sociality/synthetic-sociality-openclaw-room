@@ -27,6 +27,35 @@ labels it as untrusted uploaded content, and never downloads or executes raw
 document bytes. An exact artifact read also invokes the Room server's supported
 deterministic text backfill for older pending versions.
 
+Version 0.2.65 is parity release P7a with Hermes 1.0.82 ("Stay connected",
+contract P2c-3a, P2c-3b, P2c-3c, P2c-6 and the P2c-4 status additions, shared
+cases P7a-01 to P7a-09):
+
+- One reconnect schedule (P2c-3a): registration, heartbeat, event reads and
+  the enrollment listing retry after 1, 2, 4, 8, then every 15 s (each wait
+  80 to 100 % of that; the cap was 60 s), with no attempt limit. The start
+  path and an event page with invalid active epoch metadata are now retried
+  inside the connector: a Room outage no longer ends the channel, so the
+  host's "auto-restart attempt N/10" schedule (which gives up after attempt
+  10) is not used for it. A `Retry-After` on a 5xx is honoured up to 15 s, on a
+  429 up to 120 s (new here; Hermes already did). A proxy's HTML error page
+  keeps its HTTP status instead of becoming "malformed JSON".
+- Muted membership (P2c-3b): `connector_not_active` on the enrollment listing
+  of a muted membership no longer re-registers every heartbeat; the Room shows
+  `connection: inactive`, the listing pauses, and the Room state is re-read at
+  most every 60 s until the membership is active again.
+- Attempt renewal (P2c-3c, ISSUE-023): a transient failure is retried after 1,
+  2, 4, then 5 s instead of a flat 5 s, never past the lease.
+- Status (P2c-4, additive; schema name unchanged): per Room
+  `lastReconnectedAt`, `lastOutageSeconds`, `lastGateWaitReason`
+  (`host_run_busy`); per installation `webRead` and `webReadTools` (P2c-6).
+  OpenClaw 2026.7.1-2 gives a channel plugin no resolved tool list, so
+  `webRead` is `unknown` until the host's tool-call hook names a web reading
+  tool in a Room turn. The plugin adds and removes no web tool.
+
+No state migration and nothing new on disk: 0.2.65 loads a 0.2.64 state file
+unchanged.
+
 Version 0.2.64 is parity release P6 with Hermes 1.0.80 ("Clean start and
 bounds", contract section P6, shared cases P6-01 to P6-10; P5-2 amended,
 shared cases P5-02 and P5-03):

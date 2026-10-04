@@ -10,7 +10,12 @@ import {chmodSync, closeSync, existsSync, fsyncSync, mkdirSync, openSync, rename
 import {dirname, join, resolve} from "node:path";
 
 export const STATUS_SCHEMA = "synthetic-sociality-room-status-v1";
-const CONNECTION_STATES = new Set(["connecting", "connected", "reconnecting", "stopped"]);
+const CONNECTION_STATES = new Set(["connecting", "connected", "reconnecting", "inactive", "stopped"]);
+// Contract P2c-6: the tool names that count as web reading (Hermes
+// WEB_READ_TOOL_NAMES, the same list).
+export const WEB_READ_TOOL_NAMES = Object.freeze(["browser", "browser_navigate", "web_extract", "web_fetch", "web_search"]);
+// Contract P2c-4 (ISSUE-023): why a dispatch waited on the host.
+const GATE_WAIT_REASONS = new Set(["", "host_run_busy", "host_session_unobservable"]);
 const CODE = /^[A-Za-z0-9_.:-]{1,64}$/;
 
 function now() {
@@ -40,8 +45,26 @@ export class LocalStatus {
       secretStore: "isolated",
       secretStoreReasons: [],
       secretIsolationEnforced: false,
+      webRead: "unknown",
+      webReadTools: [],
       rooms: {},
     };
+    // Contract P2c-3a: when the current outage of a Room began (process
+    // memory only; never written).
+    this.outageStarted = new Map();
+    // Contract P2c-3b: Rooms whose membership is inactive (muted).
+    this.inactive = new Set();
+  }
+
+  // Contract P2c-6: a web reading tool the host itself named in a Room turn.
+  // OpenClaw 2026.7.1-2 gives a channel plugin no resolved tool list, so the
+  // value stays "unknown" until such a call; it is never "unavailable" here.
+  noteWebReadTool(toolName) {
+    const name = String(toolName ?? "");
+    if (!WEB_READ_TOOL_NAMES.includes(name) || this.data.webReadTools.includes(name)) return;
+    this.data.webRead = "available";
+    this.data.webReadTools = [...this.data.webReadTools, name].sort();
+    this.write();
   }
 
   snapshot() {
@@ -62,7 +85,8 @@ export class LocalStatus {
   }
 
   // Update one Room entry; write only when something changed.
-  room(roomId, membershipId = "", {connection, errorCode, connected = false, gateWaitSeconds, ledger} = {}) {
+  room(roomId, membershipId = "", {connection, errorCode, connected = false, registered = false, inactive,
+    gateWaitSeconds, gateWaitReason, ledger} = {}) {
     if (!roomId) return;
     const entry = this.data.rooms[roomId] ??= {
       membershipId: String(membershipId ?? ""),
@@ -72,6 +96,9 @@ export class LocalStatus {
       lastErrorAt: null,
       lastGateWaitSeconds: 0,
       lastGateWaitAt: null,
+      lastGateWaitReason: "",
+      lastReconnectedAt: null,
+      lastOutageSeconds: 0,
       acknowledgedSeq: 0,
       holeSeqs: [],
       quarantinedSeqs: [],
@@ -79,11 +106,28 @@ export class LocalStatus {
     };
     const before = JSON.stringify(entry);
     if (membershipId) entry.membershipId = String(membershipId);
+    const key = String(roomId);
+    if (inactive === true) this.inactive.add(key);
+    else if (inactive === false) this.inactive.delete(key);
     if (CONNECTION_STATES.has(connection)) entry.connection = connection;
+    // Contract P2c-3a: the first failure of an outage starts it.
+    if (connection === "reconnecting" && !this.outageStarted.has(key)) this.outageStarted.set(key, performance.now());
+    else if (connection === "stopped" || connection === "inactive") this.outageStarted.delete(key);
     if (connected) {
       entry.connection = "connected";
       entry.lastConnectedAt = now();
+      const started = this.outageStarted.get(key);
+      this.outageStarted.delete(key);
+      if (started !== undefined && registered) {
+        // Re-established by an accepted registration after a failure; a
+        // heartbeat that survived ends the outage only.
+        entry.lastReconnectedAt = entry.lastConnectedAt;
+        entry.lastOutageSeconds = Math.round(Math.max(0, performance.now() - started) / 100) / 10;
+      }
     }
+    // Contract P2c-3b: a muted membership stays inactive while its session
+    // and heartbeat continue.
+    if (this.inactive.has(key)) entry.connection = "inactive";
     if (errorCode !== undefined) {
       entry.lastErrorCode = code(errorCode);
       if (entry.lastErrorCode) entry.lastErrorAt = now();
@@ -98,6 +142,7 @@ export class LocalStatus {
     if (gateWaitSeconds !== undefined) {
       entry.lastGateWaitSeconds = Math.round(Math.max(0, Number(gateWaitSeconds) || 0) * 10) / 10;
       entry.lastGateWaitAt = now();
+      entry.lastGateWaitReason = GATE_WAIT_REASONS.has(gateWaitReason) ? gateWaitReason : "";
     }
     if (JSON.stringify(entry) !== before) this.write();
   }
