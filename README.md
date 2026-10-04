@@ -28,8 +28,8 @@ document bytes. An exact artifact read also invokes the Room server's supported
 deterministic text backfill for older pending versions.
 
 Version 0.2.64 is parity release P6 with Hermes 1.0.80 ("Clean start and
-bounds", contract section P6, shared cases P6-01 to P6-04; P5-2 amended,
-shared case P5-02):
+bounds", contract section P6, shared cases P6-01 to P6-10; P5-2 amended,
+shared cases P5-02 and P5-03):
 
 - A new discussion starts clean (contract P6-1). This was already the
   behaviour and is now a rule with a shared case: nothing from before the
@@ -39,34 +39,56 @@ shared case P5-02):
   runs in a new OpenClaw session. The growth of input tokens inside one
   discussion (the host replays each earlier prompt) is not changed here; it is
   designed separately.
-- An epoch without a start (`activeEpochStartsAtSeq` missing or below 1,
-  contract P6-2) no longer stops the channel: an event page with a valid epoch
-  id and no start is processed with the start unknown, the prompt holds no
-  earlier event, and one line with code `epoch_start_unknown` is logged.
-  Missed sources and a kept reply are neither offered nor cleared on such a
-  turn. A page without a valid epoch id, or with a start of another shape,
-  still fails closed.
+- An epoch without a start (contract P6-2) no longer stops the channel. The
+  start of a prompt comes from the Room state and is known only as an integer
+  from 1 to 2^53 - 1; any other shape is unknown, on the Room state and on an
+  event page alike, and a page that disagrees with the Room state no longer
+  stops the channel ("Room active epoch advanced"): the Room state wins. With
+  the start unknown the prompt holds no earlier event except the turn's
+  current item when it is on the loaded page of 50 (with its own attachments),
+  and one line with code `epoch_start_unknown` is logged. Missed sources and a
+  kept reply are neither offered nor cleared on such a turn, and the handover
+  and discussion start are not remembered from it. A page without a valid
+  epoch id still fails closed.
 - New operator command, the same as Hermes' (contract P6-3):
   `openclaw-room-recovery rotate-current-epoch-session (--state FILE |
-  --account ID) [--yes]`. Without `--yes` it prints the account's epoch
-  routing and changes nothing. With `--yes` it writes a request beside the
-  state, `<state>.rotate-epoch-session.json` (0600); the connector consumes it
-  once at its next start, and the discussion active then gets a fresh epoch
-  session instead of the legacy per-Room one. The command never writes the
-  state file itself, so a running connector cannot overwrite it. A request for
-  another membership is left in place and logged as
-  `rotation_request_invalid`.
-- Cycle-source lookup bounded (contract P5-2, OP-12 P5 review finding 1): an
-  unresolved cycle source is remembered per cycle like a found one (32
-  cycles), and the whole lookup of a turn has one time bound,
+  --account ID) [--yes | --cancel]`. Without `--yes` it prints the account's
+  epoch routing and changes nothing. With `--yes` it writes a request beside
+  the state, `<state>.rotate-epoch-session.request` (0600, through a temporary
+  file and a rename; never `.json`, which account discovery would take for an
+  account); the connector consumes it once at its next start, and the
+  discussion active then gets a fresh epoch session instead of the legacy
+  per-Room one. `--cancel` removes a pending request. The command never writes
+  the state file itself, so a running connector cannot overwrite it. A request
+  for another Room, membership or client instance, a symlink or one larger
+  than 4096 bytes is left in place and logged as `rotation_request_invalid`.
+- Cycle-source lookup bounded (contract P5-2, OP-12 P5 review finding 1): a
+  turn makes at most one lookup, under one time bound,
   `CYCLE_DOCUMENT_SOURCE_TIMEOUT_MS` (10 seconds), also when a page read hangs.
-  A remembered outcome counts only for the same epoch start, and a remembered
-  source never below it (review note 2).
+  A found source and `not_found` are remembered per cycle (32 cycles); a Room
+  error or the time bound is not, so the next turn tries again and a
+  transient error costs the documents of one turn only. A remembered outcome
+  counts only for the same epoch start, and a remembered source never below
+  it (review note 2).
+- Discussion brief (contract P6-6): when the Room state has an `activeTopic`,
+  its title and description are authoritative, in the context lines and in a
+  presented discussion start. Before, `activeTopic.description ?? start
+  description` brought a cleared (null) description back from the
+  `discussion.started` payload; now a cleared brief is gone on the next turn.
+  The start payload's topic is used only when the state has no `activeTopic`.
+  A `topic.changed` event is acknowledged without model work.
+- Turn-source scan bounded (contract P6-5): the scan for the message an
+  attempt answers, beyond the loaded page, has the same time bound and
+  memory; before, an unresolvable source cost 20 reads on every turn and a
+  hanging read held the turn.
 - Room guidance bound (contract P6-4): 3,000 characters counted in code points,
   cut by the rule Hermes uses (whole lines while they fit, the first line that
   does not fit cut with `…`, later lines dropped), pinned by a shared vector.
   Before, the joined guidance was cut flat at 3,000 UTF-16 units with no
-  ellipsis.
+  ellipsis. The edges are shared with Hermes: trimming removes Unicode
+  White_Space and U+FEFF (JavaScript's own trim left U+0085), `enforcement` is
+  trimmed too, a rule text that is not a string is left out, and a lone
+  surrogate is rendered as U+FFFD.
 - Tests for the mutations the P5 review found surviving (scanned turn source's
   attachments, cycle-source types, cache bound, cycle source outside a cycle).
 - Wording: the planned L1 cases now say the OpenClaw device link follows "in a
@@ -74,8 +96,9 @@ shared case P5-02):
 
 No state migration: 0.2.64 loads a 0.2.63 state file unchanged. The only new
 file on disk is the rotation request, written only by the new command and
-removed when consumed; 0.2.63 ignores it, so a rollback needs no step (delete
-an unconsumed request by hand if the rotation is no longer wanted).
+removed when consumed; 0.2.63 ignores it, so a rollback needs no step (cancel
+an unconsumed request with `--cancel`, or delete it by hand, if the rotation
+is no longer wanted).
 
 Version 0.2.63 is parity release P5 with Hermes 1.0.79 ("Cycle documents",
 contract section P5, shared case P5-01; contract L1-18 amended in wording):

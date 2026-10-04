@@ -317,9 +317,15 @@ test("P1a-06 discussion start title and description presented verbatim and attri
   // The Room's own words may say anything; nothing connector-authored is added around them.
   assert.deepEqual(denied(connectorAuthored(value.text, [DESCRIPTION, TITLE])), []);
 
-  // Without a description on /state, the start event's own description is used.
+  // Contract P6-6 (round 2, owner 2026-10-04): when /state has an activeTopic
+  // it is authoritative; without a description there is none, and the start
+  // event's own description is not used in its place (a cleared brief stays
+  // gone). Only without an activeTopic does the start event's topic count.
   const fromStart = await turn({activeTopic: {title: TITLE}});
-  assert.ok(fromStart.text.includes(`Current discussion: ${TITLE}\n${DESCRIPTION}\n`));
+  assert.equal(fromStart.text.includes(DESCRIPTION), false);
+  assert.ok(fromStart.text.includes(`Current discussion: ${TITLE}\n`));
+  const noTopic = await turn({activeTopic: undefined});
+  assert.ok(noTopic.text.includes(`Current discussion: ${TITLE}\n${DESCRIPTION}\n`));
 
   // A title-only start (the observed Showroom case) presents the title alone.
   const titleOnly = await turn({activeTopic: {title: TITLE}, pageEvents: [{...start, payload: {epoch: {...start.payload.epoch,

@@ -2,12 +2,15 @@
 // session (Hermes: `hermes room rotate-current-epoch-session`). The command
 // never writes the state file a running connector owns; it leaves a request
 // beside it, which the connector consumes once at its next start.
-import {closeSync, constants as fs, fchmodSync, fstatSync, lstatSync, openSync, readSync, unlinkSync, writeSync} from "node:fs";
+import {closeSync, constants as fs, fchmodSync, fstatSync, fsyncSync, lstatSync, openSync, readSync, renameSync, unlinkSync, writeSync} from "node:fs";
+import {randomUUID} from "node:crypto";
 
 const REQUEST_MAX_BYTES = 4096;
 
+// Never ending in .json: account discovery takes every *.json file in the
+// state directory for an account (src/account-discovery.js, src/state.js:17).
 export function rotationRequestPath(stateFile) {
-  return `${stateFile}.rotate-epoch-session.json`;
+  return `${stateFile}.rotate-epoch-session.request`;
 }
 
 export function routingSummary(state, requestPending) {
@@ -30,13 +33,22 @@ export function writeRotationRequest(stateFile, state, now = new Date()) {
     version: 1, roomId: state.roomId, membershipId: state.membershipId, clientInstanceId: state.clientInstanceId,
     requestedAt: now.toISOString(),
   };
-  const fd = openSync(rotationRequestPath(stateFile),
-    fs.O_WRONLY | fs.O_CREAT | fs.O_TRUNC | (fs.O_NOFOLLOW ?? 0), 0o600);
+  // Atomic: a temporary file (0600, never .json) renamed over the request.
+  const path = rotationRequestPath(stateFile);
+  const temporary = `${path}.${randomUUID()}.tmp`;
+  const fd = openSync(temporary, fs.O_WRONLY | fs.O_CREAT | fs.O_EXCL | (fs.O_NOFOLLOW ?? 0), 0o600);
   try {
-    fchmodSync(fd, 0o600);
-    writeSync(fd, `${JSON.stringify(request)}\n`);
-  } finally {
-    closeSync(fd);
+    try {
+      fchmodSync(fd, 0o600);
+      writeSync(fd, `${JSON.stringify(request)}\n`);
+      fsyncSync(fd);
+    } finally {
+      closeSync(fd);
+    }
+    renameSync(temporary, path);
+  } catch (error) {
+    try { unlinkSync(temporary); } catch {}
+    throw error;
   }
   return request;
 }

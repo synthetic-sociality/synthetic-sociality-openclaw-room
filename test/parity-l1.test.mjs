@@ -1,8 +1,9 @@
 // Shared conformance cases for the device link L1 (delivery contract section
 // "L1 — Device link"). The case names are identical in the Hermes and OpenClaw
 // conformance.json files. Hermes implements them first (1.0.78); in OpenClaw
-// every case is planned until the P5 translation, so this suite checks the
-// planned marking, the contract pins and the shared signature vector only.
+// every case is planned until the translation in a later release, so this
+// suite checks the planned marking, the contract pins and the shared signature
+// vector only.
 import assert from "node:assert/strict";
 import test from "node:test";
 import {createHash, createPrivateKey, createPublicKey, sign, verify} from "node:crypto";

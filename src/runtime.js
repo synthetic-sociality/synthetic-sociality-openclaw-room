@@ -1151,28 +1151,34 @@ export class OpenClawRoomRuntime {
     // and fail closed so a later retry cannot answer without owner guidance.
     const state = await this.client.roomState(this.state, signal);
     const stateEpochId = exactEpochId(state?.activeEpoch?.id, "Room state active epoch");
-    const stateStartsAtSeq = knownEpochStart(state?.activeEpoch?.startsAtSeq ?? sourceEpoch.startsAtSeq);
-    if (stateEpochId !== sourceEpoch.id || stateStartsAtSeq !== knownEpochStart(sourceEpoch.startsAtSeq)) {
+    if (stateEpochId !== sourceEpoch.id) {
       throw new Error("Room active epoch advanced before model dispatch");
     }
+    // Contract P6-2: the start of the prompt comes from the Room state. A page
+    // that disagrees never stops the channel or fails the dispatch.
+    const contextEpoch = {id: sourceEpoch.id, startsAtSeq: knownEpochStart(state?.activeEpoch?.startsAtSeq)};
     const policy = await this.client.roomPolicy(this.state, signal);
     const policyView = policy?.policy && typeof policy.policy === "object" ? policy.policy : policy;
     this.contextPolicyWordLimit = positiveWordLimit(policyView?.maxContributionWords);
     // Contract P6-2: an epoch without a start never widens the window to the
     // Room's history; the prompt holds no earlier event (same in Hermes).
-    const startKnown = knownEpochStart(sourceEpoch.startsAtSeq) >= 1;
+    const startKnown = contextEpoch.startsAtSeq >= 1;
     if (!startKnown) this.logger?.warn?.(`Room ${this.state.roomId} epoch start unknown: code epoch_start_unknown`);
     const currentSeq = Number(event?.seq ?? state.headSeq ?? this.state.cursor);
-    const before = startKnown ? Math.max(sourceEpoch.startsAtSeq - 1, currentSeq - 50) : currentSeq - 1;
+    // The ordinary loaded page: the 50 sequence numbers before the turn, never
+    // before a known start.
+    const before = Math.max(startKnown ? contextEpoch.startsAtSeq - 1 : 0, currentSeq - 50);
     const fetched = await this.client.readEvents(this.state, before, {wait: 0, signal});
     const fetchedEpoch = validateActiveEpochPage(fetched);
-    if (fetchedEpoch.id !== sourceEpoch.id || fetchedEpoch.startsAtSeq !== sourceEpoch.startsAtSeq) {
+    if (fetchedEpoch.id !== sourceEpoch.id) {
       throw new Error("Room active epoch advanced while loading model context");
     }
+    // Without a known start only the current item may come from the loaded
+    // page; no earlier event enters the prompt otherwise (P6-2).
     const page = startKnown ? fetched : {...fetched, events: []};
     this.rememberPostNumbers([...(Array.isArray(page?.events) ? page.events : []), event]);
-    const handoverContext = await this.epochHandoverContext(event, sourceEpoch, page?.events, signal);
-    const startEvent = await this.epochStartEvent(event, sourceEpoch, page?.events, signal);
+    const handoverContext = await this.epochHandoverContext(event, contextEpoch, page?.events, signal);
+    const startEvent = await this.epochStartEvent(event, contextEpoch, page?.events, signal);
     // Delivery contract P1a-5: a cycle seeded by the discussion start presents
     // that start, verbatim and attributed, as the current-turn input.
     this.contextDiscussionStart = discussionStartInput(event, startEvent, state);
@@ -1181,18 +1187,19 @@ export class OpenClawRoomRuntime {
     // current item, not a transcript entry.
     // A source older than the loaded page is read by a bounded scan of the
     // epoch, as in Hermes (context.py cycle_source_message).
-    let sourceMessage = cycleSourceMessage(event, page?.events);
-    if (startKnown && !sourceMessage && !(startEvent && String(eventPayload(event?.payload).sourceEventId ?? "") === String(startEvent.id ?? ""))) {
+    let sourceMessage = cycleSourceMessage(event, startKnown ? page?.events : fetched?.events);
+    const turnSourceId = event?.type === "discussion.cycle_attempt_ready" ? String(eventPayload(event?.payload).sourceEventId ?? "").trim() : "";
+    if (startKnown && turnSourceId && !sourceMessage && !(startEvent && turnSourceId === String(startEvent.id ?? ""))) {
       // Enrichment only, as in Hermes: a failed read leaves the turn without
-      // the current item instead of losing the claimed attempt.
-      try {
-        sourceMessage = await scanCycleSourceMessage(event, sourceEpoch.startsAtSeq,
-          (after) => this.client.readEvents(this.state, after, {wait: 0, signal}));
-      } catch (error) {
-        if (signal?.aborted) throw error;
-        this.logger?.warn?.(`Room ${this.state.roomId} cycle source unavailable: ${error?.message ?? error}`);
-        sourceMessage = null;
+      // the current item instead of losing the claimed attempt. Contract P6-5:
+      // one scan per turn under the P5-2 time bound; a found source and
+      // not_found are remembered.
+      const scan = await this.rememberedEpochScan("turnSourceEvents", turnSourceId, turnSourceId, Number(event?.seq),
+        contextEpoch.startsAtSeq, new Set(["message.posted"]), signal);
+      if (scan.reason && scan.reason !== "not_found") {
+        this.logger?.warn?.(`Room ${this.state.roomId} cycle source unavailable: ${scan.error?.message ?? scan.reason}`);
       }
+      sourceMessage = scan.event;
     }
     if (sourceMessage) this.rememberPostNumbers([sourceMessage]);
     // The host session speaker is the source's author (P1a-7), as in Hermes.
@@ -1202,27 +1209,27 @@ export class OpenClawRoomRuntime {
       authorName: speakerLabel(state?.roster, sourceMessage),
       authorRole: String(sourceMessage.actorRole ?? ""),
     } : null;
-    const roomContext = canonicalRoomContext(state, page?.events, sourceMessage?.id ?? event?.id, policy, sourceEpoch.startsAtSeq, startEvent);
+    const roomContext = canonicalRoomContext(state, page?.events, sourceMessage?.id ?? event?.id, policy, contextEpoch.startsAtSeq, startEvent);
     const answered = new Set([String(event?.id ?? ""), String(sourceMessage?.id ?? ""), String(eventPayload(event?.payload).sourceEventId ?? "")]);
     const attemptReady = event?.type === "discussion.cycle_attempt_ready";
     // Without a known start the durable missed sources and kept reply are
     // neither offered nor cleared (P6-2).
     const missed = startKnown
-      ? await this.missedSourceFacts(event, page?.events, state?.roster, sourceEpoch.startsAtSeq, answered, signal,
+      ? await this.missedSourceFacts(event, page?.events, state?.roster, contextEpoch.startsAtSeq, answered, signal,
         attemptReady ? serverMissedSource(eventPayload(event?.payload)) : "")
       : {facts: [], offered: [], mark: ""};
     this.contextMissedFacts = missed.facts;
     this.contextMissedOffered = missed.offered;
     this.contextMissedMark = missed.mark;
     this.contextAttemptReady = startKnown && attemptReady;
-    const kept = startKnown ? await this.keptReplyOffer(event, page?.events, state?.roster, sourceEpoch, signal) : {block: "", clear: false};
+    const kept = startKnown ? await this.keptReplyOffer(event, page?.events, state?.roster, contextEpoch, signal) : {block: "", clear: false};
     this.contextKeptReply = kept.block;
     this.contextKeptReplyCleared = kept.clear;
     // Contract P5-1: the cycle's source message keeps its attachments on every
     // turn of the cycle; never a failed or delayed turn.
     const pageEvents = Array.isArray(page?.events) ? page.events : [];
     const cycleSource = await this.cycleDocumentSource(cycleAttempt, [sourceMessage, event, ...pageEvents].filter(Boolean),
-      event, sourceEpoch.startsAtSeq, signal);
+      event, contextEpoch.startsAtSeq, signal);
     const library = await this.client.listArtifacts(this.state, signal);
     const artifactContext = await sourceArtifactContext(
       event,
@@ -1252,23 +1259,38 @@ export class OpenClawRoomRuntime {
     const floor = knownEpochStart(epochStartsAtSeq);
     // Contract P6-2: without an epoch start there is no floor to scan to.
     if (!floor) return null;
-    this.cycleSourceEvents ??= new Map();
-    const key = `${String(cycle.id ?? "")}\0${sourceEventId}`;
-    // Contract P5-2: a found source and an unresolved one are both remembered
-    // per cycle, so the bounded lookup runs at most once. A hit counts only
-    // for the same epoch floor and never below it.
-    if (this.cycleSourceEvents.has(key)) {
-      const cached = this.cycleSourceEvents.get(key);
-      if (cached.floor === floor && (!cached.event || Number(cached.event.seq) >= floor)) return cached.event;
+    const scan = await this.rememberedEpochScan("cycleSourceEvents", `${String(cycle.id ?? "")}\0${sourceEventId}`,
+      sourceEventId, Number(event?.seq), floor, CYCLE_DOCUMENT_SOURCE_TYPES, signal);
+    if (scan.reason) {
+      this.logger?.warn?.(`Room ${this.state.roomId} cycle source documents unavailable: code cycle_source_unresolved cycle ${String(cycle.id ?? "") || "-"} source ${sourceEventId} reason ${scan.reason}`);
+    }
+    return scan.event;
+  }
+
+  // One bounded epoch scan with its memory (contract P5-2, P6-5; Hermes
+  // _remembered_epoch_scan). Returns {event, reason}: reason null for a
+  // remembered outcome, "" for a found source, "not_found" for a scan that
+  // completed without it, else the error's name. A found source and
+  // not_found are remembered for the same epoch start (at most
+  // CYCLE_DOCUMENT_SOURCE_CACHE keys, both kinds counted); an error or the
+  // time bound is not, so the next turn tries again. A caller's abort is
+  // rethrown and remembers nothing.
+  async rememberedEpochScan(cacheName, key, sourceEventId, beforeSeq, floor, types, signal) {
+    this[cacheName] ??= new Map();
+    const cache = this[cacheName];
+    if (cache.has(key)) {
+      const cached = cache.get(key);
+      if (cached.floor === floor && (!cached.event || Number(cached.event.seq) >= floor)) return {event: cached.event, reason: null};
     }
     let scanned = null;
     let reason = "not_found";
+    let failure = null;
     const bound = AbortSignal.timeout(this.cycleDocumentSourceTimeoutMs ?? CYCLE_DOCUMENT_SOURCE_TIMEOUT_MS);
     const bounded = signal ? AbortSignal.any([signal, bound]) : bound;
     try {
       scanned = await Promise.race([
-        scanEpochEvent(sourceEventId, Number(event?.seq), floor,
-          (after) => this.client.readEvents(this.state, after, {wait: 0, signal: bounded}), CYCLE_DOCUMENT_SOURCE_TYPES),
+        scanEpochEvent(sourceEventId, beforeSeq, floor,
+          (after) => this.client.readEvents(this.state, after, {wait: 0, signal: bounded}), types),
         // A read that ignores the abort still never holds the turn.
         new Promise((_, reject) => {
           const timedOut = () => reject(Object.assign(new Error("cycle source lookup timed out"), {name: "TimeoutError"}));
@@ -1279,15 +1301,16 @@ export class OpenClawRoomRuntime {
     } catch (error) {
       if (signal?.aborted) throw error;
       reason = singleLine(error?.name || "Error");
+      failure = error;
     }
-    if (!scanned) {
-      scanned = null;
-      this.logger?.warn?.(`Room ${this.state.roomId} cycle source documents unavailable: code cycle_source_unresolved cycle ${String(cycle.id ?? "") || "-"} source ${sourceEventId} reason ${reason}`);
+    if (scanned) reason = "";
+    else scanned = null;
+    if (reason === "" || reason === "not_found") {
+      cache.delete(key);
+      cache.set(key, {floor, event: scanned});
+      while (cache.size > CYCLE_DOCUMENT_SOURCE_CACHE) cache.delete(cache.keys().next().value);
     }
-    this.cycleSourceEvents.delete(key);
-    this.cycleSourceEvents.set(key, {floor, event: scanned});
-    while (this.cycleSourceEvents.size > CYCLE_DOCUMENT_SOURCE_CACHE) this.cycleSourceEvents.delete(this.cycleSourceEvents.keys().next().value);
-    return scanned;
+    return {event: scanned, reason, error: failure};
   }
 
   async epochHandoverContext(event, sourceEpoch, pageEvents, signal) {
@@ -1297,6 +1320,9 @@ export class OpenClawRoomRuntime {
     // accumulated host history.
     this.handoverContexts ??= new Map();
     if (this.handoverContexts.has(sourceEpoch.id)) return this.handoverContexts.get(sourceEpoch.id);
+    // Contract P6-2: nothing is kept per epoch from a turn whose start is
+    // unknown; a later turn with a known start reads it afresh.
+    if (knownEpochStart(sourceEpoch.startsAtSeq) < 1) return "";
     const startEvent = await this.epochStartEvent(event, sourceEpoch, pageEvents, signal);
     const rendered = discussionHandoverContext(startEvent);
     this.handoverContexts.set(sourceEpoch.id, rendered);
@@ -1307,6 +1333,7 @@ export class OpenClawRoomRuntime {
   async epochStartEvent(event, sourceEpoch, pageEvents, signal) {
     this.epochStartEvents ??= new Map();
     if (this.epochStartEvents.has(sourceEpoch.id)) return this.epochStartEvents.get(sourceEpoch.id);
+    if (knownEpochStart(sourceEpoch.startsAtSeq) < 1) return null;
     const isStart = (item) => item?.type === "discussion.started" && Number(item?.seq) === Number(sourceEpoch.startsAtSeq);
     let startEvent = isStart(event) ? event : (Array.isArray(pageEvents) ? pageEvents.find(isStart) : undefined);
     if (!startEvent && Number(sourceEpoch.startsAtSeq) >= 1) {
@@ -2967,21 +2994,18 @@ function exactOptionalEpochId(value, label = "Room epoch") {
 export function validateActiveEpochPage(page) {
   const id = exactEpochId(page?.activeEpochId, "Room event page active epoch metadata");
   const startsAtSeq = page?.activeEpochStartsAtSeq;
-  // Contract P6-2: an active epoch with a valid id and no start (missing, or
-  // below 1) is processed with the start unknown (0), as in Hermes; stopping
-  // the channel would stop the agent. Any other start shape still fails closed.
-  if (startsAtSeq === undefined || startsAtSeq === null || (Number.isSafeInteger(startsAtSeq) && startsAtSeq < 1)) {
-    return {id, startsAtSeq: 0};
-  }
-  if (!Number.isSafeInteger(startsAtSeq)) {
-    throw new Error("Room event page active epoch metadata is invalid or incomplete");
-  }
-  return {id, startsAtSeq};
+  // Contract P6-2: a page start of any shape other than an integer of at
+  // least 1 is unknown (0); it never stops the channel. The epoch id stays a
+  // fence: a page without a valid id still fails closed.
+  return {id, startsAtSeq: knownEpochStart(startsAtSeq)};
 }
 
-function knownEpochStart(value) {
-  const number = Number(value ?? 0);
-  return Number.isSafeInteger(number) && number >= 1 ? number : 0;
+// Contract P6-2: the active epoch's start when it is known, else 0. Known
+// only for a JSON number whose value is an integer from 1 to 2^53 - 1; a
+// boolean, string, fraction, list, object, null, 0 or a negative number is
+// unknown (Hermes _known_epoch_start, the same set).
+export function knownEpochStart(value) {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 1 ? value : 0;
 }
 
 export function epochEvidence(event) {
@@ -3212,14 +3236,30 @@ export function roomTurnFacts({phase = "", cycleAttempt = null, policyWordLimit 
 
 // Delivery contract P1a-5: the start of a discussion, as the starting human
 // wrote it. Only when the cycle attempt's source is that exact start event.
+// Contract P6-6: the discussion's title and description. When the Room state
+// has an activeTopic object it is authoritative (an empty, null or missing
+// value means none, with nothing from the discussion.started payload in its
+// place); only without one is the start event's topic used. Both are trimmed
+// as P6-4 trims guidance text (Hermes active_topic, the same rule).
+export function activeTopic(state, startEvent = null) {
+  let topic = state?.activeTopic;
+  if (!topic || typeof topic !== "object" || Array.isArray(topic)) {
+    const payload = eventPayload(startEvent?.payload);
+    topic = payload.epoch?.topic ?? payload.topic ?? null;
+    if (!topic || typeof topic !== "object" || Array.isArray(topic)) return {title: "", description: ""};
+  }
+  return {title: guidanceText(topic.title), description: guidanceText(topic.description)};
+}
+
 export function discussionStartInput(event, startEvent, state = {}) {
   if (event?.type !== "discussion.cycle_attempt_ready" || startEvent?.type !== "discussion.started") return null;
   if (String(eventPayload(event.payload).sourceEventId ?? "") !== String(startEvent.id ?? "") || !startEvent.id) return null;
-  const payload = eventPayload(startEvent.payload);
-  const topic = payload.epoch?.topic ?? payload.topic ?? {};
+  // Contract P6-6: the Room state's activeTopic is authoritative for the
+  // presented start too; a cleared brief is gone on the next turn.
+  const {title, description} = activeTopic(state, startEvent);
   return {
-    title: String(topic.title ?? "").trim(),
-    description: String(topic.description ?? "").trim(),
+    title,
+    description,
     authorId: String(startEvent.actorId ?? ""),
     authorName: speakerLabel(state?.roster, startEvent),
   };
@@ -3541,6 +3581,37 @@ function singleLine(value) {
 // units. Whole lines are kept while they fit; the first line that does not
 // fit is cut to the remaining room ending in "…", or dropped when fewer than
 // two characters remain; later lines are dropped.
+// Contract P6-4: the characters trimmed from both ends of a rule, Unicode
+// White_Space plus U+FEFF (Hermes GUIDANCE_TRIM is the same set).
+const GUIDANCE_TRIM = "\\u0009-\\u000D\\u0020\\u0085\\u00A0\\u1680\\u2000-\\u200A\\u2028\\u2029\\u202F\\u205F\\u3000\\uFEFF";
+const GUIDANCE_TRIM_PATTERN = new RegExp(`^[${GUIDANCE_TRIM}]+|[${GUIDANCE_TRIM}]+$`, "gu");
+
+// A rule field as contract P6-4 reads it: a string only, each lone surrogate
+// replaced by U+FFFD, trimmed of GUIDANCE_TRIM; else "" (Hermes guidance_text).
+export function guidanceText(value) {
+  if (typeof value !== "string") return "";
+  return value.toWellFormed().replace(GUIDANCE_TRIM_PATTERN, "");
+}
+
+// The open-exchange preamble and the bounded guidance lines (contract P6-4).
+// A rule counts when it is an object whose trimmed enforcement is "guidance"
+// and whose text is a non-empty string after trimming (Hermes saved_guidance).
+export function savedGuidance(rules) {
+  const texts = [];
+  let preamble = "";
+  for (const rule of Array.isArray(rules) ? rules : []) {
+    if (!rule || typeof rule !== "object" || Array.isArray(rule) || guidanceText(rule.enforcement) !== "guidance") continue;
+    const text = guidanceText(rule.text);
+    if (!text) continue;
+    if (createHash("sha256").update(text, "utf8").digest("hex") === OPEN_EXCHANGE_PREAMBLE_SHA256) {
+      preamble = text;
+      continue;
+    }
+    texts.push(text);
+  }
+  return {preamble, lines: boundedGuidance(texts)};
+}
+
 export function boundedGuidance(texts) {
   const lines = [];
   let size = 0;
@@ -3562,16 +3633,9 @@ export function canonicalRoomContext(state, events, currentEventId = "", policy 
   const policyView = policy?.policy && typeof policy.policy === "object" ? policy.policy : policy;
   const title = String(state?.title ?? "").trim();
   const purpose = String(state?.purpose ?? "").trim();
-  const startTopic = eventPayload(startEvent?.payload).epoch?.topic ?? {};
-  const topic = String(state?.activeTopic?.title ?? startTopic.title ?? "").trim();
-  const topicDescription = String(state?.activeTopic?.description ?? startTopic.description ?? "").trim();
-  const savedGuidance = (Array.isArray(state?.rules) ? state.rules : [])
-    .filter((rule) => String(rule?.enforcement ?? "") === "guidance")
-    .map((rule) => String(rule?.text ?? "").trim())
-    .filter(Boolean);
-  const isPreamble = (text) => createHash("sha256").update(text).digest("hex") === OPEN_EXCHANGE_PREAMBLE_SHA256;
-  const openExchangePreamble = savedGuidance.find(isPreamble) ?? "";
-  const guidance = boundedGuidance(savedGuidance.filter((text) => !isPreamble(text))).join("\n");
+  const {title: topic, description: topicDescription} = activeTopic(state, startEvent);
+  const {preamble: openExchangePreamble, lines: guidanceLines} = savedGuidance(state?.rules);
+  const guidance = guidanceLines.join("\n");
   const topicDrift = String(policyView?.topicDrift ?? "").trim();
   const researchMode = String(policyView?.researchGroundingMode ?? "").trim();
   const researchMaxSources = Number(policyView?.researchMaxSources ?? 0);

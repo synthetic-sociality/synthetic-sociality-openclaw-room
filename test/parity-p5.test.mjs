@@ -124,7 +124,7 @@ const documentsBlock = (text) => {
 
 test("conformance P5 case names resolve to tests in this suite", async () => {
   const cases = Object.entries(conformance.parityP5Cases ?? {});
-  assert.equal(cases.length, 2);
+  assert.equal(cases.length, 3);
   const directory = new URL("./", import.meta.url);
   const sources = await Promise.all((await readdir(directory)).filter((name) => name.endsWith(".test.mjs"))
     .map((name) => readFile(new URL(name, directory), "utf8")));
