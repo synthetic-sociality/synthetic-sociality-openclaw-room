@@ -328,14 +328,21 @@
   "parityP5Contract": "docs/delivery-lifecycle-contract-v1.md#p5--cycle-documents-2026-10-03",
   "parityP5Cases": {
     "P5-01": "P5-01 every turn of a cycle carries the cycle source's attachments once, then the turn source's, within the limits",
-    "P5-02": "P5-02 a slow or unresolvable cycle source costs at most one bounded lookup per cycle and never delays a turn beyond the bound"
+    "P5-02": "P5-02 a slow or unresolvable cycle source costs at most one bounded lookup per cycle and never delays a turn beyond the bound",
+    "P5-03": "P5-03 a failed or timed-out cycle-source lookup is tried again on the next turn and the brief returns"
   },
   "parityP6Contract": "docs/delivery-lifecycle-contract-v1.md#p6--clean-start-and-bounds-2026-10-04",
   "parityP6Cases": {
     "P6-01": "P6-01 a new discussion runs in a new host session and no block holds an event from before its start",
     "P6-02": "P6-02 an epoch without a start gives a prompt without earlier events and the turn proceeds",
     "P6-03": "P6-03 rotate-current-epoch-session is a dry run without --yes and with it authorises one fresh epoch session",
-    "P6-04": "P6-04 the Room guidance is cut by the one shared rule at 3,000 characters"
+    "P6-04": "P6-04 the Room guidance is cut by the one shared rule at 3,000 characters",
+    "P6-05": "P6-05 a turn with the start unknown keeps nothing per epoch, so a later turn has the handover and the discussion start",
+    "P6-06": "P6-06 the start is known only as an integer of at least 1 from the Room state, and a disagreeing page never stops a turn",
+    "P6-07": "P6-07 with the start unknown the turn still renders its current item from the loaded page",
+    "P6-08": "P6-08 an unresolvable or hanging turn source costs one bounded scan per turn and never blocks a turn",
+    "P6-09": "P6-09 the Room state's activeTopic is authoritative and a cleared brief is gone on the next turn",
+    "P6-10": "P6-10 a topic.changed event is acknowledged without model work"
   },
   "parityP6GuidanceVector": [
     {
@@ -375,12 +382,72 @@
       ],
       "codePoints": 2998,
       "sha256": "21cba6089d814e3dbc4730417dbd276a83383d50738ba37c0a6185c53f23f6ed"
+    },
+    {
+      "name": "edges",
+      "roomRules": [
+        {
+          "enforcement": "guidance",
+          "text": "\ufeff\u00a0 BOM, NBSP and NEL are trimmed \u0085"
+        },
+        {
+          "enforcement": " guidance\t",
+          "text": "Enforcement is trimmed too."
+        },
+        {
+          "enforcement": "guidance",
+          "text": "\u001fU+001F and U+001C are not trimmed\u001c"
+        },
+        {
+          "enforcement": "guidance",
+          "text": 42
+        },
+        {
+          "enforcement": "guidance",
+          "text": [
+            "a list"
+          ]
+        },
+        {
+          "enforcement": "guidance",
+          "text": null
+        },
+        {
+          "enforcement": "rule",
+          "text": "Not guidance."
+        },
+        {
+          "enforcement": "guidance",
+          "text": "A lone \ud800 surrogate and a pair \ud83d\ude00 stay one code point each."
+        },
+        "a string rule",
+        null,
+        {
+          "enforcement": "guidance",
+          "text": "\u2028\u3000 \u200a"
+        },
+        {
+          "enforcement": [
+            "guidance"
+          ],
+          "text": "Enforcement that is not a string."
+        },
+        {
+          "text": "No enforcement."
+        },
+        {
+          "enforcement": "guidance",
+          "text": "\u180eU+180E is not White_Space and stays\u200b"
+        }
+      ],
+      "codePoints": 199,
+      "sha256": "38e4669f25cf1864759be6e1efaad0ebed816dbdee02b161ed8474fd62f8be78"
     }
   ],
   "parityContractSectionSha256": {
     "P3": "a689096e24f9fee13e0603006274c303f3435ee823f082a84a63b765deb8906b",
     "L1": "504b548622321269be64fd64dfcfa83884a2ded2bad092a37b4db379ba632937",
-    "P5": "ea70a9e7270a8165d949b25aae09004bd07cd70e6530ca2a40eabbd0508a97d7",
-    "P6": "672a608c82a5974c4f9ccb920215896b992c83ad7e01ae6c882f8882743bc7fa"
+    "P5": "4e7272530192d00478b842d4d1c8559530f39b76e0e0c026e738f740422e5a87",
+    "P6": "3b79968d551d2613256a90c52c87ca6a18d93ff5337fc73f128b1654715d9e3a"
   }
 }
