@@ -7,7 +7,7 @@
 import assert from "node:assert/strict";
 import test, {after} from "node:test";
 import {createHash} from "node:crypto";
-import {link, mkdtemp, readFile, readdir, rm, writeFile} from "node:fs/promises";
+import {link, mkdir, mkdtemp, readFile, readdir, rm, writeFile} from "node:fs/promises";
 import {tmpdir} from "node:os";
 import {join} from "node:path";
 import {registerHooks} from "node:module";
@@ -31,11 +31,12 @@ after(() => rm(home, {recursive: true, force: true}));
 const runtimeModule = await import("../src/runtime.js");
 const {
   OpenClawRoomRuntime, ROOM_NO_SYSTEM_STATUS_INSTRUCTION, WORD_BOUND_CYCLE_SOURCE, WORD_BOUND_POLICY_SOURCE, activeTopic,
-  canonicalRoomContext, guidanceCarriesNoStatusSentence, positiveWordLimit, roomTurnFacts, wordBoundFact,
+  canonicalRoomContext, guidanceCarriesNoStatusSentence, normalizeEvent, positiveWordLimit, roomTurnFacts, wordBoundFact,
 } = runtimeModule;
-const {RoomAPIError, RoomClient, RoomTransportError} = await import("../src/room-client.js");
+const {RoomAPIError, RoomClient, RoomRequestError, RoomTransportError} = await import("../src/room-client.js");
 const {GATE_WAIT_REASONS, LocalStatus} = await import("../src/local-status.js");
-const {readRoomHistory, resetHistoryScanCache} = await import("../src/history.js");
+const {readRoomHistory, registerRoomHistoryTool, resetHistoryScanCache} = await import("../src/history.js");
+const {defaultStateDirectory, saveState} = await import("../src/state.js");
 const channelModule = await import("../src/channel.js");
 const {writeRotationRequest, rotationRequestPath} = await import("../src/epoch-rotation.js");
 
@@ -71,6 +72,8 @@ const claimed = (sourceEventId = "m-42", extra = {}) => ({attempt: {id: "attempt
   cycle: {id: "cycle-1", generation: 1, totalTurns: 2, sourceEventId, budgets: {totalTurns: 6, perAgentTurns: 3}, ...extra}});
 const count = (text, part) => text.split(part).length - 1;
 const pause = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
+// A bound against a hang only; no outcome depends on it (an unref'd timer).
+const hangGuard = () => new Promise((_resolve, reject) => setTimeout(() => reject(new Error("hang")), 120_000).unref());
 
 function runtimeFor(events, options = {}) {
   const {claim = claimed(), rules = [], policy = {}, state = {}, client = {}} = options;
@@ -185,7 +188,7 @@ test("conformance P7c case names resolve to tests in this suite", async () => {
   const sources = await Promise.all((await readdir(directory)).filter((name) => name.endsWith(".test.mjs"))
     .map((name) => readFile(new URL(name, directory), "utf8")));
   const cases = Object.entries(conformance.parityP7cCases ?? {});
-  assert.equal(cases.length, 20);
+  assert.equal(cases.length, 22);
   cases.forEach(([id, name], index) => {
     assert.equal(id, `P7c-${String(index + 1).padStart(2, "0")}`);
     assert.ok(name.startsWith(`${id} `), id);
@@ -319,8 +322,18 @@ test("P7c-07 the shared transcript vector renders byte-identically and marks the
     readEvents: async (_session, afterSeq) => ({events: events.filter((item) => item.seq > afterSeq), headSeq: 44}),
     listEpochs: async () => ({epochs: [{id: "epoch-z", ordinal: 2, startsAtSeq: 41, status: "active"}]}),
   };
-  const history = await readRoomHistory({client, session: {roomId: "room-1", membershipId: "zurie", baseUrl: "https://room.example/api"}});
+  // Through the registered tool and its own session resolver, over the saved
+  // state the runtime uses (not a hand-made session).
+  const accounts = defaultStateDirectory();
+  await mkdir(accounts, {recursive: true, mode: 0o700});
+  await saveState(join(accounts, "t.json"), {version: 1, baseUrl: "https://room.example/api", roomId: "room-1", membershipId: "zurie",
+    credential: "fixture-credential", clientInstanceId: "client-1", cursor: 0});
+  const tools = [];
+  registerRoomHistoryTool({registerTool: (tool) => tools.push(tool)}, {makeClient: () => client});
+  const history = JSON.parse((await tools[0].execute("call-1", {})).content[0].text);
+  assert.equal(history.success, true, JSON.stringify(history));
   assert.deepEqual(Object.fromEntries(history.messages.map((entry) => [entry.seq, entry.actor])), {42: "TJE", 43: "Paula", 44: "Zurie (you)"});
+  await rm(join(accounts, "t.json"));
 });
 
 test("P7c-08 the word bound reads At most N words per response with its source and there is no line without a bound", async () => {
@@ -346,6 +359,31 @@ test("P7c-09 the ISSUE-031 sentence is in the frame exactly once, also when the 
       {enforcement: "guidance", text: `Be brief.\n\n${SENTENCE}\n\nUse plain words.`}]}),
   };
   for (const [label, {turn}] of Object.entries(frames)) assert.equal(count(turn.text, SENTENCE), 1, label);
+  // Every frame a model can get (cyclePrompt): a cycle turn, a direct human.command
+  // turn, an open-Room message turn and a message turn with a claimed attempt.
+  // The sentence once and byte-exact without the guidance; not added when the
+  // guidance carries it. An open-Room message turn through the scan as well.
+  const command = {id: "cmd-47", seq: 47, type: "human.command", actorRole: "human_owner", actorId: "owner-tj",
+    payload: {command: {command: "ask", arguments: {instruction: "Your view?"}}, visibleText: "/ask"}};
+  const shapes = {
+    "cycle turn": [ready(46, "m-42"), claimed()],
+    "direct human.command turn": [command, null],
+    "open-Room message turn": [HUMAN, null],
+    "message turn with a claimed attempt": [HUMAN, claimed()],
+  };
+  for (const [label, [event, attempt]] of Object.entries(shapes)) {
+    const frame = (carried) => normalizeEvent(event, "room-1", attempt, "", "epoch-z", "", 0, null, "", null, [], "",
+      {guidanceCarriesNoStatus: carried}).text;
+    assert.equal(count(frame(false), SENTENCE), 1, label);
+    assert.ok(frame(false).split("\n\n").includes(SENTENCE), `${label}: a paragraph of its own, byte-exact`);
+    assert.equal(count(frame(true), SENTENCE), 0, `${label}: not added when the guidance carries it`);
+  }
+  const openEvents = [START, HUMAN];
+  const openTurn = (await scan(runtimeFor(openEvents, {policy: {coordinationMode: "open"}}), openEvents))
+    .find((turn) => turn.raw.id === HUMAN.id);
+  assert.ok(openTurn, "the open-Room message is a turn");
+  assert.equal(openTurn.cycleAttempt ?? null, null);
+  assert.equal(count(openTurn.text, SENTENCE), 1, "open-Room message turn through the scan");
   // Not a filter: a reply about missing access is posted unchanged, and the
   // status file holds no message body.
   const body = "I have no internet access, so I answer from the brief.";
@@ -568,7 +606,8 @@ test("P7c-17 a request the runtime refuses to form is the connector's own error,
     fetchImpl: async () => { fetches += 1; return new Response("{}", {status: 200}); }});
   await assert.rejects(client.request("/rooms/room-1/state"), (error) => {
     assert.ok(!(error instanceof RoomTransportError), error?.name);
-    assert.equal(error?.name, "TypeError");
+    assert.ok(error instanceof RoomRequestError, error?.name);
+    assert.equal(error.code, "request_not_formed");
     return true;
   });
   assert.equal(fetches, 0);
@@ -578,7 +617,7 @@ test("P7c-17 a request the runtime refuses to form is the connector's own error,
   const controller = new AbortController();
   const turns = runtime.assignedTurns(controller.signal);
   await assert.rejects(Promise.race([turns.next(), pause(5_000).then(() => { throw new Error("retried"); })]),
-    (error) => error?.name === "TypeError");
+    (error) => error instanceof RoomRequestError);
   controller.abort();
   assert.equal(fetches, 0);
 });
@@ -646,6 +685,93 @@ test("P7c-20 a Room URL the runtime refuses to form is the connector's own error
     return true;
   });
   assert.equal(fetches, 0);
+  // A port fetch blocks (the Fetch standard's bad ports) is refused before any
+  // I/O as well: the plugin's own error, not a failed contact (OP-12 N8).
+  const blocked = new RoomClient({baseUrl: "http://127.0.0.1:6000/api", credential: "credential",
+    fetchImpl: async () => { fetches += 1; return new Response("{}", {status: 200}); }});
+  await assert.rejects(blocked.request("/rooms/room-1/state"), (error) => error instanceof RoomRequestError && error.code === "request_not_formed");
+  assert.equal(fetches, 0);
+  const open = new RoomClient({baseUrl: "http://127.0.0.1:6001/api", credential: "credential",
+    fetchImpl: async () => { fetches += 1; return new Response("{}", {status: 200}); }});
+  await open.request("/rooms/room-1/state");
+  assert.equal(fetches, 1, "a port that is not blocked is contacted");
+});
+
+test("P7c-21 a credential the runtime refuses in a header is never in an error, a log line or the status, and the loop fails closed", async () => {
+  // The runtime's own message would quote the header value; the plugin raises
+  // its own error with a fixed message and code request_not_formed instead.
+  const secret = "fixture-secret-7Q2";
+  // A line break or NUL inside the value (a trailing one is trimmed by the runtime).
+  for (const credential of [`${secret}\nX-Injected: 1`, `${secret}\rX-Injected: 1`, `${secret}\u0000X`]) {
+    let fetches = 0;
+    const client = new RoomClient({baseUrl: "https://room.example/api", credential,
+      fetchImpl: async () => { fetches += 1; return new Response("{}", {status: 200}); }});
+    let thrown = null;
+    try { await client.request("/rooms/room-1/state"); } catch (error) { thrown = error; }
+    assert.ok(thrown instanceof RoomRequestError, JSON.stringify(credential));
+    assert.equal(thrown.code, "request_not_formed");
+    assert.equal(thrown.cause, undefined);
+    for (const text of [thrown.message, String(thrown), thrown.stack, JSON.stringify(thrown)]) assert.ok(!text.includes(secret));
+    // The loop: the event read fails closed; the status and the logs carry the code only.
+    const directory = await mkdtemp(join(home, "refused-"));
+    const path = join(directory, "status.json");
+    const runtime = runtimeFor([HUMAN]);
+    runtime.status = new LocalStatus(path, {version: "test", hostLabel: "host"});
+    runtime.client.readEvents = async () => client.request("/rooms/room-1/events");
+    const controller = new AbortController();
+    const turns = runtime.assignedTurns(controller.signal);
+    let ended = null;
+    try { await Promise.race([turns.next(), hangGuard()]); } catch (error) { ended = error; }
+    controller.abort();
+    assert.ok(ended instanceof RoomRequestError, String(ended?.name));
+    assert.equal(fetches, 0);
+    await pause(20);
+    const status = await readFile(path, "utf8");
+    const entry = JSON.parse(status).rooms["room-1"];
+    assert.deepEqual([entry.connection, entry.lastErrorCode], ["stopped", "request_not_formed"]);
+    assert.ok(!status.includes(secret));
+    assert.ok(runtime.logs.some((line) => line.includes("request_not_formed")), runtime.logs.join("\n"));
+    assert.ok(!runtime.logs.join("\n").includes(secret));
+  }
+  // The heartbeat loop fails closed on it as well and ends the read.
+  const runtime = runtimeFor([HUMAN]);
+  runtime.heartbeatMinimumSeconds = 0.001;
+  runtime.connectorSession = {sessionId: "s", heartbeatIntervalSeconds: 0.001};
+  runtime.maintainPresence = async () => { throw new RoomRequestError(); };
+  runtime.runHeartbeat();
+  await runtime.heartbeatTask;
+  assert.ok(runtime.heartbeatAbort.signal.aborted);
+  assert.ok(runtime.heartbeatError instanceof RoomRequestError);
+});
+
+test("P7c-22 held_by_moderator only for cycle_no_attempt while the Room state holds the refused cycle, and never the holder's name or membership id", async () => {
+  const hold = {cycleId: "cycle-1", holderMembershipId: "holder-7k", holderDisplayName: "Thorsten", startedAt: "2026-10-05T10:00:00Z",
+    expiresAt: "2026-10-05T10:00:45Z"};
+  const superseded = () => { throw new RoomAPIError(409, {code: "cycle_superseded"}); };
+  const {cycleId: _omitted, ...withoutCycle} = hold;
+  const cases = {
+    "hold of this cycle": [{activeHold: hold}, undefined, "held_by_moderator"],
+    "empty object": [{activeHold: {}}, undefined, ""],
+    "hold of another cycle": [{activeHold: {...hold, cycleId: "cycle-other"}}, undefined, ""],
+    "hold without a cycle": [{activeHold: withoutCycle}, undefined, ""],
+    "cycle_superseded during the hold": [{activeHold: hold}, superseded, ""],
+    "no hold": [{activeHold: null}, undefined, ""],
+  };
+  const events = [START, HUMAN, PEER, INTERJECTION, responseReady(51)];
+  for (const [label, [state, claim, reason]] of Object.entries(cases)) {
+    const directory = await mkdtemp(join(home, "hold-exact-"));
+    const path = join(directory, "status.json");
+    const runtime = runtimeFor(events, {state, claim: claim ?? (() => null)});
+    runtime.state.cursor = 50;
+    runtime.status = new LocalStatus(path, {version: "test", hostLabel: "host"});
+    runtime.reportStatus({connected: true});
+    assert.deepEqual(await scan(runtime, events), [], label);
+    assert.equal(runtime.calls.claims, 1, label);
+    await pause(20);
+    const text = await readFile(path, "utf8");
+    assert.equal(JSON.parse(text).rooms["room-1"]?.lastGateWaitReason ?? "", reason, label);
+    assert.ok(!text.includes("holder-7k") && !text.includes("Thorsten"), label);
+  }
 });
 
 // P7c items 4 and 8: tests for mutations that survived the P6 round-2 and P7a
@@ -667,6 +793,56 @@ test("the turn-source memory is kept per source", async () => {
   assert.ok(turns[0].text.includes("#43 TJE: Message 43."));
   assert.ok(turns[1].text.includes("#44 TJE: Message 44."));
   assert.ok(!turns[1].text.split("[/Canonical Room context]")[1].includes("Message 43."));
+});
+
+// OP-12 P7c OpenClaw review N12: tests for the surviving mutations c, q2, q4, q6.
+test("reply names come only from the messages kept for the context", () => {
+  // A reply to a message of an earlier discussion and to the current item: both
+  // are outside the context read, so both are named by their event id.
+  const earlier = {id: "m-30", seq: 30, type: "message.posted", actorRole: "participant_agent", actorId: "paula",
+    payload: {body: "From an earlier discussion."}};
+  const current = {...HUMAN, id: "m-48", seq: 48};
+  const reply = {id: "m-46", seq: 46, type: "message.posted", actorRole: "participant_agent", actorId: "paula",
+    payload: {body: "I answer both.", respondsTo: ["m-30", "m-48"]}};
+  const rendered = canonicalRoomContext({roster: ROSTER}, [earlier, START, HUMAN, reply, current], "m-48", {}, 41, null, "zurie");
+  assert.ok(rendered.includes("#46 Paula (reply to canonical event m-30, canonical event m-48): I answer both."), rendered);
+  assert.ok(!rendered.includes("From an earlier discussion."));
+});
+
+test("a failed Room state read after a refused claim is swallowed and the event is acknowledged", async () => {
+  const events = [START, HUMAN, PEER, INTERJECTION, responseReady(51)];
+  let refused = false;
+  const runtime = runtimeFor(events, {claim: () => { refused = true; return null; }});
+  const read = runtime.client.roomState;
+  runtime.client.roomState = async (...args) => {
+    if (refused) throw new Error("state read failed");
+    return read(...args);
+  };
+  runtime.state.cursor = 50;
+  assert.deepEqual(await scan(runtime, events), []);
+  assert.equal(runtime.calls.claims, 1);
+  assert.deepEqual(runtime.calls.acks, [51]);
+});
+
+test("a command source older than the loaded page is found by the cycle-source lookup and posts without respondsTo", async () => {
+  const older = Array.from({length: 70}, (_, index) => ({id: `m-${46 + index}`, seq: 46 + index, type: "message.posted",
+    actorRole: "human_owner", actorId: "owner-tj", payload: {body: `Message ${46 + index}.`, epochId: "epoch-z"}}));
+  const events = [START, HUMAN, ASK, ...older, ready(120, "cmd-45")];
+  const {turn} = await turnText(events, {claim: claimed("cmd-45")});
+  assert.equal(turn.respondsToId, "");
+});
+
+test("a fenced message of an earlier discussion is acknowledged at once, before the next event is handled", async () => {
+  const old = {id: "m-20", seq: 20, type: "message.posted", actorRole: "human_owner", actorId: "owner-tj",
+    payload: {body: "A message of the earlier discussion.", resolvedRecipientMembershipIds: ["zurie"]}};
+  const events = [old, START, HUMAN];
+  const runtime = runtimeFor(events, {pageStartsAt: 0, policy: {coordinationMode: "open"}});
+  runtime.state.cursor = 19;
+  const acknowledgedBefore = {};
+  runtime.markContextAcknowledged = async (event) => { acknowledgedBefore[event.seq] = [...runtime.calls.acks]; };
+  await scan(runtime, events);
+  const next = Object.keys(acknowledgedBefore).map(Number).sort((a, b) => a - b)[0];
+  assert.ok(next > 20 && acknowledgedBefore[next].includes(20), JSON.stringify(acknowledgedBefore));
 });
 
 test("the topic is trimmed as guidance is", () => {

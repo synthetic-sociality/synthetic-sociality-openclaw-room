@@ -102,6 +102,24 @@ export class RoomTransportError extends Error {
 }
 const transportFailure = (error, signal) => (signal?.aborted ? error : new RoomTransportError(error));
 
+// Contract P2c-3a, P7c: a request the runtime refuses to form before any I/O
+// (a header value or a Room URL it does not accept, a port fetch blocks) is
+// the plugin's own error. Fixed message and code, no cause: the runtime's
+// message can quote the header value, that is the credential.
+export class RoomRequestError extends Error {
+  constructor() {
+    super("Room request refused by the runtime before any I/O (a header value or the Room URL it does not accept)");
+    this.name = "RoomRequestError";
+    this.code = "request_not_formed";
+  }
+}
+
+// The Fetch standard's bad ports: fetch refuses them before any I/O.
+const FETCH_BAD_PORTS = new Set([0, 1, 7, 9, 11, 13, 15, 17, 19, 20, 21, 22, 23, 25, 37, 42, 43, 53, 69, 77, 79, 87, 95, 101, 102,
+  103, 104, 109, 110, 111, 113, 115, 117, 119, 123, 135, 137, 139, 143, 161, 179, 389, 427, 465, 512, 513, 514, 515, 526, 530, 531,
+  532, 540, 548, 554, 556, 563, 587, 601, 636, 989, 990, 993, 995, 1719, 1720, 1723, 2049, 3659, 4045, 4190, 5060, 5061, 6000, 6566,
+  6665, 6666, 6667, 6668, 6669, 6679, 6697, 10080]);
+
 // The contact a request made (method and path, without the query): the
 // P2c-3a schedule of a loop resets when the contact that last failed succeeds.
 // The long poll and a plain read of the same route are two contacts.
@@ -181,7 +199,14 @@ export class RoomClient {
     // to form (a header value it does not accept, a GET with a body) is the
     // connector's own error, raised here before any I/O and never a failed
     // contact; the Request is built only to have the runtime check it.
-    new Request(`${this.baseUrl}${path}`, {...init, signal: undefined});
+    let formed = true;
+    try {
+      const port = new URL(new Request(`${this.baseUrl}${path}`, {...init, signal: undefined}).url).port;
+      if (port && FETCH_BAD_PORTS.has(Number(port))) formed = false;
+    } catch {
+      formed = false;
+    }
+    if (!formed) throw new RoomRequestError();
     let response;
     try {
       response = await this.fetch(`${this.baseUrl}${path}`, init);

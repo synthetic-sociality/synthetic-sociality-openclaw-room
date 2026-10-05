@@ -1,7 +1,7 @@
 import {createHash, randomUUID} from "node:crypto";
 import {hostname} from "node:os";
 import {dirname, join} from "node:path";
-import {RETRY_AFTER_MAXIMUM_SECONDS, RoomAPIError, RoomClient, RoomResponseError, RoomTransportError, roomErrorDiagnostic} from "./room-client.js";
+import {RETRY_AFTER_MAXIMUM_SECONDS, RoomAPIError, RoomClient, RoomRequestError, RoomResponseError, RoomTransportError, roomErrorDiagnostic} from "./room-client.js";
 import {loadState, migrateStateFile, saveNewState, saveState} from "./state.js";
 import {activateRoomChannel} from "./activation.js";
 import {ROOM_CONNECTOR_PROVENANCE} from "./release-provenance.js";
@@ -609,6 +609,7 @@ export class OpenClawRoomRuntime {
       try {
         return await this.initializeOnce(signal);
       } catch (error) {
+        this.failClosedOnRequestError(error);
         if (signal?.aborted || this.closed || !transientRoomFailure(error)) throw error;
         if (step === 0) this.logger?.warn?.(`Room start failed${roomErrorDiagnostic(error)}; retrying inside the connector`);
         this.reportStatus({connection: "reconnecting", errorCode: statusErrorCode(error)});
@@ -779,6 +780,7 @@ export class OpenClawRoomRuntime {
         for await (const turn of this.assignedTurnsOnce(signal)) yield turn;
         return;
       } catch (error) {
+        this.failClosedOnRequestError(error);
         if (signal?.aborted || this.closed || !transientRoomFailure(error)) throw error;
         if (failed && (this.scanPasses !== failed.passes
           || (failed.contact && (this.client?.contactSucceeded?.(failed.contact) ?? 0) > failed.successes))) step = 0;
@@ -1542,16 +1544,26 @@ export class OpenClawRoomRuntime {
     // Unclaimed or expired: the model never saw this attempt's source (P2a-3).
     if (claimed === false) {
       await this.noteMissedSource(String(payload.sourceEventId ?? ""));
-      await this.noteHeldByModerator(signal);
+      await this.noteHeldByModerator(String(payload.cycleId), signal);
     }
     return claimed;
+  }
+
+  // Contract P2c-3a, P7c: a request the runtime refuses to form is the plugin's
+  // own error; the loop fails closed with its code. Fixed log line: the
+  // runtime's message can quote the credential.
+  failClosedOnRequestError(error) {
+    if (!(error instanceof RoomRequestError) || this.requestErrorReported) return;
+    this.requestErrorReported = true;
+    this.logger?.error?.(`Room request refused by the runtime before any I/O code=${error.code}; the channel stops`);
+    this.reportStatus({connection: "stopped", errorCode: error.code});
   }
 
   // Contract P7c-5: a claim refused while a human holds the Room records the
   // coded reason held_by_moderator (wait 0); never the holder or any text. The
   // Room state is read once for it; the reason is diagnostics only, so a
   // failed read records nothing and changes nothing else.
-  async noteHeldByModerator(signal) {
+  async noteHeldByModerator(cycleId, signal) {
     // Only for cycle_no_attempt, never for cycle_superseded.
     if (this.claimRefusal !== "cycle_no_attempt") return;
     let state = null;
@@ -1561,7 +1573,8 @@ export class OpenClawRoomRuntime {
       return;
     }
     const hold = state?.activeHold;
-    if (hold && typeof hold === "object" && !Array.isArray(hold)) {
+    // A hold of this very cycle only: not {}, not a hold of another cycle.
+    if (hold && typeof hold === "object" && !Array.isArray(hold) && cycleId && String(hold.cycleId ?? "") === cycleId) {
       this.heldByModerator = true;
       this.reportStatus({gateWaitSeconds: 0, gateWaitReason: "held_by_moderator"});
     }
@@ -2901,6 +2914,13 @@ export class OpenClawRoomRuntime {
             this.heartbeatAbort.abort(error);
             return;
           }
+          if (error instanceof RoomRequestError) {
+            // Fails closed: the read loop ends on this answer as on a revocation.
+            this.failClosedOnRequestError(error);
+            this.heartbeatError = error;
+            this.heartbeatAbort.abort(error);
+            return;
+          }
           if (error instanceof RoomAPIError && !error.retryable && !sessionLost(error)) throw error;
           // P2c-3a: keep the loop and the session; only the Room's own "lost"
           // (flagged in maintainPresence) registers it again.
@@ -4093,6 +4113,7 @@ function sessionLost(error) {
 // P2c-4: a status code for a failure: the Room code, else a fixed class.
 export function statusErrorCode(error) {
   if (error instanceof RoomAPIError) return error.code || `http_${error.status}`;
+  if (error instanceof RoomRequestError) return error.code;
   if (error instanceof InvalidEventPage) return "invalid_event_page";
   if (error instanceof RoomResponseError) return "invalid_json_response";
   // A filesystem error (ENOSPC, EIO, EACCES ...) is local, not the network.

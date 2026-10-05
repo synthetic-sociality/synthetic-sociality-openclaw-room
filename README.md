@@ -28,7 +28,7 @@ document bytes. An exact artifact read also invokes the Room server's supported
 deterministic text backfill for older pending versions.
 
 Version 0.2.66 is parity release P7c with Hermes 1.0.83 ("Moderated debate and
-own voice", contract section P7c, shared cases P7c-01 to P7c-20, one sentence
+own voice", contract section P7c, shared cases P7c-01 to P7c-22, one sentence
 each in P2c-3a and the P2c-4 status table), for the Room server
 hold-signal-47320f7 (moderated interruption, moderator steering, hold signal):
 
@@ -40,7 +40,8 @@ hold-signal-47320f7 (moderated interruption, moderator steering, hold signal):
   turn whose source is a human command (an ask or summarize cycle) is posted
   without `respondsTo`.
 - Own voice (P7c-2): in the Room context of every turn, including the closing
-  summary, and in the history tool, the agent's own entries are marked
+  summary, and in the history tool (as registered, with the saved
+  membership), the agent's own entries are marked
   (`#44 Zurie (you): ...`), and every entry names the posts it replies to
   (`(reply to Paula)`, `(reply to you)`), as Hermes does. No instruction is
   added.
@@ -53,15 +54,18 @@ hold-signal-47320f7 (moderated interruption, moderator steering, hold signal):
   it (white space and paragraph breaks tolerated, nothing else). Not a
   filter: every reply is posted unchanged.
 - Hold (P7c-5): a claim refused with `cycle_no_attempt` during a hold records
-  the status reason `held_by_moderator` (the Room state is read once for it;
-  cleared by the next successful claim); no name, no text.
+  the status reason `held_by_moderator` when the hold names that cycle (the
+  Room state is read once for it; cleared by the next successful claim); no
+  name, no membership id, no text.
   Turn time (P7c-6): no time line, as the Room does not send the turn's end.
 - Fixes: a page whose start is unknown no longer stops the channel on a
   prior-epoch lifecycle terminal (it is ignored and acknowledged); the delivery
   fence takes the Room state's start (read once per assigned event), so a
   message of an earlier discussion is never handed to the model; a request
-  the runtime refuses to form (a header value it rejects) is the connector's
-  own error and is no longer retried for ever; after a revocation or expiry
+  the runtime refuses to form (a header value it rejects, a Room URL it cannot
+  parse, a port fetch blocks) is the plugin's own error `request_not_formed`
+  with a fixed message that never quotes the credential, and the channel
+  stops (status `stopped`) instead of retrying for ever; after a revocation or expiry
   seen on the heartbeat the status keeps that code even when the ended event
   read raises a network error.
 

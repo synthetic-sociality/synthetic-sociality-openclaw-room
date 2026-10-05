@@ -227,7 +227,10 @@ export async function resolveHistorySession(requestedRoom, {accounts = stateAcco
     try {
       const state = await load(account.stateFile);
       if (!state?.roomId || !state?.credential || !state?.baseUrl) continue;
-      sessions.push({accountId: account.accountId, roomId: String(state.roomId), credential: String(state.credential), baseUrl: String(state.baseUrl)});
+      // Contract P7c-2: the membership id of the same saved state the runtime
+      // uses, so the registered tool marks the agent's own entries.
+      sessions.push({accountId: account.accountId, roomId: String(state.roomId), credential: String(state.credential), baseUrl: String(state.baseUrl),
+        membershipId: String(state.membershipId ?? "")});
     } catch {
       // Unreadable or foreign state files are skipped; they never grant access.
     }
