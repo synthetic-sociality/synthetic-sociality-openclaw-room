@@ -52,8 +52,10 @@ export class LocalStatus {
     // Contract P2c-3a: when the current outage of a Room began (process
     // memory only; never written).
     this.outageStarted = new Map();
-    // Contract P2c-3b: Rooms whose membership is inactive (muted).
+    // Contract P2c-3b: Rooms whose membership is inactive (muted), and each
+    // Room's own connection state under that mark (P2c-4).
     this.inactive = new Set();
+    this.connection = new Map();
   }
 
   // Contract P2c-6: a web reading tool the host itself named in a Room turn.
@@ -107,14 +109,20 @@ export class LocalStatus {
     const before = JSON.stringify(entry);
     if (membershipId) entry.membershipId = String(membershipId);
     const key = String(roomId);
+    // Contract P2c-4: `connection` is the connection's own state, with
+    // `inactive` shown over `connected` only while the membership is muted
+    // (P2c-3b); `stopped` and `reconnecting` win over it. A stop or a new
+    // registration (a new runtime, an unmute) ends the inactive mark.
     if (inactive === true) this.inactive.add(key);
-    else if (inactive === false) this.inactive.delete(key);
-    if (CONNECTION_STATES.has(connection)) entry.connection = connection;
+    else if (inactive === false || connection === "stopped" || (connected && registered)) this.inactive.delete(key);
+    let state = this.connection.get(key) ?? entry.connection;
+    if (connection === "inactive") state = "connected";
+    else if (CONNECTION_STATES.has(connection)) state = connection;
     // Contract P2c-3a: the first failure of an outage starts it.
     if (connection === "reconnecting" && !this.outageStarted.has(key)) this.outageStarted.set(key, performance.now());
     else if (connection === "stopped" || connection === "inactive") this.outageStarted.delete(key);
     if (connected) {
-      entry.connection = "connected";
+      state = "connected";
       entry.lastConnectedAt = now();
       const started = this.outageStarted.get(key);
       this.outageStarted.delete(key);
@@ -125,9 +133,8 @@ export class LocalStatus {
         entry.lastOutageSeconds = Math.round(Math.max(0, performance.now() - started) / 100) / 10;
       }
     }
-    // Contract P2c-3b: a muted membership stays inactive while its session
-    // and heartbeat continue.
-    if (this.inactive.has(key)) entry.connection = "inactive";
+    this.connection.set(key, state);
+    entry.connection = state === "connected" && this.inactive.has(key) ? "inactive" : state;
     if (errorCode !== undefined) {
       entry.lastErrorCode = code(errorCode);
       if (entry.lastErrorCode) entry.lastErrorAt = now();

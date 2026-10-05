@@ -126,14 +126,15 @@ function untilAborted(signal) {
 
 // Contract P2c-1, in every session: a file path inside the Room store (a
 // search root containing it), or a shell call naming it, is refused. A fence
-// error refuses too.
-export function roomToolCallPolicy(api) {
+// error refuses too. Contract P2c-6: only the gateway's own registration
+// (noteWebRead) writes the web-reading status, like every other status write.
+export function roomToolCallPolicy(api, {noteWebRead = false} = {}) {
   return (event, ctx) => {
     try {
       const cfg = api?.runtime?.config?.current?.() ?? api?.config;
       // Contract P2c-6: a web reading tool the host offered in a Room turn
       // (the host's session key is agent:<agent>:<channel>:<kind>:<peer>).
-      if (String(ctx?.sessionKey ?? "").split(":")[2] === ID && WEB_READ_TOOL_NAMES.includes(event?.toolName)) {
+      if (noteWebRead && String(ctx?.sessionKey ?? "").split(":")[2] === ID && WEB_READ_TOOL_NAMES.includes(event?.toolName)) {
         try { roomLocalStatus(api?.logger, cfg).noteWebReadTool(event.toolName); } catch {}
       }
       const stateDir = openClawStateDirectory();
@@ -496,7 +497,7 @@ export function createRoomChannel({makeClient}) {
       if (gatewayLoad) roomLocalStatus(api?.logger, api?.config).setLoaded(true);
       // Contract P2c-1: fence the store in every session, and scrub results.
       if (typeof api?.on === "function") {
-        api.on("before_tool_call", roomToolCallPolicy(api), {priority: 1000});
+        api.on("before_tool_call", roomToolCallPolicy(api, {noteWebRead: gatewayLoad}), {priority: 1000});
         api.on("tool_result_persist", roomToolResultScrub);
         if (gatewayLoad) api.on("gateway_stop", () => { roomLocalStatus(api?.logger, api?.runtime?.config?.current?.() ?? api?.config).setLoaded(false); });
       } else {

@@ -29,7 +29,7 @@ deterministic text backfill for older pending versions.
 
 Version 0.2.65 is parity release P7a with Hermes 1.0.82 ("Stay connected",
 contract P2c-3a, P2c-3b, P2c-3c, P2c-6 and the P2c-4 status additions, shared
-cases P7a-01 to P7a-09):
+cases P7a-01 to P7a-16):
 
 - One reconnect schedule (P2c-3a): registration, heartbeat, event reads and
   the enrollment listing retry after 1, 2, 4, 8, then every 15 s (each wait
@@ -38,8 +38,17 @@ cases P7a-01 to P7a-09):
   inside the connector: a Room outage no longer ends the channel, so the
   host's "auto-restart attempt N/10" schedule (which gives up after attempt
   10) is not used for it. A `Retry-After` on a 5xx is honoured up to 15 s, on a
-  429 up to 120 s (new here; Hermes already did). A proxy's HTML error page
-  keeps its HTTP status instead of becoming "malformed JSON".
+  429 up to 120 s (new here; Hermes already did).
+- Failed contacts, exactly (P2c-3a, round 2): a network failure ("fetch failed"
+  with a network cause) or timeout, a 5xx or 429, an answer whose body is not
+  the Room's JSON with any status (an edge's HTML 403/404/413 no longer ends
+  the channel, stops the heartbeat or quarantines a reply), a Room error
+  marked retryable, an invalid event page (also on the context read of a
+  turn). Any other TypeError, a local failure or an abort fails closed. A
+  loop's schedule resets only when the contact that failed succeeds or a full
+  pass completes, and the session is not registered again unless the Room
+  says it is lost. The attempt settle and the source acknowledgement after a
+  host run retry on the schedule instead of ending the channel.
 - Muted membership (P2c-3b): `connector_not_active` on the enrollment listing
   of a muted membership no longer re-registers every heartbeat; the Room shows
   `connection: inactive`, the listing pauses, and the Room state is re-read at
@@ -51,7 +60,11 @@ cases P7a-01 to P7a-09):
   (`host_run_busy`); per installation `webRead` and `webReadTools` (P2c-6).
   OpenClaw 2026.7.1-2 gives a channel plugin no resolved tool list, so
   `webRead` is `unknown` until the host's tool-call hook names a web reading
-  tool in a Room turn. The plugin adds and removes no web tool.
+  tool in a Room turn (written only by the gateway's own registration). The
+  plugin adds and removes no web tool. `connection: inactive` shows only
+  while a muted membership is otherwise connected; `stopped` and
+  `reconnecting` win. New `lastErrorCode` values: `invalid_json_response`,
+  `invalid_event_page`.
 
 No state migration and nothing new on disk: 0.2.65 loads a 0.2.64 state file
 unchanged.

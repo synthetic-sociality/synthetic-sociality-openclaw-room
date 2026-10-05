@@ -74,13 +74,33 @@ export function parseRetryAfter(raw, now = Date.now()) {
   return Math.min(RETRY_AFTER_MAXIMUM_SECONDS, seconds);
 }
 
-// A response with the expected status whose body is not JSON (an old
-// deployment's HTML fallback); retryable under P2c-3a where a loop retries.
+// Contract P2c-3a: an answer whose body is not the Room's JSON, whatever its
+// HTTP status (an old deployment's HTML fallback, a proxy or edge error page):
+// a failed contact, never a Room answer. Its status and Retry-After are kept
+// for the schedule only; no caller reads a credential, not-found or size
+// answer from it.
 export class RoomResponseError extends Error {
-  constructor(message = "Room API returned malformed JSON") {
+  constructor(message = "Room API returned malformed JSON", {status = 0, retryAfter = 0} = {}) {
     super(message);
     this.name = "RoomResponseError";
+    this.status = status;
+    this.retryAfter = Math.max(0, Math.min(RETRY_AFTER_MAXIMUM_SECONDS, Number(retryAfter) || 0));
   }
+}
+
+// Contract P2c-3a: the runtime's own form of a network failure (Node's fetch:
+// a TypeError "fetch failed" whose cause carries a network code). An abort is
+// not a failure; a TypeError of any other shape is a programming error.
+const NETWORK_CAUSE_CODE = /^(E[A-Z0-9_]+|UND_ERR_(?!ABORTED)[A-Z_]+)$/u;
+export function isNetworkFailure(error) {
+  return error instanceof TypeError && error.message === "fetch failed"
+    && typeof error.cause?.code === "string" && NETWORK_CAUSE_CODE.test(error.cause.code);
+}
+
+// The contact a request made (method and path, without the query): the
+// P2c-3a schedule of a loop resets when the contact that last failed succeeds.
+export function roomContact(method, path) {
+  return `${method} ${String(path).split("?")[0]}`;
 }
 
 export class RoomAPIError extends Error {
@@ -119,9 +139,31 @@ export class RoomClient {
     this.baseUrl = parsed.toString().replace(/\/$/, "");
     this.credential = credential;
     this.fetch = fetchImpl;
+    // Contract P2c-3a: successful answers per contact (roomContact).
+    this.contactSuccesses = new Map();
+  }
+
+  contactSucceeded(contact) {
+    return this.contactSuccesses.get(contact) ?? 0;
   }
 
   async request(path, {method = "GET", body, credential = this.credential, signal, expected = [200]} = {}) {
+    const contact = roomContact(method, path);
+    try {
+      const decoded = await this.requestOnce(path, {method, body, credential, signal, expected});
+      this.contactSuccesses.set(contact, this.contactSucceeded(contact) + 1);
+      return decoded;
+    } catch (error) {
+      try {
+        if (error && typeof error === "object" && !error.roomContact) error.roomContact = contact;
+      } catch {
+        // A frozen error keeps no contact; only a full pass resets then.
+      }
+      throw error;
+    }
+  }
+
+  async requestOnce(path, {method, body, credential, signal, expected}) {
     const headers = {Accept: "application/json"};
     if (credential) headers.Authorization = `Bearer ${credential}`;
     if (body !== undefined) headers["Content-Type"] = "application/json";
@@ -132,22 +174,39 @@ export class RoomClient {
       redirect: "error",
       signal,
     });
-    const raw = await readBounded(response, MAX_RESPONSE_BYTES);
-    let decoded = {};
+    let raw;
+    try {
+      raw = await readBounded(response, MAX_RESPONSE_BYTES);
+    } catch (error) {
+      // A connection lost while the body is read is the same network failure.
+      if (error instanceof TypeError && typeof error.cause?.code === "string" && NETWORK_CAUSE_CODE.test(error.cause.code)) {
+        throw new TypeError("fetch failed", {cause: error.cause});
+      }
+      throw error;
+    }
     const accepted = expected.includes(response.status);
+    const retryAfter = parseRetryAfter(response.headers?.get?.("retry-after"));
+    let decoded = {};
+    let roomJson = false;
     if (raw) {
       try {
         decoded = JSON.parse(raw);
+        roomJson = true;
       } catch {
-        // A proxy's HTML error page keeps its status (P2c-3a: a 502 is a 502).
-        if (accepted) throw new RoomResponseError();
         decoded = {};
       }
     }
-    if (!accepted) {
-      throw new RoomAPIError(response.status, decoded, {retryAfter: parseRetryAfter(response.headers?.get?.("retry-after"))});
+    if (accepted) {
+      if (raw && !roomJson) throw new RoomResponseError(undefined, {status: response.status, retryAfter});
+      return decoded;
     }
-    return decoded;
+    // Contract P2c-3a: only the Room's own JSON error is a Room answer; an
+    // error page of a proxy or edge (HTML, plain text, empty), with any
+    // status, is a failed contact.
+    if (!roomJson || !decoded || typeof decoded !== "object" || Array.isArray(decoded)) {
+      throw new RoomResponseError(`Room API answered status ${response.status} without the Room's JSON`, {status: response.status, retryAfter});
+    }
+    throw new RoomAPIError(response.status, decoded, {retryAfter});
   }
 
   redeemInvitation({invitationToken, identity, signal}) {

@@ -120,6 +120,12 @@ function roomRuntime(events) {
 }
 
 const leaseIn = (milliseconds) => new Date(Date.now() + milliseconds).toISOString();
+const baseMs = (step, capMs = CAP_MS) => Math.min(capMs, 1000 * 2 ** step);
+function assertOnSchedule(wait, step, all, capMs = CAP_MS) {
+  assert.ok(wait >= 0.8 * baseMs(step, capMs) - 1e-6 && wait <= baseMs(step, capMs) + 1e-6, `step ${step}: ${all}`);
+}
+const html = (status) => new Response(`<html><body>${status} from the edge</body></html>`, {status, headers: {"content-type": "text/html"}});
+const page = (events, extra = {activeEpochId: "epoch-z", activeEpochStartsAtSeq: 1}) => ({...extra, events});
 
 test("conformance P7a case names resolve to tests in this suite", async () => {
   const {readdir} = await import("node:fs/promises");
@@ -127,7 +133,7 @@ test("conformance P7a case names resolve to tests in this suite", async () => {
   const sources = await Promise.all((await readdir(directory)).filter((name) => name.endsWith(".test.mjs"))
     .map((name) => readFile(new URL(name, directory), "utf8")));
   const cases = Object.entries(conformance.parityP7aCases ?? {});
-  assert.equal(cases.length, 9);
+  assert.equal(cases.length, 16);
   cases.forEach(([id, name], index) => {
     assert.equal(id, `P7a-${String(index + 1).padStart(2, "0")}`);
     assert.ok(name.startsWith(`${id} `), id);
@@ -307,7 +313,7 @@ test("P7a-05 a muted membership is inactive, not retried on the seconds schedule
   assert.equal(statusActive.connection, "connected");
 });
 
-test("P7a-06 more than 10 consecutive failures: still retrying", async () => {
+test("P7a-06 more than 10 consecutive failures: still retrying, every wait within the schedule and its jitter", async () => {
   const network = () => Object.assign(new TypeError("fetch failed"), {cause: {code: "ECONNREFUSED"}});
   const {runtime, calls} = await startRuntime(Array.from({length: 12}, network));
   const timers = compressTimers();
@@ -321,6 +327,10 @@ test("P7a-06 more than 10 consecutive failures: still retrying", async () => {
   const waits = timers.of("initializeRetrying");
   assert.equal(waits.length, 12);
   assert.ok(waits.every((wait) => wait <= CAP_MS), String(waits));
+  // Each wait lies in [0.8, 1.0] of its base 1, 2, 4, 8, 15, 15, ... s.
+  waits.forEach((wait, index) => assertOnSchedule(wait, index, waits));
+  // The factor is drawn, not fixed: twelve waits never all sit on their base.
+  assert.ok(waits.some((wait, index) => wait < baseMs(index) - 1e-6), String(waits));
 });
 
 test("P7a-07 a transient attempt-renewal failure is retried within 1 s and never past the lease", async () => {
@@ -445,7 +455,9 @@ test("P7a-08 the status records the reconnect time, the outage length and a code
 test("P7a-09 web reading is reported from the host's own tool selection, unknown when the host cannot report it", async () => {
   statusModule.resetLocalStatusWriters();
   const api = {config: ISOLATED_HOST_CONFIG, logger: {warn: () => {}}};
-  const policy = channelModule.roomToolCallPolicy(api);
+  // Only the gateway's own registration writes the status (noteWebRead).
+  channelModule.roomToolCallPolicy(api)({toolName: "web_fetch", params: {}}, {sessionKey: `agent:main:${ID}:group:room-1:epoch:abc`});
+  const policy = channelModule.roomToolCallPolicy(api, {noteWebRead: true});
   const path = channelModule.roomStatusPath(ISOLATED_HOST_CONFIG);
   channelModule.roomLocalStatus(api.logger, ISOLATED_HOST_CONFIG).setLoaded(true);
   // OpenClaw 2026.7.1-2 gives a channel plugin no resolved tool list: unknown.
@@ -461,4 +473,356 @@ test("P7a-09 web reading is reported from the host's own tool selection, unknown
   written = JSON.parse(await readFile(path, "utf8"));
   assert.deepEqual([written.webRead, written.webReadTools], ["available", ["web_fetch"]]);
   assert.ok(!JSON.stringify(written).includes("example.org"));
+});
+
+test("the P2c-3a failed contacts are exactly the listed ones; a programming error fails closed", () => {
+  const {transientRoomFailure} = runtimeModule;
+  const network = Object.assign(new TypeError("fetch failed"), {cause: Object.assign(new Error("connect ECONNREFUSED"), {code: "ECONNREFUSED"})});
+  const reset = Object.assign(new TypeError("fetch failed"), {cause: Object.assign(new Error("other side closed"), {code: "UND_ERR_SOCKET"})});
+  const retried = [network, reset, new RoomAPIError(502, {}), new RoomAPIError(429, {}),
+    new clientModule.RoomResponseError(), new RoomAPIError(409, {code: "stale_context", retryable: true}),
+    Object.assign(new Error("timed out"), {name: "TimeoutError"})];
+  const closed = [
+    new TypeError("Cannot read properties of undefined (reading 'network')"), new TypeError("terminated"),
+    new TypeError("fetch failed"), Object.assign(new TypeError("fetch failed"), {cause: {code: "UND_ERR_ABORTED"}}),
+    Object.assign(new Error("This operation was aborted"), {name: "AbortError"}),
+    new RoomAPIError(401, {code: "credential_revoked", retryable: true}), new RoomAPIError(401, {code: "credential_expired"}),
+    new RoomAPIError(403, {code: "validation_error"}), new RoomAPIError(404, {}), new Error("plain"),
+    Object.assign(new Error("ENOSPC: no space left on device"), {code: "ENOSPC", syscall: "write"}),
+  ];
+  retried.forEach((error, index) => assert.equal(transientRoomFailure(error), true, `retried ${index}`));
+  closed.forEach((error, index) => assert.equal(transientRoomFailure(error), false, `closed ${index}`));
+});
+
+test("P7a-10 an HTML 403 once and an HTML 404 once on the event read, on the heartbeat and on a post: the loop continues, the post stays retryable, no quarantine", async () => {
+  // The event read: an edge error page is a failed contact, never a Room answer.
+  const reads = roomRuntime([message(41, "x")]);
+  const answers = [html(403), html(404)];
+  reads.client = new clientModule.RoomClient({baseUrl: "https://room.example/api", credential: "fixture-credential",
+    fetchImpl: async () => answers.shift() ?? json(page([message(41, "x")]))});
+  const timers = compressTimers();
+  let read;
+  try {
+    read = await reads.readEventsResilient(40);
+  } finally {
+    timers.restore();
+  }
+  assert.equal(read.events[0].seq, 41);
+  assert.equal(timers.of("readEventsResilient").length, 2);
+
+  // The heartbeat: the loop and the session stay; no registration.
+  const beats = roomRuntime([message(41, "x")]);
+  delete beats.maintainPresence;
+  beats.publishPresence = async () => {};
+  const room = {heartbeats: 0, registrations: 0};
+  const heartbeatAnswers = [html(403), html(404)];
+  beats.client = new clientModule.RoomClient({baseUrl: "https://room.example/api", credential: "fixture-credential", fetchImpl: async (url) => {
+    if (url.includes("/heartbeat")) {
+      const answer = heartbeatAnswers.shift();
+      if (answer) return answer;
+      room.heartbeats += 1;
+      return json({leaseExpiresAt: "2099-01-01T00:00:00Z"});
+    }
+    if (url.endsWith("/connector/sessions")) { room.registrations += 1; return json({sessionId: "s2", capabilities: []}); }
+    if (url.includes("/connector/enrollments")) return json([]);
+    throw new Error(`Unexpected request: ${url}`);
+  }});
+  beats.connectorSession = {sessionId: "s", heartbeatIntervalSeconds: 0.01};
+  beats.heartbeatMinimumSeconds = 0.01;
+  const heartbeatTimers = compressTimers();
+  try {
+    beats.runHeartbeat();
+    const deadline = Date.now() + 5000;
+    while (room.heartbeats < 3 && Date.now() < deadline) await pause(5);
+  } finally {
+    await beats.close();
+    heartbeatTimers.restore();
+  }
+  assert.ok(room.heartbeats >= 3, String(room.heartbeats));
+  assert.equal(beats.heartbeatError, undefined);
+  assert.equal(room.registrations, 0);
+
+  // The post: an edge error page leaves the reply retryable, never quarantined.
+  const client = new clientModule.RoomClient({baseUrl: "https://room.example/api", credential: "fixture-credential",
+    fetchImpl: async () => answers.length ? answers.shift() : html(413)});
+  for (const status of [403, 404, 413]) {
+    answers.push(html(status));
+    const error = await client.request("/rooms/room-1/messages", {method: "POST", body: {}, expected: [201]}).catch((caught) => caught);
+    const outcome = runtimeModule.classifyPostRefusal(error, {identity: {}, post: {}});
+    assert.equal(outcome.outcome, "retryable", `${status}: ${JSON.stringify(outcome)}`);
+    assert.equal(runtimeModule.transientRoomFailure(error), true, String(status));
+  }
+});
+
+test("P7a-11 an invalid page on the context read of a turn, once: the turn is not lost, the channel does not end, the page is not processed", async () => {
+  const runtime = roomRuntime([message(41, "After the restart.")]);
+  const readEvents = runtime.client.readEvents;
+  let contextReads = 0;
+  runtime.client.readEvents = async (state, after, options = {}) => {
+    if (!options.wait) {
+      contextReads += 1;
+      // During the server's shutdown: no active epoch metadata, not a list of events.
+      if (contextReads === 1) return {events: [message(40, "Never processed."), "garbage"]};
+    }
+    return readEvents(state, after, options);
+  };
+  const controller = new AbortController();
+  const timers = compressTimers();
+  let turn;
+  try {
+    const turns = runtime.assignedTurns(controller.signal);
+    turn = await turns.next();
+    controller.abort();
+    await turns.return();
+  } finally {
+    timers.restore();
+  }
+  assert.equal(turn.done, false);
+  assert.equal(turn.value.sourceEventId ?? turn.value.id, "message000041");
+  assert.ok(contextReads >= 2, String(contextReads));
+  assert.ok(!JSON.stringify(turn.value).includes("Never processed."));
+  const waits = timers.of("assignedTurns");
+  assert.equal(waits.length, 1);
+  assert.ok(waits[0] <= 1000, String(waits));
+});
+
+test("P7a-12 a partial outage, the event read succeeds and a later contact fails every time, or every heartbeat fails: the waits grow to the cap and the registrations stay at one", async () => {
+  // OP-12 N1: event read 200, Room state 503 for ever.
+  const runtime = roomRuntime([message(41, "x")]);
+  const room = {registrations: 0, heartbeats: 0};
+  Object.assign(runtime.client, {
+    register: async () => { room.registrations += 1; return {sessionId: `session-${room.registrations}`, capabilities: []}; },
+    heartbeat: async () => { room.heartbeats += 1; return {}; },
+    connectorEnrollments: async () => [],
+    roomState: async () => { throw new RoomAPIError(503, {}); },
+  });
+  await runtime.registerConnector();
+  const controller = new AbortController();
+  const timers = compressTimers();
+  try {
+    const turns = runtime.assignedTurns(controller.signal);
+    const next = turns.next().catch(() => null);
+    const deadline = Date.now() + 10_000;
+    while (timers.of("assignedTurns").length < 7 && Date.now() < deadline) await pause(2);
+    controller.abort();
+    await next;
+  } finally {
+    timers.restore();
+  }
+  const waits = timers.of("assignedTurns").slice(0, 7);
+  assert.equal(waits.length, 7);
+  waits.forEach((wait, index) => assertOnSchedule(wait, index, waits));
+  delete runtime.maintainPresence;
+  runtime.publishPresence = async () => {};
+  await runtime.maintainPresence();
+  assert.deepEqual([room.registrations, room.heartbeats], [1, 1]);
+
+  // Every heartbeat fails while the Room would accept a registration.
+  const beats = roomRuntime([message(41, "x")]);
+  delete beats.maintainPresence;
+  beats.publishPresence = async () => {};
+  const counts = {registrations: 0, heartbeats: 0};
+  Object.assign(beats.client, {
+    register: async () => { counts.registrations += 1; return {sessionId: "s", capabilities: []}; },
+    heartbeat: async () => { counts.heartbeats += 1; throw new RoomAPIError(502, {}); },
+    connectorEnrollments: async () => [],
+  });
+  await beats.registerConnector();
+  beats.connectorSession = {sessionId: "s", heartbeatIntervalSeconds: 0.01};
+  beats.heartbeatMinimumSeconds = 0.01;
+  const heartbeatTimers = compressTimers();
+  try {
+    beats.runHeartbeat();
+    const deadline = Date.now() + 10_000;
+    while (heartbeatTimers.of("").length < 7 && Date.now() < deadline) await pause(2);
+  } finally {
+    await beats.close();
+    heartbeatTimers.restore();
+  }
+  const retries = heartbeatTimers.of("").slice(0, 7);
+  assert.equal(retries.length, 7, String(retries));
+  retries.forEach((wait, index) => assertOnSchedule(wait, index, retries));
+  assert.equal(counts.registrations, 1);
+});
+
+test("P7a-13 a transient failure of the attempt settle and of the acknowledgement after a host run: retried on the schedule inside the connector, the connection stays, the source is acknowledged when the Room answers", async () => {
+  const runtime = roomRuntime([message(41, "x")]);
+  const event = message(41, "x");
+  let settles = 0;
+  let acks = 0;
+  runtime.client.completeDiscussionAttempt = async () => {
+    settles += 1;
+    if (settles <= 2) throw new RoomAPIError(502, {});
+    return {};
+  };
+  runtime.client.acknowledge = async (_state, seq) => {
+    acks += 1;
+    if (acks === 1) throw new clientModule.RoomResponseError("edge page", {status: 503});
+    if (acks === 2) throw Object.assign(new TypeError("fetch failed"), {cause: {code: "ECONNRESET"}});
+    return {acknowledgedSeq: seq};
+  };
+  const attempt = {cycle: {id: "cycle-1", generation: 1}, attempt: {id: "attempt-1", membershipId: "zurie", leaseExpiresAt: leaseIn(60_000)}};
+  const timers = compressTimers();
+  try {
+    await runtime.settleDiscussionAttempt(attempt, "pass");
+    runtime.pendingEvent = event;
+    await runtime.recordSkipped(event.id, "model_no_visible_reply");
+    await runtime.ack(event.id);
+  } finally {
+    timers.restore();
+  }
+  assert.equal(attempt.settled, true);
+  assert.equal(settles, 3);
+  assert.equal(acks, 3);
+  assert.equal(runtime.state.cursor, 41);
+  const waits = timers.of("retryContact");
+  assert.equal(waits.length, 4, String(waits));
+  assert.ok(waits[0] <= 1000 && waits[2] <= 1000, String(waits));
+});
+
+test("P7a-14 the status tells the truth: inactive only while muted and otherwise up, stopped and reconnecting win, a revoked credential shows stopped with credential_revoked, connected after an unmute or a new runtime", async () => {
+  const directory = await mkdtemp(join(home, "status-"));
+  const path = join(directory, "status.json");
+  const status = new statusModule.LocalStatus(path, {version: "test", hostLabel: "h"});
+  const read = async () => JSON.parse(await readFile(path, "utf8")).rooms["room-1"];
+  const seen = [];
+  const note = async () => { const entry = await read(); seen.push([entry.connection, entry.lastErrorCode]); };
+  status.room("room-1", "member-1", {connected: true, registered: true}); await note();
+  status.room("room-1", "", {connection: "inactive", inactive: true, errorCode: "connector_not_active"}); await note();
+  status.room("room-1", "", {connected: true}); await note(); // a heartbeat while muted
+  status.room("room-1", "", {connection: "reconnecting", errorCode: "network"}); await note();
+  status.room("room-1", "", {connected: true}); await note(); // up again, still muted
+  status.room("room-1", "", {errorCode: "credential_revoked"});
+  status.room("room-1", "", {connection: "stopped"}); await note();
+  status.room("room-1", "", {connected: true, registered: true}); await note(); // a new runtime registers
+  status.room("room-1", "", {connection: "inactive", inactive: true, errorCode: "connector_not_active"});
+  status.room("room-1", "", {inactive: false, connection: "connected", errorCode: ""}); await note(); // unmuted
+  assert.deepEqual(seen, [
+    ["connected", ""], ["inactive", "connector_not_active"], ["inactive", "connector_not_active"],
+    ["reconnecting", "network"], ["inactive", "network"], ["stopped", "credential_revoked"],
+    ["connected", "credential_revoked"], ["connected", ""],
+  ]);
+});
+
+test("P7a-15 a failed heartbeat is retried on the schedule, not at the heartbeat interval, and its step returns to the first after a successful heartbeat", async () => {
+  const runtime = roomRuntime([message(41, "x")]);
+  delete runtime.maintainPresence;
+  runtime.publishPresence = async () => {};
+  const script = [false, false, true, false, true];
+  let beats = 0;
+  Object.assign(runtime.client, {
+    heartbeat: async () => {
+      beats += 1;
+      if (script[beats - 1] === false) throw new RoomAPIError(503, {});
+      return {};
+    },
+    connectorEnrollments: async () => [],
+  });
+  runtime.connectorSession = {sessionId: "s", heartbeatIntervalSeconds: 60};
+  const timers = compressTimers();
+  try {
+    runtime.runHeartbeat();
+    const deadline = Date.now() + 5000;
+    while (beats < script.length + 1 && Date.now() < deadline) await pause(2);
+  } finally {
+    await runtime.close();
+    timers.restore();
+  }
+  const waits = timers.of("").slice(0, 6);
+  const interval = 60 * 800;
+  // interval, fail -> step 0, fail -> step 1, success -> interval, fail -> step 0 again, success -> interval
+  assert.equal(waits[0], interval, String(waits));
+  assertOnSchedule(waits[1], 0, waits);
+  assertOnSchedule(waits[2], 1, waits);
+  assert.equal(waits[3], interval, String(waits));
+  assertOnSchedule(waits[4], 0, waits);
+  assert.equal(waits[5], interval, String(waits));
+});
+
+test("P7a-16 the attempt renewal and the re-claim before a post retry on the schedule capped at 5 s at the call", async () => {
+  // The renewal: six transient failures with a long lease.
+  const runtime = roomRuntime([message(41, "x")]);
+  delete runtime.startAttemptLease;
+  let claims = 0;
+  runtime.client.claimDiscussionAttempt = async () => {
+    claims += 1;
+    if (claims <= 6) throw new RoomAPIError(503, {});
+    return {cycle: {id: "cycle-1", generation: 1}, attempt: {id: "attempt-1", membershipId: "zurie", leaseExpiresAt: leaseIn(600_000)}};
+  };
+  const attempt = () => ({cycle: {id: "cycle-1", generation: 1}, attempt: {id: "attempt-1", membershipId: "zurie", leaseExpiresAt: leaseIn(600_000)}});
+  const timers = compressTimers();
+  try {
+    runtime.startAttemptLease({id: "message000041", seq: 41}, attempt());
+    const deadline = Date.now() + 5000;
+    while (claims < 7 && Date.now() < deadline) await pause(1);
+  } finally {
+    await runtime.stopAttemptLease("message000041");
+    timers.restore();
+  }
+  const renewals = timers.of("renewAttemptLease").slice(0, 6);
+  assert.equal(renewals.length, 6, String(renewals));
+  renewals.forEach((wait, index) => assertOnSchedule(wait, index, renewals, 5000));
+
+  // The re-claim before a post: the same schedule and cap.
+  const reclaim = roomRuntime([message(41, "x")]);
+  let reclaims = 0;
+  reclaim.client.claimDiscussionAttempt = async () => {
+    reclaims += 1;
+    if (reclaims <= 6) throw new RoomAPIError(503, {});
+    return attempt();
+  };
+  const held = attempt();
+  reclaim.attemptLeases.set("message000041", {sourceEvent: {id: "message000041", seq: 41}, cycleAttempt: held, timer: null,
+    inflight: null, stopped: false, superseded: false, reason: ""});
+  const intent = {identity: {sourceEventId: "message000041", cycle: {cycleId: "cycle-1", attemptId: "attempt-1"}}};
+  const timers2 = compressTimers();
+  let reason;
+  try {
+    reason = await reclaim.attemptAuthorityLost(intent);
+  } finally {
+    timers2.restore();
+  }
+  assert.equal(reason, "");
+  const waits = timers2.of("attemptAuthorityLost").slice(0, 6);
+  assert.equal(waits.length, 6, String(waits));
+  waits.forEach((wait, index) => assertOnSchedule(wait, index, waits, 5000));
+});
+
+test("the scan loop's schedule returns to its first step after a full pass, never after an accepted registration", async () => {
+  const runtime = roomRuntime([message(41, "x")]);
+  const script = [false, false, false, true, false, false];
+  let reads = 0;
+  let registrations = 0;
+  const roomState = runtime.client.roomState;
+  runtime.client.register = async () => { registrations += 1; return {sessionId: `s-${registrations}`, capabilities: []}; };
+  runtime.client.roomState = async (...args) => {
+    reads += 1;
+    if (script[reads - 1] === false) {
+      // A registration accepted meanwhile (another loop) resets nothing here.
+      await runtime.registerConnector();
+      throw new RoomAPIError(503, {});
+    }
+    return roomState(...args);
+  };
+  const controller = new AbortController();
+  const timers = compressTimers();
+  try {
+    const turns = runtime.assignedTurns(controller.signal);
+    const first = await turns.next(); // three failures, then a full pass with the turn
+    assert.equal(first.done, false);
+    const second = turns.next().catch(() => null);
+    const deadline = Date.now() + 5000;
+    while (timers.of("assignedTurns").length < 5 && Date.now() < deadline) await pause(2);
+    controller.abort();
+    await second;
+  } finally {
+    timers.restore();
+  }
+  const waits = timers.of("assignedTurns").slice(0, 5);
+  assert.equal(waits.length, 5, String(waits));
+  [0, 1, 2].forEach((step) => assertOnSchedule(waits[step], step, waits));
+  // After the full pass: the first step again, then the second.
+  assertOnSchedule(waits[3], 0, waits);
+  assertOnSchedule(waits[4], 1, waits);
+  assert.ok(registrations >= 5);
 });

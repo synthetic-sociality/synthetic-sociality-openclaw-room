@@ -1,7 +1,7 @@
 import {createHash, randomUUID} from "node:crypto";
 import {hostname} from "node:os";
 import {dirname, join} from "node:path";
-import {RETRY_AFTER_MAXIMUM_SECONDS, RoomAPIError, RoomClient, RoomResponseError, roomErrorDiagnostic} from "./room-client.js";
+import {RETRY_AFTER_MAXIMUM_SECONDS, RoomAPIError, RoomClient, RoomResponseError, isNetworkFailure, roomErrorDiagnostic} from "./room-client.js";
 import {loadState, migrateStateFile, saveNewState, saveState} from "./state.js";
 import {activateRoomChannel} from "./activation.js";
 import {ROOM_CONNECTOR_PROVENANCE} from "./release-provenance.js";
@@ -459,10 +459,13 @@ function acceptedActivitySequence(receipt, expected) {
   return receipt.acceptedStreamSeq;
 }
 
+// A completed wait removes its abort listener, so endless retries never pile
+// listeners onto the host's signal.
 const sleep = (milliseconds, signal) => new Promise((resolve, reject) => {
   if (signal?.aborted) return reject(signal.reason ?? new Error("aborted"));
-  const timer = setTimeout(resolve, milliseconds);
-  signal?.addEventListener("abort", () => { clearTimeout(timer); reject(signal.reason ?? new Error("aborted")); }, {once: true});
+  const aborted = () => { clearTimeout(timer); reject(signal.reason ?? new Error("aborted")); };
+  const timer = setTimeout(() => { signal?.removeEventListener("abort", aborted); resolve(); }, milliseconds);
+  signal?.addEventListener("abort", aborted, {once: true});
 });
 
 // Contract P2c-3a: the reconnect schedule, identical in Hermes
@@ -495,17 +498,28 @@ export class InvalidEventPage extends Error {
   }
 }
 
-// Contract P2c-3a: a failure the connector retries itself instead of ending
-// the channel: a retryable Room answer (5xx, 429, a retryable code) other than
-// a revoked or expired credential, a network error or timeout, a response that
-// is not the expected JSON, or an invalid event page.
+// Contract P2c-3a: the failed contacts the connector retries itself instead
+// of ending the channel, exactly: a network failure (Node's "fetch failed"
+// with a network cause) or a request timeout; an HTTP 5xx or 429; an answer
+// whose body is not the Room's JSON, whatever its status; a Room JSON error
+// marked retryable (never a revoked or expired credential); an invalid event
+// page. Anything else fails closed: a programming error (any other
+// TypeError), a local failure, an abort, every other Room answer.
 export function transientRoomFailure(error) {
   if (error instanceof RoomAPIError) {
     return error.retryable && error.code !== "credential_revoked" && error.code !== "credential_expired";
   }
   if (error instanceof RoomResponseError || error instanceof InvalidEventPage) return true;
   if (error?.name === "TimeoutError") return true;
-  return error instanceof TypeError && /fetch failed|terminated|network/iu.test(String(error.message));
+  return isNetworkFailure(error);
+}
+
+// A failed contact that carries no Room code: the Room has not answered the
+// request yet (network, timeout, 5xx/429 without a code, a body that is not
+// the Room's JSON). A coded Room answer is an answer, never retried as one.
+export function uncodedContactFailure(error) {
+  return transientRoomFailure(error) && !(error instanceof InvalidEventPage)
+    && !(error instanceof RoomAPIError && error.code);
 }
 
 // A background wait (the heartbeat loop) never keeps the process alive by itself.
@@ -569,8 +583,8 @@ export class OpenClawRoomRuntime {
     // P2c-3b: when an inactive membership's Room state was last read (0: active).
     this.inactiveRecheckMs = INACTIVE_RECHECK_MS;
     this.inactiveCheckedAt = 0;
-    // Validated event pages read by this runtime (resets the P2c-3a schedule).
-    this.pagesRead = 0;
+    // Full passes of the event scan completed without a failure (P2c-3a reset).
+    this.scanPasses = 0;
   }
 
   async initialize(signal) {
@@ -607,8 +621,8 @@ export class OpenClawRoomRuntime {
   retryDelay(step, error = null, capMs = this.reconnectMaxMs) {
     return reconnectDelayMs(step, {
       firstMs: this.reconnectInitialMs, capMs,
-      retryAfterSeconds: error instanceof RoomAPIError ? error.retryAfter : 0,
-      status: error instanceof RoomAPIError ? error.status : 0,
+      retryAfterSeconds: error instanceof RoomAPIError || error instanceof RoomResponseError ? error.retryAfter : 0,
+      status: error instanceof RoomAPIError || error instanceof RoomResponseError ? error.status : 0,
     });
   }
 
@@ -752,24 +766,28 @@ export class OpenClawRoomRuntime {
 
   // Contract P2c-3a: a transient failure while reading or processing events
   // (a Room outage, an invalid page) never ends the channel: the scan resumes
-  // from the durable frontier, as a host restart would, on the schedule.
+  // from the durable frontier, as a host restart would, on the schedule. The
+  // step returns to the first only when the contact that last failed has
+  // succeeded since, or a full pass completed; the session is kept (a lost
+  // session is registered again by the presence path, P2c-3).
   async *assignedTurns(signal) {
-    for (let step = 0; ; step += 1) {
-      const pages = this.pagesRead;
+    let step = 0;
+    let failed = null;
+    for (;;) {
       try {
-        for await (const turn of this.assignedTurnsOnce(signal)) {
-          step = 0;
-          yield turn;
-        }
+        for await (const turn of this.assignedTurnsOnce(signal)) yield turn;
         return;
       } catch (error) {
         if (signal?.aborted || this.closed || !transientRoomFailure(error)) throw error;
-        if (this.pagesRead !== pages) step = 0;
+        if (failed && (this.scanPasses !== failed.passes
+          || (failed.contact && (this.client?.contactSucceeded?.(failed.contact) ?? 0) > failed.successes))) step = 0;
+        const contact = typeof error?.roomContact === "string" ? error.roomContact : "";
+        failed = {contact, successes: contact ? this.client?.contactSucceeded?.(contact) ?? 0 : 0, passes: this.scanPasses};
         this.logger?.warn?.(`Room event processing interrupted${roomErrorDiagnostic(error)}${error instanceof InvalidEventPage ? " (invalid event page)" : ""}; resuming from the acknowledged position`);
         this.reportStatus({connection: "reconnecting", errorCode: statusErrorCode(error)});
         this.pendingEvent = null;
-        this.reregister = true;
         await sleep(this.retryDelay(step, error), signal);
+        step += 1;
       }
     }
   }
@@ -783,13 +801,7 @@ export class OpenClawRoomRuntime {
       await this.renewAccess(signal);
       await this.applyRecoveryClosures(signal);
       const page = await this.readEventsResilient(Math.max(scanCursor, this.state.cursor), signal);
-      let pageEpoch;
-      try {
-        pageEpoch = validateActiveEpochPage(page);
-      } catch (error) {
-        throw new InvalidEventPage(error?.message || "Room event page active epoch metadata is invalid");
-      }
-      this.pagesRead += 1;
+      const pageEpoch = validEventPage(page);
       const pageActiveEpochId = pageEpoch.id;
       if (this.state.epochSessionRoutingInitialized !== true) {
         const initialEpochId = pageActiveEpochId;
@@ -968,6 +980,8 @@ export class OpenClawRoomRuntime {
           break;
         }
       }
+      // Contract P2c-3a: a full pass without a failure resets the schedule.
+      this.scanPasses += 1;
     }
   }
 
@@ -1276,8 +1290,10 @@ export class OpenClawRoomRuntime {
     // The ordinary loaded page: the 50 sequence numbers before the turn, never
     // before a known start.
     const before = Math.max(startKnown ? contextEpoch.startsAtSeq - 1 : 0, currentSeq - 50);
+    // Contract P2c-3a: an invalid page is never processed here either; the
+    // scan reads this turn again from the durable position on the schedule.
     const fetched = await this.client.readEvents(this.state, before, {wait: 0, signal});
-    const fetchedEpoch = validateActiveEpochPage(fetched);
+    const fetchedEpoch = validEventPage(fetched);
     if (fetchedEpoch.id !== sourceEpoch.id) {
       throw new Error("Room active epoch advanced while loading model context");
     }
@@ -1398,7 +1414,7 @@ export class OpenClawRoomRuntime {
     try {
       scanned = await Promise.race([
         scanEpochEvent(sourceEventId, beforeSeq, floor,
-          (after) => this.client.readEvents(this.state, after, {wait: 0, signal: bounded}), types),
+          async (after) => validEventPageShape(await this.client.readEvents(this.state, after, {wait: 0, signal: bounded})), types),
         // A read that ignores the abort still never holds the turn.
         new Promise((_, reject) => {
           const timedOut = () => reject(Object.assign(new Error("cycle source lookup timed out"), {name: "TimeoutError"}));
@@ -1445,7 +1461,16 @@ export class OpenClawRoomRuntime {
     const isStart = (item) => item?.type === "discussion.started" && Number(item?.seq) === Number(sourceEpoch.startsAtSeq);
     let startEvent = isStart(event) ? event : (Array.isArray(pageEvents) ? pageEvents.find(isStart) : undefined);
     if (!startEvent && Number(sourceEpoch.startsAtSeq) >= 1) {
-      const startPage = await this.client.readEvents(this.state, Number(sourceEpoch.startsAtSeq) - 1, {wait: 0, signal});
+      let startPage;
+      try {
+        startPage = validEventPageShape(await this.client.readEvents(this.state, Number(sourceEpoch.startsAtSeq) - 1, {wait: 0, signal}));
+      } catch (error) {
+        // Contract P2c-3a: an invalid page is not processed; this bounded
+        // look-up proceeds without it and remembers nothing for the epoch.
+        if (!(error instanceof InvalidEventPage)) throw error;
+        this.logger?.warn?.("Room discussion start unavailable: code invalid_event_page");
+        return null;
+      }
       startEvent = (startPage?.events ?? []).find(isStart);
     }
     this.epochStartEvents.set(sourceEpoch.id, startEvent ?? null);
@@ -1527,7 +1552,7 @@ export class OpenClawRoomRuntime {
         continue;
       }
       try {
-        const readPage = (after) => this.client.readEvents(this.state, after, {wait: 0, signal});
+        const readPage = async (after) => validEventPageShape(await this.client.readEvents(this.state, after, {wait: 0, signal}));
         let source = (Array.isArray(pageEvents) ? pageEvents : [])
           .find((item) => MISSED_SOURCE_EVENT_TYPES.has(item?.type) && String(item.id ?? "") === missed.sourceEventId);
         if (!source && missed.sourceSeq > 0) {
@@ -1611,7 +1636,7 @@ export class OpenClawRoomRuntime {
     if (!kept) return {block: "", clear: false};
     if (kept.epochId !== epoch.id || (kept.sourceSeq > 0 && kept.sourceSeq < epoch.startsAtSeq)) return {block: "", clear: true};
     try {
-      const readPage = (after) => this.client.readEvents(this.state, after, {wait: 0, signal});
+      const readPage = async (after) => validEventPageShape(await this.client.readEvents(this.state, after, {wait: 0, signal}));
       let source = (Array.isArray(pageEvents) ? pageEvents : [])
         .find((item) => item?.type === "message.posted" && String(item.id ?? "") === kept.sourceEventId);
       if (!source && kept.sourceSeq > 0) {
@@ -1701,6 +1726,27 @@ export class OpenClawRoomRuntime {
     } catch (error) {
       if (error instanceof RoomAPIError && ["cycle_no_attempt", "cycle_superseded"].includes(error.code)) return false;
       throw error;
+    }
+  }
+
+  // Contract P2c-3a: a Room contact made for a turn after its host run (the
+  // settle of its attempt, the acknowledgement of its source) is retried on
+  // the schedule while the Room has not answered (no code: network, timeout,
+  // 5xx, 429, a body that is not the Room's JSON). A coded Room answer, an
+  // abort and every other failure end it as before. The channel loop waits
+  // meanwhile; later Room events are read after it.
+  async retryContact(label, operation, signal = this.heartbeatAbort.signal) {
+    for (let step = 0; ; step += 1) {
+      try {
+        const result = await operation();
+        if (step > 0) this.reportStatus({connected: true});
+        return result;
+      } catch (error) {
+        if (signal?.aborted || this.closed || !uncodedContactFailure(error)) throw error;
+        if (step === 0) this.logger?.warn?.(`Room ${label} failed${roomErrorDiagnostic(error)}; retrying inside the connector`);
+        this.reportStatus({connection: "reconnecting", errorCode: statusErrorCode(error)});
+        await sleep(this.retryDelay(step, error), signal);
+      }
     }
   }
 
@@ -1922,7 +1968,9 @@ export class OpenClawRoomRuntime {
       if (this.pendingEvent?.id === event.id) this.pendingEvent = null;
       return;
     }
-    const response = await this.client.acknowledge(this.state, frontier);
+    // Contract P2c-3a: the evidence above is durable; the acknowledgement is
+    // retried on the schedule while the Room has not answered.
+    const response = await this.retryContact("acknowledgement", () => this.client.acknowledge(this.state, frontier));
     const authoritative = response?.acknowledgedSeq;
     if (!Number.isSafeInteger(authoritative) || authoritative !== frontier) {
       throw new Error("Room acknowledgement exceeded the locally proven contiguous frontier");
@@ -2681,13 +2729,16 @@ export class OpenClawRoomRuntime {
       attemptId: cycleAttempt.attempt?.id,
     });
     try {
-      const result = await this.client.completeDiscussionAttempt(
+      // Contract P2c-3a: renewal stopped above, the settle is retried on the
+      // schedule while the Room has not answered; the Room ends the attempt
+      // with its lease meanwhile (P1-1), and then answers with a code.
+      const result = await this.retryContact("attempt settle", () => this.client.completeDiscussionAttempt(
         this.state,
         cycleAttempt.cycle.id,
         cycleAttempt.attempt.id,
         {generation: cycleAttempt.cycle.generation, action, ...(failure ? {executionFailure: failure} : {})},
         signal,
-      );
+      ), signal ?? this.heartbeatAbort.signal);
       cycleAttempt.settled = true;
       this.logger?.info?.(`Room attempt settled ${action} ${fields}`);
       return result;
@@ -2716,24 +2767,22 @@ export class OpenClawRoomRuntime {
     throw new Error("Room turn was not granted before the lease deadline");
   }
 
-  // Contract P2c-3: a lost network or Room session is recovered here, with
-  // bounded backoff and without a host restart. Only a final refusal (a
-  // non-retryable Room error such as a revoked credential) still ends the read.
+  // Contract P2c-3: a lost network is recovered here on the P2c-3a schedule
+  // (this loop's only contact is the read: its success ends the wait),
+  // without a host restart. The session is kept: the Room still accepts it
+  // unless it says otherwise (P2c-3a). Anything that is not a failed contact
+  // ends the read as before.
   async readEventsResilient(after, signal) {
     let lost = false;
     for (let step = 0; ; step += 1) {
       try {
         const page = await this.client.readEvents(this.state, after, {wait: 20, signal});
-        if (lost) {
-          this.logger?.info?.("Room event stream resumed; registering the connector session again");
-          this.reregister = true;
-        }
+        if (lost) this.logger?.info?.("Room event stream resumed");
         return page;
       } catch (error) {
-        if (signal?.aborted || this.closed || (error instanceof RoomAPIError && !error.retryable)) throw error;
+        if (signal?.aborted || this.closed || !transientRoomFailure(error)) throw error;
         if (!lost) this.logger?.warn?.(`Room connection lost${roomErrorDiagnostic(error)}; reconnecting`);
         lost = true;
-        this.reregister = true;
         this.reportStatus({connection: "reconnecting", errorCode: statusErrorCode(error)});
         await sleep(this.retryDelay(step, error), signal);
       }
@@ -2745,9 +2794,9 @@ export class OpenClawRoomRuntime {
       await this.maintainPresence(signal);
     } catch (error) {
       if (signal?.aborted || this.closed || (error instanceof RoomAPIError && !error.retryable && !sessionLost(error))) throw error;
-      this.reregister = true;
+      // P2c-3a: the session is kept; a lost one was flagged by maintainPresence.
       this.reportStatus({connection: "reconnecting", errorCode: statusErrorCode(error)});
-      this.logger?.warn?.(`Room presence unavailable${roomErrorDiagnostic(error)}; registering again at the next contact`);
+      this.logger?.warn?.(`Room presence unavailable${roomErrorDiagnostic(error)}; retrying at the next contact`);
     }
   }
 
@@ -2767,8 +2816,8 @@ export class OpenClawRoomRuntime {
         } catch (error) {
           if (this.closed || this.heartbeatAbort.signal.aborted) return;
           if (error instanceof RoomAPIError && !error.retryable && !sessionLost(error)) throw error;
-          // P2c-3: keep the loop; the next contact registers the session again.
-          this.reregister = true;
+          // P2c-3a: keep the loop and the session; only the Room's own "lost"
+          // (flagged in maintainPresence) registers it again.
           this.reportStatus({connection: "reconnecting", errorCode: statusErrorCode(error)});
           this.logger?.warn?.(`Room heartbeat failed${roomErrorDiagnostic(error)}; retrying`);
           delay = this.retryDelay(step, error);
@@ -2794,9 +2843,11 @@ export class OpenClawRoomRuntime {
         try {
           await this.client.heartbeat(this.state, this.connectorSession.sessionId, signal);
         } catch (error) {
-          // P2c-3: the Room no longer holds this session; register it again.
+          // P2c-3: the Room said in its JSON that it no longer holds this
+          // session; register it again (until accepted, if this one fails).
           if (!sessionLost(error)) throw error;
           this.logger?.warn?.(`Room connector session lost${roomErrorDiagnostic(error)}; registering again`);
+          this.reregister = true;
           await this.registerConnector(signal);
         }
         this.reportStatus({connected: true});
@@ -3151,8 +3202,35 @@ export function validateActiveEpochPage(page) {
   const startsAtSeq = page?.activeEpochStartsAtSeq;
   // Contract P6-2: a page start of any shape other than an integer of at
   // least 1 is unknown (0); it never stops the channel. The epoch id stays a
-  // fence: a page without a valid id still fails closed.
+  // fence: a page without a valid id is invalid and never processed (P2c-3a:
+  // it is read again on the schedule).
   return {id, startsAtSeq: knownEpochStart(startsAtSeq)};
+}
+
+// Contract P2c-3a: the shape of an event page (Hermes valid_event_page): an
+// object whose events, when present, are a list of objects. A bounded look-up
+// of one earlier item reads pages of this shape only and proceeds without an
+// invalid one, as for any failed read.
+export function validEventPageShape(page) {
+  const events = page?.events;
+  if (!page || typeof page !== "object" || Array.isArray(page)
+    || (events !== undefined && !(Array.isArray(events) && events.every((item) => item && typeof item === "object" && !Array.isArray(item))))) {
+    throw new InvalidEventPage("Room event page is not a list of events");
+  }
+  return page;
+}
+
+// Contract P2c-3a: an event page is valid when it is an object whose events,
+// when present, are a list of objects and whose active epoch metadata is
+// valid. An invalid page is an InvalidEventPage: never processed, read again
+// from the same cursor on the schedule, wherever it was read.
+export function validEventPage(page) {
+  validEventPageShape(page);
+  try {
+    return validateActiveEpochPage(page);
+  } catch (error) {
+    throw new InvalidEventPage(error?.message || "Room event page active epoch metadata is invalid");
+  }
 }
 
 // Contract P6-2: the active epoch's start when it is known, else 0. Known
