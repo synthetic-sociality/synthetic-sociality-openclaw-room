@@ -31,7 +31,7 @@ after(() => rm(home, {recursive: true, force: true}));
 const runtimeModule = await import("../src/runtime.js");
 const {
   OpenClawRoomRuntime, ROOM_NO_SYSTEM_STATUS_INSTRUCTION, WORD_BOUND_CYCLE_SOURCE, WORD_BOUND_POLICY_SOURCE, activeTopic,
-  canonicalRoomContext, guidanceCarriesNoStatusSentence, normalizeEvent, positiveWordLimit, roomTurnFacts, wordBoundFact,
+  canonicalRoomContext, guidanceCarriesNoStatusSentence, normalizeEvent, positiveWordLimit, roomTurnFacts, statusErrorCode, wordBoundFact,
 } = runtimeModule;
 const {RoomAPIError, RoomClient, RoomRequestError, RoomTransportError} = await import("../src/room-client.js");
 const {GATE_WAIT_REASONS, LocalStatus} = await import("../src/local-status.js");
@@ -316,10 +316,14 @@ test("P7c-07 the shared transcript vector renders byte-identically and marks the
   }
   // The history tool.
   resetHistoryScanCache();
-  const events = [START, HUMAN, PEER, OWN];
+  // Another member with the agent's display name is never marked (by actorId only).
+  const namesake = {id: "m-45", seq: 45, type: "message.posted", actorRole: "participant_agent", actorId: "zurie-2",
+    payload: {body: "Same name, another member.", epochId: "epoch-z"}};
+  const events = [START, HUMAN, PEER, OWN, namesake];
   const client = {
-    roomState: async () => ({headSeq: 44, activeEpoch: {id: "epoch-z", ordinal: 2, startsAtSeq: 41}, roster: ROSTER}),
-    readEvents: async (_session, afterSeq) => ({events: events.filter((item) => item.seq > afterSeq), headSeq: 44}),
+    roomState: async () => ({headSeq: 45, activeEpoch: {id: "epoch-z", ordinal: 2, startsAtSeq: 41},
+      roster: [...ROSTER, {membershipId: "zurie-2", displayName: "Zurie", role: "participant_agent", status: "active"}]}),
+    readEvents: async (_session, afterSeq) => ({events: events.filter((item) => item.seq > afterSeq), headSeq: 45}),
     listEpochs: async () => ({epochs: [{id: "epoch-z", ordinal: 2, startsAtSeq: 41, status: "active"}]}),
   };
   // Through the registered tool and its own session resolver, over the saved
@@ -332,7 +336,7 @@ test("P7c-07 the shared transcript vector renders byte-identically and marks the
   registerRoomHistoryTool({registerTool: (tool) => tools.push(tool)}, {makeClient: () => client});
   const history = JSON.parse((await tools[0].execute("call-1", {})).content[0].text);
   assert.equal(history.success, true, JSON.stringify(history));
-  assert.deepEqual(Object.fromEntries(history.messages.map((entry) => [entry.seq, entry.actor])), {42: "TJE", 43: "Paula", 44: "Zurie (you)"});
+  assert.deepEqual(Object.fromEntries(history.messages.map((entry) => [entry.seq, entry.actor])), {42: "TJE", 43: "Paula", 44: "Zurie (you)", 45: "Zurie"});
   await rm(join(accounts, "t.json"));
 });
 
@@ -733,6 +737,9 @@ test("P7c-21 a credential the runtime refuses in a header is never in an error, 
     assert.ok(runtime.logs.some((line) => line.includes("request_not_formed")), runtime.logs.join("\n"));
     assert.ok(!runtime.logs.join("\n").includes(secret));
   }
+  // The channel writes statusErrorCode(error) when it ends (src/channel.js): the
+  // plugin's own code, never network.
+  assert.equal(statusErrorCode(new RoomRequestError()), "request_not_formed");
   // The heartbeat loop fails closed on it as well and ends the read.
   const runtime = runtimeFor([HUMAN]);
   runtime.heartbeatMinimumSeconds = 0.001;
@@ -838,11 +845,24 @@ test("a fenced message of an earlier discussion is acknowledged at once, before 
   const events = [old, START, HUMAN];
   const runtime = runtimeFor(events, {pageStartsAt: 0, policy: {coordinationMode: "open"}});
   runtime.state.cursor = 19;
-  const acknowledgedBefore = {};
-  runtime.markContextAcknowledged = async (event) => { acknowledgedBefore[event.seq] = [...runtime.calls.acks]; };
+  // The first Room state read after the fenced message was superseded is the
+  // fence read of the next event: the fenced message is acknowledged by then.
+  let superseded = false;
+  let acknowledgedAtNextRead = null;
+  const supersede = runtime.supersedeHistoricalEvent.bind(runtime);
+  runtime.supersedeHistoricalEvent = async (event, ...rest) => {
+    const result = await supersede(event, ...rest);
+    if (event.seq === 20) superseded = true;
+    return result;
+  };
+  const read = runtime.client.roomState;
+  runtime.client.roomState = async (...args) => {
+    if (superseded && acknowledgedAtNextRead === null) acknowledgedAtNextRead = [...runtime.calls.acks];
+    return read(...args);
+  };
   await scan(runtime, events);
-  const next = Object.keys(acknowledgedBefore).map(Number).sort((a, b) => a - b)[0];
-  assert.ok(next > 20 && acknowledgedBefore[next].includes(20), JSON.stringify(acknowledgedBefore));
+  assert.ok(superseded, "the earlier message was fenced");
+  assert.deepEqual(acknowledgedAtNextRead, [20]);
 });
 
 test("the topic is trimmed as guidance is", () => {
