@@ -134,7 +134,7 @@ test("conformance P7a case names resolve to tests in this suite", async () => {
   const sources = await Promise.all((await readdir(directory)).filter((name) => name.endsWith(".test.mjs"))
     .map((name) => readFile(new URL(name, directory), "utf8")));
   const cases = Object.entries(conformance.parityP7aCases ?? {});
-  assert.equal(cases.length, 18);
+  assert.equal(cases.length, 20);
   cases.forEach(([id, name], index) => {
     assert.equal(id, `P7a-${String(index + 1).padStart(2, "0")}`);
     assert.ok(name.startsWith(`${id} `), id);
@@ -521,6 +521,12 @@ test("the P2c-3a failed contacts are exactly the listed ones; a programming erro
   const own = new clientModule.RoomClient({baseUrl: "https://room.example/api", fetchImpl: async () => { fetched += 1; return json({}); }});
   const ownError = await own.request("/rooms/room-1/messages", {method: "POST", body: {size: 1n}}).catch((caught) => caught);
   assert.equal([ownError instanceof TypeError, transientRoomFailure(ownError), fetched].join(), "true,false,0");
+  // Hermes r2 N1: a post-run contact is retried on a 5xx or 429 with or
+  // without a Room code; any other coded answer is an answer.
+  assert.equal(runtimeModule.uncodedContactFailure(new RoomAPIError(500, {code: "internal", retryable: true})), true);
+  assert.equal(runtimeModule.uncodedContactFailure(new RoomAPIError(429, {code: "rate_limited", retryable: true})), true);
+  assert.equal(runtimeModule.uncodedContactFailure(new RoomAPIError(503, {code: "busy", retryable: true})), true); // a listed code is kept
+  assert.equal(runtimeModule.uncodedContactFailure(new RoomAPIError(409, {code: "stale_context", retryable: true})), false);
   // OP-12 r2 N1: the long poll and the context read are two contacts.
   assert.notEqual(clientModule.roomContact("GET", "/rooms/r/events?after=1&limit=100&waitSeconds=20"),
     clientModule.roomContact("GET", "/rooms/r/events?after=1&limit=100"));
@@ -1105,4 +1111,88 @@ test("every retry loop ends on the stop signal at once, without a further contac
 
   const once = [1, false];
   assert.deepEqual(results, {start: once, read: once, scan: once, settle: once, acknowledgement: once, heartbeat: once});
+});
+
+test("P7a-19 the settle of an attempt gets no Room answer three times while a claim would still succeed: no renewal or re-claim is sent once the settle starts, the settle is retried on the schedule, nothing is posted twice", async () => {
+  const runtime = roomRuntime([message(41, "x")]);
+  delete runtime.startAttemptLease; // the real lease and its renewal
+  const attempt = {cycle: {id: "cycle-1", generation: 1}, attempt: {id: "attempt-1", membershipId: "zurie", leaseExpiresAt: leaseIn(3_000)}};
+  let claims = 0;
+  let posts = 0;
+  const settles = []; // the claims made before each settle try
+  Object.assign(runtime.client, {
+    claimDiscussionAttempt: async () => { claims += 1; return {cycle: attempt.cycle, attempt: {...attempt.attempt, leaseExpiresAt: leaseIn(3_000)}}; },
+    completeDiscussionAttempt: async () => {
+      settles.push(claims);
+      if (settles.length > 3) return {};
+      await pause(30); // time in which a live renewal would claim again
+      throw new clientModule.RoomResponseError("edge page", {status: 502});
+    },
+    postMessage: async () => { posts += 1; return {}; },
+  });
+  const timers = compressTimers();
+  try {
+    runtime.startAttemptLease(message(41, "x"), attempt);
+    const deadline = Date.now() + 5000;
+    while (claims < 2 && Date.now() < deadline) await pause(2); // the renewal is alive and the claim succeeds
+    await runtime.settleDiscussionAttempt(attempt, "pass");
+    await pause(30);
+  } finally {
+    timers.restore();
+    await runtime.close();
+  }
+  assert.ok(claims >= 2, String(claims));
+  assert.equal(attempt.settled, true);
+  assert.equal(settles.length, 4);
+  assert.deepEqual([...new Set([...settles, claims])], [settles[0]]); // no claim once the settle started
+  assert.equal(posts, 0);
+  const waits = timers.of("retryContact");
+  assert.equal(waits.length, 3, String(waits));
+  waits.forEach((wait, index) => assertOnSchedule(wait, index, waits));
+});
+
+test("P7a-20 the Room's JSON credential_revoked and credential_expired, each on the event read and on the heartbeat: both loops end at once, no further contact, status stopped with that code", async () => {
+  const outcomes = {};
+  const expected = {};
+  for (const code of ["credential_revoked", "credential_expired"]) {
+    for (const where of ["event read", "heartbeat"]) {
+      const runtime = roomRuntime([message(41, "x")]);
+      delete runtime.maintainPresence;
+      runtime.publishPresence = async () => {};
+      runtime.connectorSession = {sessionId: "s", heartbeatIntervalSeconds: 0.01};
+      runtime.heartbeatMinimumSeconds = 0.01;
+      const contacts = [];
+      const refusal = () => new RoomAPIError(401, {code, message: "refused"});
+      Object.assign(runtime.client, {
+        // The long poll waits for the Room (or for its signal), as fetch does.
+        readEvents: (_state, _after, {signal} = {}) => {
+          contacts.push("read");
+          if (where === "event read") return Promise.reject(refusal());
+          return new Promise((_resolve, reject) => signal.addEventListener("abort", () => reject(signal.reason), {once: true}));
+        },
+        heartbeat: async () => { contacts.push("heartbeat"); if (where === "heartbeat") throw refusal(); return {}; },
+        connectorEnrollments: async () => [],
+      });
+      runtime.initialize = async () => { runtime.runHeartbeat(); return runtime.connectorSession; };
+      const channel = channelModule.createRoomChannel({makeClient: (_account, {status}) => { runtime.status = status; return runtime; }});
+      const controller = new AbortController();
+      let hostStatus = {};
+      const run = channel.plugin.gateway.startAccount({
+        account: {accountId: "p7a-20", stateFile: runtime.account.stateFile}, accountId: "p7a-20",
+        abortSignal: controller.signal, cfg: ISOLATED_HOST_CONFIG, channelRuntime: {},
+        getStatus: () => hostStatus, setStatus: (next) => { hostStatus = next; },
+        log: {info: () => {}, warn: () => {}, error: () => {}},
+      }).then(() => null, (error) => error);
+      const ended = await Promise.race([run, pause(3000).then(() => "still running")]);
+      const made = contacts.length;
+      if (ended === "still running") { controller.abort(); await run; }
+      await pause(50);
+      const entry = JSON.parse(await readFile(channelModule.roomStatusPath(ISOLATED_HOST_CONFIG), "utf8")).rooms["room-1"];
+      const key = `${code} on the ${where}`;
+      outcomes[key] = [ended?.code ?? ended, contacts.length - made, entry.connection, entry.lastErrorCode,
+        contacts.filter((contact) => contact === (where === "heartbeat" ? "heartbeat" : "read")).length];
+      expected[key] = [code, 0, "stopped", code, 1];
+    }
+  }
+  assert.deepEqual(outcomes, expected);
 });

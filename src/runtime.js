@@ -515,12 +515,12 @@ export function transientRoomFailure(error) {
   return error?.name === "TimeoutError";
 }
 
-// A failed contact that carries no Room code: the Room has not answered the
-// request yet (network, timeout, 5xx/429 without a code, a body that is not
-// the Room's JSON). A coded Room answer is an answer, never retried as one.
+// A failed contact the Room has not answered, or answered that it failed:
+// network, timeout, a 5xx or 429 with or without a code, a body that is not
+// the Room's JSON. Any other coded Room answer is an answer, never retried.
 export function uncodedContactFailure(error) {
   return transientRoomFailure(error) && !(error instanceof InvalidEventPage)
-    && !(error instanceof RoomAPIError && error.code);
+    && !(error instanceof RoomAPIError && error.code && error.status < 500 && error.status !== 429);
 }
 
 // A background wait (the heartbeat loop) never keeps the process alive by itself.
@@ -2777,7 +2777,10 @@ export class OpenClawRoomRuntime {
     let lost = false;
     for (let step = 0; ; step += 1) {
       try {
-        const page = await this.client.readEvents(this.state, after, {wait: 20, signal});
+        // P2c-3: a revoked or expired credential on the heartbeat aborts the
+        // long poll with that answer (runHeartbeat), so the read ends at once.
+        const stop = signal ? AbortSignal.any([signal, this.heartbeatAbort.signal]) : this.heartbeatAbort.signal;
+        const page = await this.client.readEvents(this.state, after, {wait: 20, signal: stop});
         if (lost) this.logger?.info?.("Room event stream resumed");
         return page;
       } catch (error) {
@@ -2819,6 +2822,12 @@ export class OpenClawRoomRuntime {
           step = 0;
         } catch (error) {
           if (this.closed || this.heartbeatAbort.signal.aborted) return;
+          if (error instanceof RoomAPIError && (error.code === "credential_revoked" || error.code === "credential_expired")) {
+            this.heartbeatError = error;
+            this.logger?.error?.(`Room heartbeat loop stopped${roomErrorDiagnostic(error)}`);
+            this.heartbeatAbort.abort(error);
+            return;
+          }
           if (error instanceof RoomAPIError && !error.retryable && !sessionLost(error)) throw error;
           // P2c-3a: keep the loop and the session; only the Room's own "lost"
           // (flagged in maintainPresence) registers it again.
