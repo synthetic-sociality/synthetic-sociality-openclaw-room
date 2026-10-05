@@ -699,6 +699,8 @@ test("P7c-18 with the stored Showroom guidance of Harness b70aff3e as the Room r
   // One character changed: the frame adds the sentence.
   for (const changed of [stored.text.replace("system status.", "system status!"), stored.text.replace("Say nothing", "say nothing"),
     stored.text.replace("tools, access", "tools,  access"),
+    // The sentence without its final full stop (OP-12 P7c r2 N6, d5).
+    stored.text.replace("is based on.", "is based on"),
     // A tab or a lone carriage return is not a paragraph break (no line feed).
     stored.text.replace("tools, access", "tools,\taccess"), stored.text.replace("tools, access", "tools,\raccess")]) {
     assert.ok(!guidanceCarriesNoStatusSentence([changed]));
@@ -782,8 +784,9 @@ test("P7c-21 a credential the runtime refuses in a header is never in an error, 
   // The runtime's own message would quote the header value; the plugin raises
   // its own error with a fixed message and code request_not_formed instead.
   const secret = "fixture-secret-7Q2";
-  // A line break or NUL inside the value (a trailing one is trimmed by the runtime).
-  for (const credential of [`${secret}\nX-Injected: 1`, `${secret}\rX-Injected: 1`, `${secret}\u0000X`]) {
+  // A line break or NUL inside the value (a trailing one is trimmed by the runtime);
+  // a DEL or another control character fetch refuses only when it dispatches (OP-12 P7c r2 N2).
+  for (const credential of [`${secret}\nX-Injected: 1`, `${secret}\rX-Injected: 1`, `${secret}\u0000X`, `${secret}\u007fX`, `${secret}\u0001X`]) {
     let fetches = 0;
     const client = new RoomClient({baseUrl: "https://room.example/api", credential,
       fetchImpl: async () => { fetches += 1; return new Response("{}", {status: 200}); }});
@@ -797,6 +800,8 @@ test("P7c-21 a credential the runtime refuses in a header is never in an error, 
     const directory = await mkdtemp(join(home, "refused-"));
     const path = join(directory, "status.json");
     const runtime = runtimeFor([HUMAN]);
+    // The state holds the refused credential, as it does live (a log line printing it would leak it).
+    runtime.state.credential = credential;
     runtime.status = new LocalStatus(path, {version: "test", hostLabel: "host"});
     runtime.client.readEvents = async () => client.request("/rooms/room-1/events");
     const controller = new AbortController();
@@ -819,6 +824,7 @@ test("P7c-21 a credential the runtime refuses in a header is never in an error, 
     for (const loop of ["start", "heartbeat"]) {
       const loopPath = join(directory, `${loop}.json`);
       const looping = runtimeFor([HUMAN]);
+      looping.state.credential = credential;
       looping.status = new LocalStatus(loopPath, {version: "test", hostLabel: "host"});
       looping.reconnectInitialMs = 1;
       looping.reconnectMaxMs = 2;
@@ -890,6 +896,21 @@ test("P7c-22 held_by_moderator only for cycle_no_attempt while the Room state ho
     assert.equal(JSON.parse(text).rooms["room-1"]?.lastGateWaitReason ?? "", reason, label);
     assert.ok(!text.includes("holder-7k") && !text.includes("Thorsten"), label);
   }
+  // P2c-4: a renewal of a turn the agent holds is a later successful claim of
+  // that Room: it clears the reason (OP-12 P7c r2 N6, p1).
+  const directory = await mkdtemp(join(home, "hold-renewal-"));
+  const path = join(directory, "status.json");
+  const runtime = runtimeFor(events, {state: {activeHold: hold}, claim: () => null});
+  runtime.state.cursor = 50;
+  runtime.status = new LocalStatus(path, {version: "test", hostLabel: "host"});
+  runtime.reportStatus({connected: true});
+  await scan(runtime, events);
+  const reason = async () => { await pause(20); return JSON.parse(await readFile(path, "utf8")).rooms["room-1"]?.lastGateWaitReason ?? ""; };
+  assert.equal(await reason(), "held_by_moderator");
+  runtime.client.claimDiscussionAttempt = async () => cycleAttempt();
+  const renewed = await runtime.claimHeldAttempt({cycleAttempt: cycleAttempt(), sourceEvent: {id: "ready-5", seq: 5}}, undefined, "attempt_renewal_failed");
+  assert.ok(renewed.refreshed, JSON.stringify(renewed));
+  assert.equal(await reason(), "");
 });
 
 // P7c items 4 and 8: tests for mutations that survived the P6 round-2 and P7a

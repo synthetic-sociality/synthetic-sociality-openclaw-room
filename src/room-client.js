@@ -212,6 +212,9 @@ export class RoomClient {
     try {
       const port = new URL(new Request(`${this.baseUrl}${path}`, {...init, signal: undefined}).url).port;
       if (port && FETCH_BAD_PORTS.has(Number(port))) formed = false;
+      // fetch refuses more when it dispatches (undici's header check: a
+      // control character such as DEL), still before any I/O.
+      if (Object.values(headers).some((value) => /[^\t\x20-\x7e\x80-\xff]/u.test(String(value).replace(/^[\t\n\r ]+|[\t\n\r ]+$/gu, "")))) formed = false;
     } catch {
       formed = false;
     }
