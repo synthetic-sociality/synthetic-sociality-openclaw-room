@@ -157,7 +157,16 @@ export function roomErrorDiagnostic(error) {
 
 export class RoomClient {
   constructor({baseUrl, credential = "", fetchImpl = globalThis.fetch}) {
-    const parsed = new URL(baseUrl);
+    // Contract P2c-3a: a Room URL the URL parser refuses (no scheme, a broken
+    // IPv6 bracket; its error quotes the URL) or whose scheme fetch does not
+    // support is the plugin's own error, before any I/O.
+    let parsed = null;
+    try {
+      parsed = new URL(baseUrl);
+    } catch {
+      parsed = null;
+    }
+    if (!parsed || !["http:", "https:"].includes(parsed.protocol)) throw new RoomRequestError();
     if (parsed.protocol !== "https:" && !(parsed.protocol === "http:" && ["127.0.0.1", "localhost", "::1"].includes(parsed.hostname))) {
       throw new Error("Room base URL must use HTTPS (HTTP is allowed only on localhost)");
     }

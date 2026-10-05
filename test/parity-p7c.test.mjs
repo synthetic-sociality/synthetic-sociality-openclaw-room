@@ -71,6 +71,8 @@ const responseReady = (seq, sourceEventId = "m-50") => ready(seq, sourceEventId,
 const claimed = (sourceEventId = "m-42", extra = {}) => ({attempt: {id: "attempt-1", round: 2, membershipId: "zurie", leaseExpiresAt: "2099-01-01T00:00:00Z"},
   cycle: {id: "cycle-1", generation: 1, totalTurns: 2, sourceEventId, budgets: {totalTurns: 6, perAgentTurns: 3}, ...extra}});
 const count = (text, part) => text.split(part).length - 1;
+// The one log line of a stop (runtime.failClosedOnRequestError).
+const STOP_LINE = "Room request refused by the runtime before any I/O code=request_not_formed; the channel stops";
 const pause = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 // A bound against a hang only; no outcome depends on it (an unref'd timer).
 const hangGuard = () => new Promise((_resolve, reject) => setTimeout(() => reject(new Error("hang")), 120_000).unref());
@@ -158,7 +160,42 @@ async function turnText(events, options = {}) {
   return {turn: turns[0], runtime};
 }
 
-function postRuntime(post = async () => ({id: "posted-6", seq: 6, ts: "2026-10-05T10:00:00Z"})) {
+// P7c-4: the turn of each kind the four frame shapes of P7c-09 do not build,
+// with a marker that shows the kind was rendered.
+async function turnKinds(rules) {
+  const kind = async (events, options, prepare = () => {}) => {
+    const runtime = runtimeFor(events, {rules, ...options});
+    prepare(runtime);
+    const turns = await scan(runtime, events);
+    assert.equal(turns.length, 1, "one turn");
+    return turns[0];
+  };
+  const commandTurn = async (name) => {
+    const source = {...ASK, id: "cmd-46", seq: 46, payload: {...ASK.payload, command: {command: name, arguments: {instruction: "Your view?"}}}};
+    const turn = await kind([START, HUMAN, PEER, source, ready(52, "cmd-46")], {claim: claimed("cmd-46")});
+    assert.equal(turn.respondsToId, "", "decided as a command-source turn");
+    return turn;
+  };
+  const summary = ready(55, "term-54", {phase: "summary", phaseInstruction: "Write the closing summary."});
+  const kept = {sourceEventId: "m-42", sourceSeq: 42, epochId: "epoch-z", producedAt: "2026-10-05T09:52:30Z", reason: "turn_expired",
+    text: "My kept earlier reply."};
+  return {
+    "response round": {turn: await kind([START, HUMAN, PEER, INTERJECTION, responseReady(51)], {claim: claimed("m-50")}),
+      marker: `${RESPONSE_INSTRUCTION}`},
+    "closing summary": {turn: await kind([START, HUMAN, PEER, summary], {claim: claimed()}), marker: "Write the closing summary."},
+    // The command is not a message: no current item; the frame ends with the turn facts.
+    "ask cycle": {turn: await commandTurn("ask"), marker: "[Room turn facts]\nDiscussion phase: follow_up; round 2;"},
+    "summarize cycle": {turn: await commandTurn("summarize"), marker: "[Room turn facts]\nDiscussion phase: follow_up; round 2;"},
+    "kept reply offered": {turn: await kind([START, HUMAN, PEER, ready(50, "m-43")], {claim: claimed("m-43")},
+      (runtime) => { runtime.state.keptReply = structuredClone(kept); }), marker: "\nMy kept earlier reply.\n"},
+    "missed source offered": {turn: await kind([START, HUMAN, PEER, ready(50, "m-43")], {claim: claimed("m-43")},
+      (runtime) => { runtime.state.missedSources = [{sourceEventId: "m-42", sourceSeq: 42}]; }), marker: "Missed earlier: #42 TJE"},
+    "discussion start as the current item": {turn: await kind([START, HUMAN, PEER, ready(50, "start-z")], {claim: claimed("start-z")}),
+      marker: "Debate"},
+  };
+}
+
+function postRuntime(post =async () => ({id: "posted-6", seq: 6, ts: "2026-10-05T10:00:00Z"})) {
   const runtime = new OpenClawRoomRuntime({accountId: "t", stateFile: join(home, `${Math.random()}.json`), baseUrl: "https://room.example/api"});
   runtime.state = {version: 1, baseUrl: "https://room.example/api", roomId: "room-1", membershipId: "zurie", credential: "fixture-credential",
     clientInstanceId: "client-1", cursor: 4, messagePayloadDialect: "v2", deliveryIntents: {}, terminalEvidence: {}};
@@ -388,6 +425,18 @@ test("P7c-09 the ISSUE-031 sentence is in the frame exactly once, also when the 
   assert.ok(openTurn, "the open-Room message is a turn");
   assert.equal(openTurn.cycleAttempt ?? null, null);
   assert.equal(count(openTurn.text, SENTENCE), 1, "open-Room message turn through the scan");
+  // The turn kinds the shapes above do not build (OP-12 P7c r2 B1, N6), each
+  // through the scan: what normalizeEvent and cyclePrompt vary the frame by is
+  // the event type, the claimed attempt, the Room's phase and phaseInstruction,
+  // the kind of the cycle source (message, command, discussion start,
+  // unresolved) and the optional blocks (word bound, missed source, kept reply).
+  for (const carried of [false, true]) {
+    for (const [label, {turn, marker}] of Object.entries(await turnKinds(carried ? [{enforcement: "guidance", text: SENTENCE}] : []))) {
+      assert.ok(turn.text.includes(marker), `${label}: ${turn.text}`);
+      assert.equal(count(turn.text, SENTENCE), 1, `${label} (guidance carries it: ${carried})`);
+      assert.equal(turn.text.split("\n\n").includes(SENTENCE), !carried, `${label}: a paragraph of its own unless the guidance carries it`);
+    }
+  }
   // Not a filter: a reply about missing access is posted unchanged, and the
   // status file holds no message body.
   const body = "I have no internet access, so I answer from the brief.";
@@ -681,14 +730,42 @@ test("P7c-20 a Room URL the runtime refuses to form is the connector's own error
   // A port that is not a number: the URL parser refuses it before any I/O
   // (OpenClaw parses the Room URL when the client is made); the plugin's fetch
   // is never called and the error is not a transport failure.
+  // Also (OP-12 P7c r2 N2, N3, as Hermes) a URL without a scheme or with a
+  // broken IPv6 bracket and a scheme other than http or https: the plugin's own
+  // error, whose text and fields never quote the URL (the parser's error keeps
+  // it as input).
   let fetches = 0;
-  assert.throws(() => new RoomClient({baseUrl: "https://room.example:port/api", credential: "credential",
-    fetchImpl: async () => { fetches += 1; return new Response("{}", {status: 200}); }}), (error) => {
-    assert.ok(!(error instanceof RoomTransportError), error?.name);
-    assert.equal(error?.name, "TypeError");
-    return true;
-  });
+  for (const baseUrl of ["https://room.example:port/api", "room.example/api", "//room.example/api", "http://[::1/api",
+    "foo://room.example/api"]) {
+    assert.throws(() => new RoomClient({baseUrl, credential: "credential",
+      fetchImpl: async () => { fetches += 1; return new Response("{}", {status: 200}); }}), (error) => {
+      assert.ok(!(error instanceof RoomTransportError), error?.name);
+      assert.ok(error instanceof RoomRequestError, `${baseUrl}: ${error?.name}`);
+      assert.equal(error.code, "request_not_formed");
+      assert.equal(error.cause, undefined);
+      assert.ok(!`${error.message} ${JSON.stringify(error)} ${error.stack}`.includes("example"), baseUrl);
+      return true;
+    });
+  }
   assert.equal(fetches, 0);
+  // The start loop meets it when the channel makes its client: it fails closed.
+  const starting = runtimeFor([HUMAN]);
+  const startPath = join(await mkdtemp(join(home, "url-")), "status.json");
+  starting.status = new LocalStatus(startPath, {version: "test", hostLabel: "host"});
+  let starts = 0;
+  starting.initializeOnce = async () => { starts += 1; return new RoomClient({baseUrl: "room.example/api", credential: "credential"}); };
+  await assert.rejects(starting.initializeRetrying(undefined), (error) => error instanceof RoomRequestError);
+  assert.equal(starts, 1, "not retried");
+  await pause(20);
+  const startEntry = JSON.parse(await readFile(startPath, "utf8")).rooms["room-1"];
+  assert.deepEqual([startEntry.connection, startEntry.lastErrorCode], ["stopped", "request_not_formed"]);
+  // A host outside Latin-1 is not refused: the URL parser writes it in
+  // punycode and fetch is called with it (Hermes: http.client refuses its Host header).
+  const hosts = [];
+  const idn = new RoomClient({baseUrl: "https://例.example/api", credential: "credential",
+    fetchImpl: async (url) => { hosts.push(new URL(url).hostname); return new Response("{}", {status: 200}); }});
+  await idn.request("/rooms/room-1/state");
+  assert.deepEqual(hosts, ["xn--fsq.example"]);
   // A port fetch blocks (the Fetch standard's bad ports) is refused before any
   // I/O as well: the plugin's own error, not a failed contact (OP-12 N8).
   const blocked = new RoomClient({baseUrl: "http://127.0.0.1:6000/api", credential: "credential",
@@ -734,21 +811,52 @@ test("P7c-21 a credential the runtime refuses in a header is never in an error, 
     const entry = JSON.parse(status).rooms["room-1"];
     assert.deepEqual([entry.connection, entry.lastErrorCode], ["stopped", "request_not_formed"]);
     assert.ok(!status.includes(secret));
-    assert.ok(runtime.logs.some((line) => line.includes("request_not_formed")), runtime.logs.join("\n"));
+    assert.ok(runtime.logs.includes(STOP_LINE), runtime.logs.join("\n"));
     assert.ok(!runtime.logs.join("\n").includes(secret));
+    // Every other loop that can meet the refused request first fails closed
+    // as well (OP-12 P7c r2 B2): the start loop when the channel starts, and
+    // the heartbeat loop (a credential renewed after the start); not retried.
+    for (const loop of ["start", "heartbeat"]) {
+      const loopPath = join(directory, `${loop}.json`);
+      const looping = runtimeFor([HUMAN]);
+      looping.status = new LocalStatus(loopPath, {version: "test", hostLabel: "host"});
+      looping.reconnectInitialMs = 1;
+      looping.reconnectMaxMs = 2;
+      let tries = 0;
+      const refused = async () => { tries += 1; return client.request("/rooms/room-1/connectors", {method: "POST", body: {}}); };
+      let run;
+      if (loop === "start") {
+        looping.initializeOnce = refused;
+        run = looping.initializeRetrying(undefined);
+      } else {
+        looping.heartbeatMinimumSeconds = 0.001;
+        looping.connectorSession = {sessionId: "s", heartbeatIntervalSeconds: 0.001};
+        looping.maintainPresence = refused;
+        looping.runHeartbeat();
+        run = looping.heartbeatTask;
+      }
+      const retried = new Promise((_resolve, reject) => {
+        const timer = setInterval(() => { if (tries > 1) { clearInterval(timer); reject(new Error("retried")); } }, 5);
+        timer.unref();
+      });
+      let failure = null;
+      try { await Promise.race([run, retried, hangGuard()]); } catch (error) { failure = error; }
+      assert.equal(tries, 1, `${loop}: not retried`);
+      if (loop === "start") assert.ok(failure instanceof RoomRequestError, `${loop}: ${failure?.name}`);
+      else assert.ok(looping.heartbeatAbort.signal.aborted && looping.heartbeatError instanceof RoomRequestError, loop);
+      assert.equal(fetches, 0);
+      await pause(20);
+      const loopStatus = await readFile(loopPath, "utf8");
+      const loopEntry = JSON.parse(loopStatus).rooms["room-1"];
+      assert.deepEqual([loopEntry.connection, loopEntry.lastErrorCode], ["stopped", "request_not_formed"], loop);
+      assert.ok(looping.logs.includes(STOP_LINE), `${loop}: ${looping.logs.join("\n")}`);
+      assert.ok(!loopStatus.includes(secret) && !looping.logs.join("\n").includes(secret), loop);
+      await looping.close();
+    }
   }
   // The channel writes statusErrorCode(error) when it ends (src/channel.js): the
   // plugin's own code, never network.
   assert.equal(statusErrorCode(new RoomRequestError()), "request_not_formed");
-  // The heartbeat loop fails closed on it as well and ends the read.
-  const runtime = runtimeFor([HUMAN]);
-  runtime.heartbeatMinimumSeconds = 0.001;
-  runtime.connectorSession = {sessionId: "s", heartbeatIntervalSeconds: 0.001};
-  runtime.maintainPresence = async () => { throw new RoomRequestError(); };
-  runtime.runHeartbeat();
-  await Promise.race([runtime.heartbeatTask, hangGuard()]);
-  assert.ok(runtime.heartbeatAbort.signal.aborted);
-  assert.ok(runtime.heartbeatError instanceof RoomRequestError);
 });
 
 test("P7c-22 held_by_moderator only for cycle_no_attempt while the Room state holds the refused cycle, and never the holder's name or membership id", async () => {
@@ -763,6 +871,9 @@ test("P7c-22 held_by_moderator only for cycle_no_attempt while the Room state ho
     "hold without a cycle": [{activeHold: withoutCycle}, undefined, ""],
     "cycle_superseded during the hold": [{activeHold: hold}, superseded, ""],
     "no hold": [{activeHold: null}, undefined, ""],
+    // A truthy activeHold that is not an object names no cycle (as Hermes, OP-12 P7c r2 N5).
+    ...Object.fromEntries(["cycle-1", true, 1, ["cycle-1"], [hold]].map((value) => [`activeHold ${JSON.stringify(value)}`,
+      [{activeHold: value}, undefined, ""]])),
   };
   const events = [START, HUMAN, PEER, INTERJECTION, responseReady(51)];
   for (const [label, [state, claim, reason]] of Object.entries(cases)) {

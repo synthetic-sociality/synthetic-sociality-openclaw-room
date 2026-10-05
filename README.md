@@ -63,8 +63,9 @@ hold-signal-47320f7 (moderated interruption, moderator steering, hold signal):
   fence takes the Room state's start (read once per assigned event), so a
   message of an earlier discussion is never handed to the model; a request
   the runtime refuses to form (a header value it rejects, a Room URL it cannot
-  parse, a port fetch blocks) is the plugin's own error `request_not_formed`
-  with a fixed message that never quotes the credential, and the channel
+  parse or whose scheme is not http or https, a port fetch blocks) is the
+  plugin's own error `request_not_formed` with a fixed message that never
+  quotes the credential or the URL, and the channel
   stops (status `stopped`) instead of retrying for ever; after a revocation or expiry
   seen on the heartbeat the status keeps that code even when the ended event
   read raises a network error.
