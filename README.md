@@ -28,7 +28,7 @@ document bytes. An exact artifact read also invokes the Room server's supported
 deterministic text backfill for older pending versions.
 
 Version 0.2.66 is parity release P7c with Hermes 1.0.83 ("Moderated debate and
-own voice", contract section P7c, shared cases P7c-01 to P7c-18, one sentence
+own voice", contract section P7c, shared cases P7c-01 to P7c-20, one sentence
 each in P2c-3a and the P2c-4 status table), for the Room server
 hold-signal-47320f7 (moderated interruption, moderator steering, hold signal):
 
@@ -52,8 +52,9 @@ hold-signal-47320f7 (moderated interruption, moderator steering, hold signal):
   carries the owner's sentence once, unless the Room's guidance already holds
   it (white space and paragraph breaks tolerated, nothing else). Not a
   filter: every reply is posted unchanged.
-- Hold (P7c-5): a claim refused during a hold records the status reason
-  `held_by_moderator` (the Room state is read once for it); no name, no text.
+- Hold (P7c-5): a claim refused with `cycle_no_attempt` during a hold records
+  the status reason `held_by_moderator` (the Room state is read once for it;
+  cleared by the next successful claim); no name, no text.
   Turn time (P7c-6): no time line, as the Room does not send the turn's end.
 - Fixes: a page whose start is unknown no longer stops the channel on a
   prior-epoch lifecycle terminal (it is ignored and acknowledged); the delivery

@@ -185,7 +185,7 @@ test("conformance P7c case names resolve to tests in this suite", async () => {
   const sources = await Promise.all((await readdir(directory)).filter((name) => name.endsWith(".test.mjs"))
     .map((name) => readFile(new URL(name, directory), "utf8")));
   const cases = Object.entries(conformance.parityP7cCases ?? {});
-  assert.equal(cases.length, 18);
+  assert.equal(cases.length, 20);
   cases.forEach(([id, name], index) => {
     assert.equal(id, `P7c-${String(index + 1).padStart(2, "0")}`);
     assert.ok(name.startsWith(`${id} `), id);
@@ -374,15 +374,39 @@ test("P7c-10 a claim refused during a hold is dropped with held_by_moderator, a 
   const runtime = runtimeFor(events, {claim: (n) => structuredClone(answers[n] ?? null), state: {activeHold: hold}});
   runtime.state.cursor = 50;
   runtime.status = new LocalStatus(path, {version: "test", hostLabel: "host"});
-  const turns = await scan(runtime, events);
-  assert.deepEqual(turns.map((turn) => turn.raw.id), ["ready-51-hold-2"]);
-  assert.equal(runtime.calls.claims, 3, "one claim per announcement, no retry loop");
-  assert.deepEqual(runtime.calls.acks, [51, 52, 53]);
+  const read = runtime.client.readEvents;
+  // First the two refused announcements only (the page ends at seq 52).
+  runtime.client.readEvents = async (...args) => {
+    const page = await read(...args);
+    return {...page, events: page.events.filter((item) => item.seq <= 52)};
+  };
+  const refused = await scan(runtime, events.slice(0, 6));
+  assert.deepEqual(refused, []);
   await pause(20);
   const entry = JSON.parse(await readFile(path, "utf8")).rooms["room-1"];
   assert.deepEqual([entry.lastGateWaitReason, entry.lastGateWaitSeconds], ["held_by_moderator", 0]);
   const text = await readFile(path, "utf8");
   assert.ok(!text.includes("Thorsten") && !text.includes("family"));
+  runtime.client.readEvents = read;
+  const turns = await scan(runtime, events);
+  assert.deepEqual(turns.map((turn) => turn.raw.id), ["ready-51-hold-2"]);
+  assert.equal(runtime.calls.claims, 3, "one claim per announcement, no retry loop");
+  assert.deepEqual(runtime.calls.acks, [51, 52, 53]);
+  // The later claim of that Room succeeded: the reason is cleared (P2c-4).
+  await pause(20);
+  const cleared = JSON.parse(await readFile(path, "utf8")).rooms["room-1"];
+  assert.deepEqual([cleared.lastGateWaitReason, cleared.lastGateWaitSeconds], ["", 0]);
+  // Only cycle_no_attempt is a hold refusal: cycle_superseded during a hold records no reason.
+  const supersededPath = join(directory, "superseded.json");
+  const superseded = runtimeFor([START, HUMAN, PEER, INTERJECTION, first], {state: {activeHold: hold},
+    claim: () => { throw new RoomAPIError(409, {code: "cycle_superseded"}); }});
+  superseded.state.cursor = 50;
+  superseded.status = new LocalStatus(supersededPath, {version: "test", hostLabel: "host"});
+  assert.deepEqual(await scan(superseded, [START, HUMAN, PEER, INTERJECTION, first]), []);
+  assert.equal(superseded.calls.claims, 1);
+  await pause(20);
+  const rooms = await readFile(supersededPath, "utf8").then((raw) => JSON.parse(raw).rooms ?? {}, () => ({}));
+  assert.equal(rooms["room-1"]?.lastGateWaitReason ?? "", "");
   // A turn already claimed keeps renewing through a hold (the Room renews it as before).
   const renewing = postRuntime();
   let renewals = 0;
@@ -573,17 +597,55 @@ test("P7c-18 with the stored Showroom guidance of Harness b70aff3e as the Room r
   assert.equal(count(showroom, SENTENCE), 1);
   assert.ok(showroom.includes("- Debate for an audience"));
   // Paragraph breaks inside the sentence and white space around it are tolerated.
-  const broken = stored.text.replace(" If you cannot read", "\n\nIf you cannot read").replace(" You may say", "\r\n  You may say");
+  // A tab inside a run that holds a line feed is part of that break.
+  const broken = stored.text.replace(" If you cannot read", "\n\nIf you cannot read").replace(" You may say", "\r\n  You may say")
+    .replace(" model or", "\t\n\tmodel or");
   assert.ok(guidanceCarriesNoStatusSentence([broken]));
   const brokenFrame = await frame(broken);
   assert.equal(count(brokenFrame, SENTENCE), 0, "the Room's own wording only, not added again");
   assert.ok(brokenFrame.includes("\n\nIf you cannot read"));
   // One character changed: the frame adds the sentence.
   for (const changed of [stored.text.replace("system status.", "system status!"), stored.text.replace("Say nothing", "say nothing"),
-    stored.text.replace("tools, access", "tools,  access")]) {
+    stored.text.replace("tools, access", "tools,  access"),
+    // A tab or a lone carriage return is not a paragraph break (no line feed).
+    stored.text.replace("tools, access", "tools,\taccess"), stored.text.replace("tools, access", "tools,\raccess")]) {
     assert.ok(!guidanceCarriesNoStatusSentence([changed]));
     assert.equal(count(await frame(changed), SENTENCE), 1);
   }
+});
+
+test("P7c-19 a command-source turn whose attempt is renewed by a fresh claim answer before the post posts without respondsTo, a message-source turn names its source", async () => {
+  // OpenClaw decides the fact when it builds the turn (respondsToId); a renewal
+  // never touches the turn. The renewal here is answered by a fresh object.
+  const results = {};
+  for (const [label, source] of [["command", "cmd-45"], ["message", "m-43"]]) {
+    const {turn} = await turnText([START, HUMAN, PEER, ASK, ready(52, source)], {claim: claimed("cmd-45")});
+    const poster = postRuntime();
+    let renewals = 0;
+    poster.client.claimDiscussionAttempt = async () => { renewals += 1; return cycleAttempt(); };
+    const attempt = cycleAttempt();
+    const lease = poster.startAttemptLease({id: "ready-5", seq: 5}, attempt);
+    assert.equal(await poster.renewAttemptLease(lease), true);
+    assert.equal(renewals, 1);
+    await postFor(poster, "My answer.", turn.respondsToId, attempt);
+    await poster.stopAttemptLease("ready-5");
+    results[label] = [Object.hasOwn(poster.posts[0], "respondsTo"), poster.posts[0].respondsTo ?? null];
+  }
+  assert.deepEqual(results, {command: [false, null], message: [true, ["m-43"]]});
+});
+
+test("P7c-20 a Room URL the runtime refuses to form is the connector's own error, never a failed contact, and no request leaves the host", async () => {
+  // A port that is not a number: the URL parser refuses it before any I/O
+  // (OpenClaw parses the Room URL when the client is made); the plugin's fetch
+  // is never called and the error is not a transport failure.
+  let fetches = 0;
+  assert.throws(() => new RoomClient({baseUrl: "https://room.example:port/api", credential: "credential",
+    fetchImpl: async () => { fetches += 1; return new Response("{}", {status: 200}); }}), (error) => {
+    assert.ok(!(error instanceof RoomTransportError), error?.name);
+    assert.equal(error?.name, "TypeError");
+    return true;
+  });
+  assert.equal(fetches, 0);
 });
 
 // P7c items 4 and 8: tests for mutations that survived the P6 round-2 and P7a

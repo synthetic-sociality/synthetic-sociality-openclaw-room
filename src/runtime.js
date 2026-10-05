@@ -1066,6 +1066,7 @@ export class OpenClawRoomRuntime {
         this.state, String(lease.cycleAttempt.cycle.id), signal ? AbortSignal.any([signal, timeout]) : timeout,
       );
       if (!sameAttemptClaim(refreshed, lease.cycleAttempt, this.state.membershipId)) return {reason: "attempt_superseded", transient: false};
+      this.clearHeldByModerator();
       return {refreshed};
     } catch (error) {
       const refused = error instanceof RoomAPIError && (Boolean(error.code) || !error.retryable);
@@ -1551,6 +1552,8 @@ export class OpenClawRoomRuntime {
   // Room state is read once for it; the reason is diagnostics only, so a
   // failed read records nothing and changes nothing else.
   async noteHeldByModerator(signal) {
+    // Only for cycle_no_attempt, never for cycle_superseded.
+    if (this.claimRefusal !== "cycle_no_attempt") return;
     let state = null;
     try {
       state = await this.client.roomState(this.state, signal);
@@ -1559,6 +1562,7 @@ export class OpenClawRoomRuntime {
     }
     const hold = state?.activeHold;
     if (hold && typeof hold === "object" && !Array.isArray(hold)) {
+      this.heldByModerator = true;
       this.reportStatus({gateWaitSeconds: 0, gateWaitReason: "held_by_moderator"});
     }
   }
@@ -1773,12 +1777,26 @@ export class OpenClawRoomRuntime {
   }
 
   async claimAssignedAttempt(cycleId, signal) {
+    this.claimRefusal = "";
     try {
-      return await this.client.claimDiscussionAttempt(this.state, cycleId, signal);
+      const claimed = await this.client.claimDiscussionAttempt(this.state, cycleId, signal);
+      this.clearHeldByModerator();
+      return claimed;
     } catch (error) {
-      if (error instanceof RoomAPIError && ["cycle_no_attempt", "cycle_superseded"].includes(error.code)) return false;
+      if (error instanceof RoomAPIError && ["cycle_no_attempt", "cycle_superseded"].includes(error.code)) {
+        this.claimRefusal = error.code;
+        return false;
+      }
       throw error;
     }
+  }
+
+  // Contract P2c-4, P7c-5: a later claim of this Room succeeded; the hold
+  // reason is cleared.
+  clearHeldByModerator() {
+    if (!this.heldByModerator) return;
+    this.heldByModerator = false;
+    this.reportStatus({gateWaitSeconds: 0, gateWaitReason: ""});
   }
 
   // Contract P2c-3a: a Room contact made for a turn after its host run (the
