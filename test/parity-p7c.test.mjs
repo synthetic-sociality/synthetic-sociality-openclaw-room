@@ -739,7 +739,7 @@ test("P7c-21 a credential the runtime refuses in a header is never in an error, 
   runtime.connectorSession = {sessionId: "s", heartbeatIntervalSeconds: 0.001};
   runtime.maintainPresence = async () => { throw new RoomRequestError(); };
   runtime.runHeartbeat();
-  await runtime.heartbeatTask;
+  await Promise.race([runtime.heartbeatTask, hangGuard()]);
   assert.ok(runtime.heartbeatAbort.signal.aborted);
   assert.ok(runtime.heartbeatError instanceof RoomRequestError);
 });
