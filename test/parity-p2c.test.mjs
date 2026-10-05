@@ -37,7 +37,7 @@ await mkdir(join(STORE, "accounts"), {recursive: true, mode: 0o700});
 
 const {createRoomChannel, roomToolCallPolicy, roomToolResultScrub, resetSecretRefusalLog} = await import("../src/channel.js");
 const {OpenClawRoomRuntime, HOST_LABEL, KEPT_REPLY_CHARACTER_LIMIT, keptReplyBlock} = await import("../src/runtime.js");
-const {RoomAPIError} = await import("../src/room-client.js");
+const {RoomAPIError, RoomTransportError} = await import("../src/room-client.js");
 const {loadState, saveState, validateState} = await import("../src/state.js");
 const {renewCredential} = await import("../src/credential-renewal.js");
 const isolation = await import("../src/secret-isolation.js");
@@ -496,7 +496,7 @@ test("P2c-03 after network loss and session expiry the connector reconnects with
     runtime.connectorSession = {sessionId: "session-stored", heartbeatIntervalSeconds: 0.05};
     let initializations = 0;
     runtime.initializeOnce = async () => { initializations += 1; return runtime.connectorSession; };
-    const network = () => Object.assign(new TypeError("fetch failed"), {cause: {code: "ENETUNREACH"}});
+    const network = () => new RoomTransportError(Object.assign(new Error("connect ENETUNREACH"), {code: "ENETUNREACH"}));
     const readEvents = runtime.client.readEvents;
     let reads = 0;
     Object.assign(runtime.client, {

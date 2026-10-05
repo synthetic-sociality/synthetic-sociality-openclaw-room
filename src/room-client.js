@@ -88,19 +88,26 @@ export class RoomResponseError extends Error {
   }
 }
 
-// Contract P2c-3a: the runtime's own form of a network failure (Node's fetch:
-// a TypeError "fetch failed" whose cause carries a network code). An abort is
-// not a failure; a TypeError of any other shape is a programming error.
-const NETWORK_CAUSE_CODE = /^(E[A-Z0-9_]+|UND_ERR_(?!ABORTED)[A-Z_]+)$/u;
-export function isNetworkFailure(error) {
-  return error instanceof TypeError && error.message === "fetch failed"
-    && typeof error.cause?.code === "string" && NETWORK_CAUSE_CODE.test(error.cause.code);
+// Contract P2c-3a: the Room request ended without a complete answer, for
+// whatever reason of the transport (refused, reset, DNS, timeout, TLS or
+// certificate, a redirect, a non-HTTP answer, a body cut or not decodable).
+// Raised only where the runtime's fetch or the read of its body rejects, never
+// by matching a cause code or words; the original error is its cause. An abort
+// by the caller's own signal is passed on unchanged and is not a failure.
+export class RoomTransportError extends Error {
+  constructor(cause) {
+    super("Room request ended without a complete answer", {cause: cause?.cause ?? cause});
+    this.name = "RoomTransportError";
+  }
 }
+const transportFailure = (error, signal) => (signal?.aborted ? error : new RoomTransportError(error));
 
 // The contact a request made (method and path, without the query): the
 // P2c-3a schedule of a loop resets when the contact that last failed succeeds.
+// The long poll and a plain read of the same route are two contacts.
 export function roomContact(method, path) {
-  return `${method} ${String(path).split("?")[0]}`;
+  const [route, query = ""] = String(path).split("?");
+  return `${method} ${route}${new URLSearchParams(query).has("waitSeconds") ? " (long poll)" : ""}`;
 }
 
 export class RoomAPIError extends Error {
@@ -167,22 +174,19 @@ export class RoomClient {
     const headers = {Accept: "application/json"};
     if (credential) headers.Authorization = `Bearer ${credential}`;
     if (body !== undefined) headers["Content-Type"] = "application/json";
-    const response = await this.fetch(`${this.baseUrl}${path}`, {
-      method,
-      headers,
-      body: body === undefined ? undefined : JSON.stringify(body),
-      redirect: "error",
-      signal,
-    });
-    let raw;
+    // The Room never redirects: the runtime refuses a redirect (a failed
+    // contact below), so the credential never goes to another host.
+    const init = {method, headers, body: body === undefined ? undefined : JSON.stringify(body), redirect: "error", signal};
+    let response;
     try {
-      raw = await readBounded(response, MAX_RESPONSE_BYTES);
+      response = await this.fetch(`${this.baseUrl}${path}`, init);
     } catch (error) {
-      // A connection lost while the body is read is the same network failure.
-      if (error instanceof TypeError && typeof error.cause?.code === "string" && NETWORK_CAUSE_CODE.test(error.cause.code)) {
-        throw new TypeError("fetch failed", {cause: error.cause});
-      }
-      throw error;
+      throw transportFailure(error, signal);
+    }
+    const raw = await readBounded(response, MAX_RESPONSE_BYTES, signal);
+    // Contract P2c-3a: a 3xx is not the Room's answer; never followed.
+    if (response.status >= 300 && response.status < 400) {
+      throw new RoomResponseError(`Room API answered status ${response.status}, a redirect`, {status: response.status});
     }
     const accepted = expected.includes(response.status);
     const retryAfter = parseRetryAfter(response.headers?.get?.("retry-after"));
@@ -414,13 +418,21 @@ export class RoomClient {
   }
 }
 
-async function readBounded(response, maximum) {
+// The read of the body is part of the transport (a cut or undecodable
+// stream is a RoomTransportError); the size bound is this plugin's own check.
+async function readBounded(response, maximum, signal) {
   const reader = response.body?.getReader?.();
-  if (!reader) return response.text();
+  if (!reader) return response.text().catch((error) => { throw transportFailure(error, signal); });
   const chunks = [];
   let size = 0;
   while (true) {
-    const {done, value} = await reader.read();
+    let read;
+    try {
+      read = await reader.read();
+    } catch (error) {
+      throw transportFailure(error, signal);
+    }
+    const {done, value} = read;
     if (done) break;
     size += value.byteLength;
     if (size > maximum) {

@@ -71,11 +71,12 @@ async function startRuntime(registerAnswers, {status} = {}) {
   const calls = {register: 0};
   const runtime = new OpenClawRoomRuntime({accountId: "default", stateFile, baseUrl: "https://room.example/api"}, {
     status,
-    fetchImpl: async (url) => {
+    fetchImpl: async (url, init) => {
       if (url.endsWith("/connector/sessions")) {
         calls.register += 1;
         const answer = registerAnswers.shift();
         if (answer instanceof Error) throw answer;
+        if (typeof answer === "function") return answer(init);
         if (answer) return answer;
         return json({sessionId: "session-1", heartbeatIntervalSeconds: 60, capabilities: []});
       }
@@ -133,7 +134,7 @@ test("conformance P7a case names resolve to tests in this suite", async () => {
   const sources = await Promise.all((await readdir(directory)).filter((name) => name.endsWith(".test.mjs"))
     .map((name) => readFile(new URL(name, directory), "utf8")));
   const cases = Object.entries(conformance.parityP7aCases ?? {});
-  assert.equal(cases.length, 16);
+  assert.equal(cases.length, 18);
   cases.forEach(([id, name], index) => {
     assert.equal(id, `P7a-${String(index + 1).padStart(2, "0")}`);
     assert.ok(name.startsWith(`${id} `), id);
@@ -475,16 +476,21 @@ test("P7a-09 web reading is reported from the host's own tool selection, unknown
   assert.ok(!JSON.stringify(written).includes("example.org"));
 });
 
-test("the P2c-3a failed contacts are exactly the listed ones; a programming error fails closed", () => {
+test("the P2c-3a failed contacts are exactly the listed ones; a programming error fails closed", async () => {
   const {transientRoomFailure} = runtimeModule;
-  const network = Object.assign(new TypeError("fetch failed"), {cause: Object.assign(new Error("connect ECONNREFUSED"), {code: "ECONNREFUSED"})});
-  const reset = Object.assign(new TypeError("fetch failed"), {cause: Object.assign(new Error("other side closed"), {code: "UND_ERR_SOCKET"})});
-  const retried = [network, reset, new RoomAPIError(502, {}), new RoomAPIError(429, {}),
+  const {RoomTransportError} = clientModule;
+  const cause = (code) => Object.assign(new Error(code), {code});
+  const retried = [new RoomTransportError(cause("ECONNREFUSED")), new RoomTransportError(cause("DEPTH_ZERO_SELF_SIGNED_CERT")),
+    new RoomTransportError(new Error("unexpected redirect")), new RoomTransportError(new TypeError("terminated")),
+    new RoomAPIError(502, {}), new RoomAPIError(429, {}),
     new clientModule.RoomResponseError(), new RoomAPIError(409, {code: "stale_context", retryable: true}),
     Object.assign(new Error("timed out"), {name: "TimeoutError"})];
+  // Round 3: a TypeError that did not come from the runtime's fetch for the
+  // Room request is this plugin's own error, whatever its message or cause.
   const closed = [
     new TypeError("Cannot read properties of undefined (reading 'network')"), new TypeError("terminated"),
-    new TypeError("fetch failed"), Object.assign(new TypeError("fetch failed"), {cause: {code: "UND_ERR_ABORTED"}}),
+    new TypeError("fetch failed"), Object.assign(new TypeError("fetch failed"), {cause: cause("ECONNREFUSED")}),
+    Object.assign(new TypeError("fetch failed"), {cause: cause("DEPTH_ZERO_SELF_SIGNED_CERT")}),
     Object.assign(new Error("This operation was aborted"), {name: "AbortError"}),
     new RoomAPIError(401, {code: "credential_revoked", retryable: true}), new RoomAPIError(401, {code: "credential_expired"}),
     new RoomAPIError(403, {code: "validation_error"}), new RoomAPIError(404, {}), new Error("plain"),
@@ -492,6 +498,32 @@ test("the P2c-3a failed contacts are exactly the listed ones; a programming erro
   ];
   retried.forEach((error, index) => assert.equal(transientRoomFailure(error), true, `retried ${index}`));
   closed.forEach((error, index) => assert.equal(transientRoomFailure(error), false, `closed ${index}`));
+
+  // Decided where it is caught: every rejection of the runtime's fetch is a
+  // transport failure, unless the caller's own signal aborted it; an error of
+  // this plugin's code before the request (here the body) is not.
+  const rejections = [Object.assign(new TypeError("fetch failed"), {cause: cause("CERT_HAS_EXPIRED")}), new TypeError("fetch failed"),
+    Object.assign(new Error("aborted elsewhere"), {name: "AbortError"}), new RangeError("anything")];
+  for (const [index, rejection] of rejections.entries()) {
+    const client = new clientModule.RoomClient({baseUrl: "https://room.example/api", fetchImpl: async () => { throw rejection; }});
+    const error = await client.request("/status").catch((caught) => caught);
+    assert.ok(error instanceof RoomTransportError && transientRoomFailure(error), `rejection ${index}`);
+  }
+  const stop = new AbortController();
+  const stopped = new clientModule.RoomClient({baseUrl: "https://room.example/api", fetchImpl: async () => {
+    stop.abort();
+    throw Object.assign(new Error("This operation was aborted"), {name: "AbortError"});
+  }});
+  const aborted = await stopped.request("/status", {signal: stop.signal}).catch((caught) => caught);
+  assert.equal(aborted.name, "AbortError");
+  assert.equal(transientRoomFailure(aborted), false);
+  let fetched = 0;
+  const own = new clientModule.RoomClient({baseUrl: "https://room.example/api", fetchImpl: async () => { fetched += 1; return json({}); }});
+  const ownError = await own.request("/rooms/room-1/messages", {method: "POST", body: {size: 1n}}).catch((caught) => caught);
+  assert.equal([ownError instanceof TypeError, transientRoomFailure(ownError), fetched].join(), "true,false,0");
+  // OP-12 r2 N1: the long poll and the context read are two contacts.
+  assert.notEqual(clientModule.roomContact("GET", "/rooms/r/events?after=1&limit=100&waitSeconds=20"),
+    clientModule.roomContact("GET", "/rooms/r/events?after=1&limit=100"));
 });
 
 test("P7a-10 an HTML 403 once and an HTML 404 once on the event read, on the heartbeat and on a post: the loop continues, the post stays retryable, no quarantine", async () => {
@@ -658,7 +690,7 @@ test("P7a-13 a transient failure of the attempt settle and of the acknowledgemen
   runtime.client.acknowledge = async (_state, seq) => {
     acks += 1;
     if (acks === 1) throw new clientModule.RoomResponseError("edge page", {status: 503});
-    if (acks === 2) throw Object.assign(new TypeError("fetch failed"), {cause: {code: "ECONNRESET"}});
+    if (acks === 2) throw new clientModule.RoomTransportError(Object.assign(new Error("read ECONNRESET"), {code: "ECONNRESET"}));
     return {acknowledgedSeq: seq};
   };
   const attempt = {cycle: {id: "cycle-1", generation: 1}, attempt: {id: "attempt-1", membershipId: "zurie", leaseExpiresAt: leaseIn(60_000)}};
@@ -825,4 +857,252 @@ test("the scan loop's schedule returns to its first step after a full pass, neve
   assertOnSchedule(waits[3], 0, waits);
   assertOnSchedule(waits[4], 1, waits);
   assert.ok(registrations >= 5);
+});
+
+// Round 3 (OP-12 r2 B1): real Node fetch against local servers for a redirect
+// to another host, an answer that is not HTTP and a corrupt compressed body; a
+// certificate failure in the form Node 26 gives it (TypeError "fetch failed",
+// cause DEPTH_ZERO_SELF_SIGNED_CERT; review probe C, a self-signed server).
+async function transportFaults() {
+  const {createServer} = await import("node:http");
+  const {createServer: createSocketServer} = await import("node:net");
+  const listen = (server) => new Promise((resolve) => server.listen(0, "127.0.0.1", () => resolve(server.address().port)));
+  const target = {hits: 0};
+  const elsewhere = createServer((_request, response) => { target.hits += 1; response.writeHead(200, {"content-type": "application/json"}); response.end("{}"); });
+  const elsewherePort = await listen(elsewhere);
+  const servers = {
+    redirect: createServer((_request, response) => { response.writeHead(302, {location: `http://127.0.0.1:${elsewherePort}/api/x`}); response.end(); }),
+    "non-HTTP": createSocketServer((socket) => socket.end("SSH-2.0-OpenSSH_9.6\r\n")),
+    corrupt: createServer((_request, response) => {
+      response.writeHead(200, {"content-type": "application/json", "content-encoding": "gzip"});
+      response.end("this is not gzip");
+    }),
+  };
+  const ports = {};
+  for (const [kind, server] of Object.entries(servers)) ports[kind] = await listen(server);
+  const certificate = () => Object.assign(new TypeError("fetch failed"),
+    {cause: Object.assign(new Error("self-signed certificate"), {code: "DEPTH_ZERO_SELF_SIGNED_CERT"})});
+  return {
+    kinds: ["certificate", "redirect", "non-HTTP", "corrupt"],
+    target,
+    // One contact that fails with `kind`, sent with the request's own init.
+    fail: (kind, init) => (kind === "certificate" ? Promise.reject(certificate()) : globalThis.fetch(`http://127.0.0.1:${ports[kind]}/api/x`, init)),
+    close: () => [elsewhere, ...Object.values(servers)].forEach((server) => { server.close(); server.closeAllConnections?.(); }),
+  };
+}
+
+test("P7a-17 a certificate failure, a redirect, a non-HTTP answer and a corrupt body, each once on the event read and once at start: the loop continues, one registration, no quarantine", async () => {
+  const faults = await transportFaults();
+  try {
+    // At start: the registration fails once with each, then is accepted.
+    const {runtime, calls} = await startRuntime(faults.kinds.map((kind) => (init) => faults.fail(kind, init)));
+    const timers = compressTimers();
+    try {
+      await runtime.initialize();
+    } finally {
+      timers.restore();
+      await runtime.close();
+    }
+    assert.equal(calls.register, 5);
+    assert.equal(runtime.connectorSession.sessionId, "session-1");
+    const startWaits = timers.of("initializeRetrying");
+    assert.equal(startWaits.length, 4, String(startWaits));
+    startWaits.forEach((wait, index) => assertOnSchedule(wait, index, startWaits));
+
+    // On the event read of a running scan: each once, then the page; the
+    // presence pass after it heartbeats the same session.
+    const scan = roomRuntime([message(41, "After the outage.")]);
+    delete scan.maintainPresence;
+    scan.publishPresence = async () => {};
+    const room = {registrations: 0, heartbeats: 0};
+    const pending = [...faults.kinds];
+    const reader = new clientModule.RoomClient({baseUrl: "https://room.example/api", credential: "fixture-credential",
+      fetchImpl: async (url, init) => {
+        if (pending.length) return faults.fail(pending.shift(), init);
+        const after = Number(new URL(url).searchParams.get("after"));
+        return json(page([message(41, "After the outage.")].filter((item) => item.seq > after)));
+      }});
+    Object.assign(scan.client, {
+      readEvents: (state, after, options) => reader.readEvents(state, after, options),
+      register: async () => { room.registrations += 1; return {sessionId: "s2", capabilities: []}; },
+      heartbeat: async () => { room.heartbeats += 1; return {}; },
+      connectorEnrollments: async () => [],
+    });
+    const controller = new AbortController();
+    const scanTimers = compressTimers();
+    let turn;
+    try {
+      const turns = scan.assignedTurns(controller.signal);
+      turn = await turns.next();
+      controller.abort();
+      await turns.return();
+    } finally {
+      scanTimers.restore();
+    }
+    assert.equal(turn.done, false);
+    assert.equal(turn.value.sourceEventId ?? turn.value.id, "message000041");
+    const readWaits = scanTimers.of("readEventsResilient");
+    assert.equal(readWaits.length, 4, String(readWaits));
+    readWaits.forEach((wait, index) => assertOnSchedule(wait, index, readWaits));
+    assert.deepEqual([room.registrations, room.heartbeats >= 1, scan.connectorSession.sessionId], [0, true, "s"]);
+    assert.ok(!scan.logs.some((line) => /quarantin/iu.test(line)), scan.logs.join(" | "));
+    assert.equal(faults.target.hits, 0); // the redirect was never followed
+  } finally {
+    faults.close();
+  }
+});
+
+// The Room's answer to a heartbeat on a session it does not hold (server
+// c1f5c4a, deployed 2026-10-04T22:19Z: api/connector_sessions.go:218-219,
+// ErrSessionNotFound): HTTP 404 with its JSON code not_found.
+function lostSessionRoom() {
+  const requests = [];
+  const registerAnswers = [badGateway(), badGateway()];
+  const fetchImpl = async (url) => {
+    const path = new URL(url).pathname;
+    if (path.endsWith("/sessions/s/heartbeat")) {
+      requests.push("heartbeat s");
+      return json({code: "not_found", message: "room or object not found", requestId: "request-1"}, 404);
+    }
+    if (path.endsWith("/heartbeat")) { requests.push("heartbeat"); return json({leaseExpiresAt: "2099-01-01T00:00:00Z"}); }
+    if (path.endsWith("/connector/sessions")) {
+      const answer = registerAnswers.shift();
+      requests.push(answer ? "register failed" : "register");
+      return answer ?? json({sessionId: "s2", heartbeatIntervalSeconds: 0.01, capabilities: []});
+    }
+    // The enrollment listing does not ask for a registration.
+    if (path.endsWith("/connector/enrollments")) { requests.push("listing"); return json([]); }
+    throw new Error(`Unexpected request: ${url}`);
+  };
+  return {requests, client: new clientModule.RoomClient({baseUrl: "https://room.example/api", credential: "fixture-credential", fetchImpl})};
+}
+
+test("P7a-18 the Room's JSON 404 not_found for the session on a heartbeat, with the enrollment listing not asking for it: exactly one new registration follows promptly, retried on the schedule until accepted, and the same on the event-read path", async () => {
+  // The heartbeat loop.
+  const beats = roomRuntime([message(41, "x")]);
+  delete beats.maintainPresence;
+  beats.publishPresence = async () => {};
+  const lost = lostSessionRoom();
+  beats.client = lost.client;
+  beats.connectorSession = {sessionId: "s", heartbeatIntervalSeconds: 0.01};
+  beats.heartbeatMinimumSeconds = 0.01;
+  const timers = compressTimers();
+  try {
+    beats.runHeartbeat();
+    const deadline = Date.now() + 5000;
+    while (!lost.requests.includes("heartbeat") && Date.now() < deadline) await pause(5);
+  } finally {
+    await beats.close();
+    timers.restore();
+  }
+  assert.deepEqual(lost.requests.slice(0, 4), ["heartbeat s", "register failed", "register failed", "register"]);
+  assert.equal(lost.requests.filter((request) => request.startsWith("register")).length, 3);
+  assert.equal(beats.connectorSession.sessionId, "s2");
+  const waits = timers.of("backgroundSleep");
+  assert.equal(waits.length, 2, String(waits));
+  waits.forEach((wait, index) => assertOnSchedule(wait, index, waits));
+
+  // The event-read path (the scan's presence check, no heartbeat loop).
+  const scan = roomRuntime([message(41, "After the restart.")]);
+  delete scan.maintainPresence;
+  scan.publishPresence = async () => {};
+  const scanLost = lostSessionRoom();
+  Object.assign(scan.client, {
+    heartbeat: (...args) => scanLost.client.heartbeat(...args),
+    register: (...args) => scanLost.client.register(...args),
+    connectorEnrollments: (...args) => scanLost.client.connectorEnrollments(...args),
+  });
+  const controller = new AbortController();
+  const scanTimers = compressTimers();
+  let turn;
+  try {
+    const turns = scan.assignedTurns(controller.signal);
+    turn = await turns.next();
+    controller.abort();
+    await turns.return();
+  } finally {
+    scanTimers.restore();
+  }
+  assert.equal(turn.value.sourceEventId ?? turn.value.id, "message000041");
+  assert.deepEqual(scanLost.requests.slice(0, 4), ["heartbeat s", "register failed", "register failed", "register"]);
+  assert.equal(scanLost.requests.filter((request) => request === "register").length, 1);
+  const scanWaits = scanTimers.of("assignedTurns");
+  assert.equal(scanWaits.length, 2, String(scanWaits));
+  scanWaits.forEach((wait, index) => assertOnSchedule(wait, index, scanWaits));
+});
+
+// OP-12 r2 s4: each retry loop ends on the stop at once, by its own check:
+// the stop arrives while a contact fails transiently, and the loop neither
+// contacts the Room again nor reports a retry.
+test("every retry loop ends on the stop signal at once, without a further contact or a retry", async () => {
+  const recorded = (runtime) => {
+    const statuses = [];
+    runtime.reportStatus = (fields) => statuses.push(fields.connection ?? "");
+    return statuses;
+  };
+  const results = {};
+  const attempt = () => ({cycle: {id: "cycle-1", generation: 1}, attempt: {id: "attempt-1", membershipId: "zurie", leaseExpiresAt: leaseIn(60_000)}});
+
+  const start = new AbortController();
+  const {runtime: starting, calls} = await startRuntime([() => { start.abort(); return badGateway(); }]);
+  const startStatuses = recorded(starting);
+  await starting.initialize(start.signal).catch(() => {});
+  await pause(20);
+  results.start = [calls.register, startStatuses.includes("reconnecting")];
+
+  const read = new AbortController();
+  const reading = roomRuntime([message(41, "x")]);
+  const readStatuses = recorded(reading);
+  let reads = 0;
+  reading.client.readEvents = async () => { reads += 1; read.abort(); throw new RoomAPIError(502, {}); };
+  await reading.readEventsResilient(40, read.signal).catch(() => {});
+  await pause(20);
+  results.read = [reads, readStatuses.includes("reconnecting")];
+
+  const scan = new AbortController();
+  const scanning = roomRuntime([message(41, "x")]);
+  const scanStatuses = recorded(scanning);
+  let states = 0;
+  scanning.client.roomState = async () => { states += 1; scan.abort(); throw new RoomAPIError(503, {}); };
+  await scanning.assignedTurns(scan.signal).next().catch(() => {});
+  await pause(20);
+  results.scan = [states, scanStatuses.includes("reconnecting")];
+
+  const settle = new AbortController();
+  const settling = roomRuntime([message(41, "x")]);
+  const settleStatuses = recorded(settling);
+  let settles = 0;
+  settling.client.completeDiscussionAttempt = async () => { settles += 1; settle.abort(); throw new RoomAPIError(502, {}); };
+  await settling.settleDiscussionAttempt(attempt(), "pass", settle.signal).catch(() => {});
+  await pause(20);
+  results.settle = [settles, settleStatuses.includes("reconnecting")];
+
+  const acking = roomRuntime([message(41, "x")]);
+  const ackStatuses = recorded(acking);
+  let acks = 0;
+  acking.client.acknowledge = async () => { acks += 1; void acking.close(); throw new RoomAPIError(502, {}); };
+  acking.pendingEvent = message(41, "x");
+  await acking.recordSkipped("message000041", "model_no_visible_reply");
+  await acking.ack("message000041").catch(() => {});
+  await pause(20);
+  results.acknowledgement = [acks, ackStatuses.includes("reconnecting")];
+
+  const beating = roomRuntime([message(41, "x")]);
+  delete beating.maintainPresence;
+  beating.publishPresence = async () => {};
+  const beatStatuses = recorded(beating);
+  let beats = 0;
+  beating.client.heartbeat = async () => { beats += 1; void beating.close(); throw new RoomAPIError(502, {}); };
+  beating.client.connectorEnrollments = async () => [];
+  beating.connectorSession = {sessionId: "s", heartbeatIntervalSeconds: 0.01};
+  beating.heartbeatMinimumSeconds = 0.01;
+  beating.runHeartbeat();
+  const deadline = Date.now() + 5000;
+  while (beats < 1 && Date.now() < deadline) await pause(5);
+  await beating.heartbeatTask;
+  await pause(20);
+  results.heartbeat = [beats, beatStatuses.includes("reconnecting")];
+
+  const once = [1, false];
+  assert.deepEqual(results, {start: once, read: once, scan: once, settle: once, acknowledgement: once, heartbeat: once});
 });

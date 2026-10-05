@@ -30,7 +30,7 @@ after(() => rm(home, {recursive: true, force: true}));
 process.env.OPENCLAW_STATE_DIR = join(home, "openclaw");
 const {roomStatusPath, roomToolCallPolicy} = await import("../src/channel.js");
 const {OpenClawRoomRuntime} = await import("../src/runtime.js");
-const {RoomAPIError} = await import("../src/room-client.js");
+const {RoomAPIError, RoomTransportError} = await import("../src/room-client.js");
 const {loadState, migrateStateFile, saveState, validateState} = await import("../src/state.js");
 const recovery = await import("../src/recovery.js");
 const {runRecoveryCli} = await import("../src/recovery-cli.js");
@@ -485,7 +485,7 @@ test("P3-07 a recovery closure is refused without the Room's proof that the even
   const flakyFile = await account(paulaState(), "flaky");
   recovery.appendRecord(recovery.journalPath(flakyFile), sealed);
   const flaky = proofRoom();
-  const failures = [new RoomAPIError(503, {code: "", retryable: true}), Object.assign(new TypeError("fetch failed"), {cause: {code: "ETIMEDOUT"}})];
+  const failures = [new RoomAPIError(503, {code: "", retryable: true}), new RoomTransportError(Object.assign(new Error("connect ETIMEDOUT"), {code: "ETIMEDOUT"}))];
   const cycle = flaky.getDiscussionCycle;
   flaky.getDiscussionCycle = async (...args) => { if (failures.length) throw failures.shift(); return cycle(...args); };
   const flakyRuntime = runtimeFor(await loadState(flakyFile), flakyFile, flaky);

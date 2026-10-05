@@ -1,7 +1,7 @@
 import {createHash, randomUUID} from "node:crypto";
 import {hostname} from "node:os";
 import {dirname, join} from "node:path";
-import {RETRY_AFTER_MAXIMUM_SECONDS, RoomAPIError, RoomClient, RoomResponseError, isNetworkFailure, roomErrorDiagnostic} from "./room-client.js";
+import {RETRY_AFTER_MAXIMUM_SECONDS, RoomAPIError, RoomClient, RoomResponseError, RoomTransportError, roomErrorDiagnostic} from "./room-client.js";
 import {loadState, migrateStateFile, saveNewState, saveState} from "./state.js";
 import {activateRoomChannel} from "./activation.js";
 import {ROOM_CONNECTOR_PROVENANCE} from "./release-provenance.js";
@@ -499,19 +499,20 @@ export class InvalidEventPage extends Error {
 }
 
 // Contract P2c-3a: the failed contacts the connector retries itself instead
-// of ending the channel, exactly: a network failure (Node's "fetch failed"
-// with a network cause) or a request timeout; an HTTP 5xx or 429; an answer
-// whose body is not the Room's JSON, whatever its status; a Room JSON error
-// marked retryable (never a revoked or expired credential); an invalid event
-// page. Anything else fails closed: a programming error (any other
-// TypeError), a local failure, an abort, every other Room answer.
+// of ending the channel, exactly: any rejection of the runtime's fetch for the
+// Room request or of the read of its body (RoomTransportError, decided where
+// it is caught, never by a cause code) or a request timeout; an HTTP 5xx or
+// 429; an answer that is not the Room's JSON, whatever its status, a 3xx
+// included; a Room JSON error marked retryable (never a revoked or expired
+// credential); an invalid event page. Anything else fails closed: an error of
+// this plugin's own code (a programming error, a local write failure), an
+// abort by the stop signal, every other Room answer.
 export function transientRoomFailure(error) {
   if (error instanceof RoomAPIError) {
     return error.retryable && error.code !== "credential_revoked" && error.code !== "credential_expired";
   }
-  if (error instanceof RoomResponseError || error instanceof InvalidEventPage) return true;
-  if (error?.name === "TimeoutError") return true;
-  return isNetworkFailure(error);
+  if (error instanceof RoomTransportError || error instanceof RoomResponseError || error instanceof InvalidEventPage) return true;
+  return error?.name === "TimeoutError";
 }
 
 // A failed contact that carries no Room code: the Room has not answered the
@@ -2794,6 +2795,9 @@ export class OpenClawRoomRuntime {
       await this.maintainPresence(signal);
     } catch (error) {
       if (signal?.aborted || this.closed || (error instanceof RoomAPIError && !error.retryable && !sessionLost(error))) throw error;
+      // P2c-3a: a registration owed after a lost session is retried on the
+      // scan's schedule (assignedTurns), not only at the next long poll.
+      if (this.reregister && transientRoomFailure(error)) throw error;
       // P2c-3a: the session is kept; a lost one was flagged by maintainPresence.
       this.reportStatus({connection: "reconnecting", errorCode: statusErrorCode(error)});
       this.logger?.warn?.(`Room presence unavailable${roomErrorDiagnostic(error)}; retrying at the next contact`);
