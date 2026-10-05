@@ -842,7 +842,9 @@ test("a command source older than the loaded page is found by the cycle-source l
 test("a fenced message of an earlier discussion is acknowledged at once, before the next event is handled", async () => {
   const old = {id: "m-20", seq: 20, type: "message.posted", actorRole: "human_owner", actorId: "owner-tj",
     payload: {body: "A message of the earlier discussion.", resolvedRecipientMembershipIds: ["zurie"]}};
-  const events = [old, START, HUMAN];
+  // No event in between that is acknowledged before its own state read (a
+  // discussion start is, and its cumulative acknowledgement would cover 20).
+  const events = [old, HUMAN];
   const runtime = runtimeFor(events, {pageStartsAt: 0, policy: {coordinationMode: "open"}});
   runtime.state.cursor = 19;
   // The first Room state read after the fenced message was superseded is the
