@@ -71,6 +71,12 @@ const ready = (seq, sourceEventId, extra = {}) => ({id: `ready-${seq}`, seq, typ
 const responseReady = (seq, sourceEventId = "m-50") => ready(seq, sourceEventId, {phase: "response", phaseInstruction: RESPONSE_INSTRUCTION});
 const claimed = (sourceEventId = "m-42", extra = {}) => ({attempt: {id: "attempt-1", round: 2, membershipId: "zurie", leaseExpiresAt: "2099-01-01T00:00:00Z"},
   cycle: {id: "cycle-1", generation: 1, totalTurns: 2, sourceEventId, budgets: {totalTurns: 6, perAgentTurns: 3}, ...extra}});
+const roundOne = (sourceEventId = "m-42") => {
+  const answer = claimed(sourceEventId);
+  answer.attempt.round = 1;
+  answer.cycle.totalTurns = 0;
+  return answer;
+};
 const count = (text, part) => text.split(part).length - 1;
 // The one log line of a stop (runtime.failClosedOnRequestError).
 const STOP_LINE = "Room request refused by the runtime before any I/O code=request_not_formed; the channel stops";
@@ -193,6 +199,16 @@ async function turnKinds(rules) {
       (runtime) => { runtime.state.missedSources = [{sourceEventId: "m-42", sourceSeq: 42}]; }), marker: "Missed earlier: #42 TJE"},
     "discussion start as the current item": {turn: await kind([START, HUMAN, PEER, ready(50, "start-z")], {claim: claimed("start-z")}),
       marker: "Debate"},
+    // The phases the plugin itself names besides follow_up and summary
+    // (cyclePhaseInstruction): opening and initial_greeting, in round 1 (OP-12
+    // P7c r3 B2, N2 a-round1); a word bound frozen in the cycle (N2 a-wordbound).
+    "opening": {turn: await kind([START, HUMAN, PEER, ready(46, "m-42", {phase: "opening", round: 1})], {claim: roundOne()}),
+      marker: "Discussion phase: opening; round 1;"},
+    "initial greeting": {turn: await kind([START, HUMAN, PEER, ready(46, "m-42", {phase: "initial_greeting", round: 1})],
+      {claim: roundOne()}), marker: "Discussion phase: initial_greeting; round 1;"},
+    "word bound frozen in the cycle": {turn: await kind([START, HUMAN, PEER, ready(46, "m-42")],
+      {claim: claimed("m-42", {budgets: {totalTurns: 6, perAgentTurns: 3, maxContributionWords: 120}})},
+    ), marker: wordBoundFact(120, WORD_BOUND_CYCLE_SOURCE)},
   };
 }
 
@@ -407,15 +423,21 @@ test("P7c-09 the ISSUE-031 sentence is in the frame exactly once, also when the 
   // guidance carries it. An open-Room message turn through the scan as well.
   const command = {id: "cmd-47", seq: 47, type: "human.command", actorRole: "human_owner", actorId: "owner-tj",
     payload: {command: {command: "ask", arguments: {instruction: "Your view?"}}, visibleText: "/ask"}};
+  const keptBlock = "[Your own earlier reply]\nMy kept earlier reply.\n[/Your own earlier reply]";
   const shapes = {
     "cycle turn": [ready(46, "m-42"), claimed()],
     "direct human.command turn": [command, null],
     "open-Room message turn": [HUMAN, null],
     "message turn with a claimed attempt": [HUMAN, claimed()],
+    // OP-12 P7c r3 N2: the message shape in round 1 (phase opening, a-s4-opening)
+    // and an open-Room message turn that offers a kept reply (a-open-kept).
+    "message turn with a claimed round-1 attempt": [HUMAN, roundOne(), "", "Discussion phase: opening; round 1;"],
+    "open-Room message turn offering a kept reply": [HUMAN, null, keptBlock, keptBlock],
   };
-  for (const [label, [event, attempt]] of Object.entries(shapes)) {
-    const frame = (carried) => normalizeEvent(event, "room-1", attempt, "", "epoch-z", "", 0, null, "", null, [], "",
+  for (const [label, [event, attempt, kept = "", marker = ""]] of Object.entries(shapes)) {
+    const frame = (carried) => normalizeEvent(event, "room-1", attempt, "", "epoch-z", "", 0, null, "", null, [], kept,
       {guidanceCarriesNoStatus: carried}).text;
+    assert.ok(frame(false).includes(marker), `${label}: ${frame(false)}`);
     assert.equal(count(frame(false), SENTENCE), 1, label);
     assert.ok(frame(false).split("\n\n").includes(SENTENCE), `${label}: a paragraph of its own, byte-exact`);
     assert.equal(count(frame(true), SENTENCE), 0, `${label}: not added when the guidance carries it`);
@@ -670,9 +692,13 @@ test("P7c-17 a request the runtime refuses to form is the connector's own error,
   runtime.client.readEvents = async () => client.request("/rooms/room-1/events");
   const controller = new AbortController();
   const turns = runtime.assignedTurns(controller.signal);
-  await assert.rejects(Promise.race([turns.next(), pause(5_000).then(() => { throw new Error("retried"); })]),
-    (error) => error instanceof RoomRequestError);
-  controller.abort();
+  try {
+    await assert.rejects(Promise.race([turns.next(), pause(5_000).then(() => { throw new Error("retried"); })]),
+      (error) => error instanceof RoomRequestError);
+  } finally {
+    // A scan that retried ends here too, so the file goes on (OP-12 P7c r3 N1).
+    controller.abort();
+  }
   assert.equal(fetches, 0);
 });
 
@@ -760,7 +786,19 @@ test("P7c-20 a Room URL the runtime refuses to form is the connector's own error
   starting.status = new LocalStatus(startPath, {version: "test", hostLabel: "host"});
   let starts = 0;
   starting.initializeOnce = async () => { starts += 1; return new RoomClient({baseUrl: "room.example/api", credential: "credential"}); };
-  await assert.rejects(starting.initializeRetrying(undefined), (error) => error instanceof RoomRequestError);
+  // A start loop that retried fails here with a message instead of hanging the
+  // file (OP-12 P7c r3 N1): a second try rejects, and the runtime is closed.
+  let watch;
+  const startRetried = new Promise((_resolve, reject) => {
+    watch = setInterval(() => { if (starts > 1) reject(new Error("start: retried")); }, 5);
+  });
+  try {
+    await assert.rejects(Promise.race([starting.initializeRetrying(undefined), startRetried, hangGuard()]),
+      (error) => error instanceof RoomRequestError);
+  } finally {
+    clearInterval(watch);
+    await starting.close();
+  }
   assert.equal(starts, 1, "not retried");
   await pause(20);
   const startEntry = JSON.parse(await readFile(startPath, "utf8")).rooms["room-1"];
@@ -861,6 +899,8 @@ test("P7c-21 a credential the runtime refuses in a header is never in an error, 
       });
       let failure = null;
       try { await Promise.race([run, retried, hangGuard()]); } catch (error) { failure = error; }
+      // A loop that retried ends with the runtime, so the file goes on (OP-12 P7c r3 N1).
+      if (tries > 1) await looping.close();
       assert.equal(tries, 1, `${loop}: not retried`);
       if (loop === "start") assert.ok(failure instanceof RoomRequestError, `${loop}: ${failure?.name}`);
       else assert.ok(looping.heartbeatAbort.signal.aborted && looping.heartbeatError instanceof RoomRequestError, loop);
@@ -877,6 +917,51 @@ test("P7c-21 a credential the runtime refuses in a header is never in an error, 
   // The channel writes statusErrorCode(error) when it ends (src/channel.js): the
   // plugin's own code, never network.
   assert.equal(statusErrorCode(new RoomRequestError()), "request_not_formed");
+  // The other side (OP-12 P7c r3 B1): a credential fetch sends is formed and
+  // sent: a trailing line feed, spaces at both ends, a tab inside, é, ÿ, U+0080.
+  for (const credential of [`${secret}\n`, `  ${secret}  `, `${secret}\tX`, `${secret}é`, `${secret}ÿ`, `${secret}\u0080X`]) {
+    let fetches = 0;
+    const client = new RoomClient({baseUrl: "https://room.example/api", credential,
+      fetchImpl: async () => { fetches += 1; return new Response("{}", {status: 200}); }});
+    await client.request("/rooms/room-1/state");
+    assert.equal(fetches, 1, `${JSON.stringify(credential)}: formed and sent`);
+  }
+});
+
+test("the header pre-check refuses a value exactly when the running Node's fetch refuses it", {timeout: 120_000}, async () => {
+  // OP-12 P7c r3 N4: the pre-check is a copy of the runtime's rule; this holds it
+  // to the running runtime. Every code point 0x00-0xFF and a few above, alone,
+  // inside, first and last in the credential: real fetch to a loopback listener
+  // (sent or refused), against the client with real fetch (sent or RoomRequestError).
+  const {createServer} = await import("node:http");
+  const server = createServer((request, response) => {
+    request.resume();
+    response.writeHead(200, {"content-type": "application/json"});
+    response.end("{}");
+  });
+  const port = await new Promise((resolve) => server.listen(0, "127.0.0.1", () => resolve(server.address().port)));
+  const points = [...Array(0x100).keys(), 0x100, 0x2019, 0x3042, 0xd800, 0xfeff, 0xfffd, 0xffff];
+  const outcomes = {sent: 0, refused: 0};
+  const disagreements = [];
+  try {
+    for (const point of points) {
+      const character = String.fromCharCode(point);
+      for (const value of [character, `a${character}b`, `${character}ab`, `ab${character}`]) {
+        const runtime = await fetch(`http://127.0.0.1:${port}/x`, {headers: {Authorization: `Bearer ${value}`}})
+          .then(async (response) => { await response.arrayBuffer(); return "sent"; }, () => "refused");
+        const client = new RoomClient({baseUrl: `http://127.0.0.1:${port}/api`, credential: value});
+        const plugin = await client.request("/rooms/room-1/state")
+          .then(() => "sent", (error) => (error instanceof RoomRequestError ? "refused" : `failed ${error?.name}`));
+        outcomes[runtime] += 1;
+        if (plugin !== runtime) disagreements.push(`U+${point.toString(16).padStart(4, "0")} in ${JSON.stringify(value)}: fetch ${runtime}, plugin ${plugin}`);
+      }
+    }
+  } finally {
+    server.close();
+    server.closeAllConnections?.();
+  }
+  assert.deepEqual(disagreements, []);
+  assert.ok(outcomes.sent > 0 && outcomes.refused > 0, JSON.stringify(outcomes));
 });
 
 test("P7c-22 held_by_moderator only for cycle_no_attempt while the Room state holds the refused cycle, and never the holder's name or membership id", async () => {
