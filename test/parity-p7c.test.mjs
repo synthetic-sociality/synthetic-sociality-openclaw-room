@@ -32,6 +32,7 @@ const runtimeModule = await import("../src/runtime.js");
 const {
   OpenClawRoomRuntime, ROOM_NO_SYSTEM_STATUS_INSTRUCTION, WORD_BOUND_CYCLE_SOURCE, WORD_BOUND_POLICY_SOURCE, activeTopic,
   canonicalRoomContext, guidanceCarriesNoStatusSentence, normalizeEvent, positiveWordLimit, roomTurnFacts, statusErrorCode, wordBoundFact,
+  transientRoomFailure, uncodedContactFailure,
 } = runtimeModule;
 const {RoomAPIError, RoomClient, RoomRequestError, RoomTransportError} = await import("../src/room-client.js");
 const {GATE_WAIT_REASONS, LocalStatus} = await import("../src/local-status.js");
@@ -225,7 +226,7 @@ test("conformance P7c case names resolve to tests in this suite", async () => {
   const sources = await Promise.all((await readdir(directory)).filter((name) => name.endsWith(".test.mjs"))
     .map((name) => readFile(new URL(name, directory), "utf8")));
   const cases = Object.entries(conformance.parityP7cCases ?? {});
-  assert.equal(cases.length, 22);
+  assert.equal(cases.length, 23);
   cases.forEach(([id, name], index) => {
     assert.equal(id, `P7c-${String(index + 1).padStart(2, "0")}`);
     assert.ok(name.startsWith(`${id} `), id);
@@ -737,8 +738,11 @@ test("P7c-20 a Room URL the runtime refuses to form is the connector's own error
   // error, whose text and fields never quote the URL (the parser's error keeps
   // it as input).
   let fetches = 0;
+  // The scheme check is an allow-list (OP-12 P7c r3 N2, l2, as Hermes): ftp,
+  // file, ws and wss are refused as well.
   for (const baseUrl of ["https://room.example:port/api", "room.example/api", "//room.example/api", "http://[::1/api",
-    "foo://room.example/api"]) {
+    "foo://room.example/api", "ftp://room.example/api", "file://room.example/api", "ws://room.example/api",
+    "wss://room.example/api", "FTP://room.example/api"]) {
     assert.throws(() => new RoomClient({baseUrl, credential: "credential",
       fetchImpl: async () => { fetches += 1; return new Response("{}", {status: 200}); }}), (error) => {
       assert.ok(!(error instanceof RoomTransportError), error?.name);
@@ -768,6 +772,16 @@ test("P7c-20 a Room URL the runtime refuses to form is the connector's own error
     fetchImpl: async (url) => { hosts.push(new URL(url).hostname); return new Response("{}", {status: 200}); }});
   await idn.request("/rooms/room-1/state");
   assert.deepEqual(hosts, ["xn--fsq.example"]);
+  // The other side (OP-12 P7c r3 N1, as Hermes): a Room URL that worked still
+  // forms: an upper-case scheme, leading white space, a Latin-1 host, http and https.
+  for (const baseUrl of ["https://room.example/api", "HTTPS://room.example/api", "Https://Room.Example/API",
+    "  https://room.example/api", "\thttp://127.0.0.1:8787/api", "HTTP://127.0.0.1:8787/api", "https://räume.example/api"]) {
+    const formed = [];
+    const client = new RoomClient({baseUrl, credential: "credential",
+      fetchImpl: async (url) => { formed.push(url); return new Response("{}", {status: 200}); }});
+    await client.request("/rooms/room-1/state");
+    assert.equal(formed.length, 1, `${JSON.stringify(baseUrl)}: formed and fetched`);
+  }
   // A port fetch blocks (the Fetch standard's bad ports) is refused before any
   // I/O as well: the plugin's own error, not a failed contact (OP-12 N8).
   const blocked = new RoomClient({baseUrl: "http://127.0.0.1:6000/api", credential: "credential",
@@ -912,6 +926,147 @@ test("P7c-22 held_by_moderator only for cycle_no_attempt while the Room state ho
   assert.ok(renewed.refreshed, JSON.stringify(renewed));
   assert.equal(await reason(), "");
 });
+
+test("P7c-23 a timeout, a DNS failure, a connection reset or a refused connection on a request or on the event read is a failed contact and retried, never the connector's own request_not_formed", {timeout: 240_000}, async () => {
+  // OP-12 P7c r3 B1 (Hermes; the same case here): a stop needs a gateway
+  // restart, so a transient failure must never be taken for a request the
+  // runtime refused to form. Each kind Node's fetch distinguishes, real
+  // (loopback listeners, this process's resolver), through the real client on
+  // a request and on the event read: a failed contact (never RoomRequestError,
+  // status code network); the start, heartbeat and scan loops retry it.
+  const faults = await transientFaults();
+  try {
+    for (const [kind, marker] of Object.entries(faults.kinds)) {
+      for (const contact of ["register", "events", "heartbeat"]) {
+        const error = await faults.fail(kind, contact).then(() => null, (caught) => caught);
+        assert.ok(error && !(error instanceof RoomRequestError), `${kind} ${contact}: ${error?.name}`);
+        assert.ok(transientRoomFailure(error) && uncodedContactFailure(error), `${kind} ${contact}: a failed contact`);
+        assert.equal(statusErrorCode(error), "network", `${kind} ${contact}`);
+        assert.ok(marker(error), `${kind} ${contact}: the failure is of this kind (${error?.name} ${error?.cause?.name} ${error?.cause?.code})`);
+      }
+      // The start loop: the registration fails once with the kind, then is accepted.
+      const starting = runtimeFor([HUMAN]);
+      const startStatuses = recordedStatuses(starting);
+      Object.assign(starting, {reconnectInitialMs: 1, reconnectMaxMs: 2});
+      let starts = 0;
+      starting.initializeOnce = async () => { starts += 1; return starts === 1 ? faults.fail(kind, "register") : "started"; };
+      assert.equal(await Promise.race([starting.initializeRetrying(undefined), hangGuard()]), "started", kind);
+      assert.equal(starts, 2, `${kind}: retried`);
+      await starting.close();
+      // The heartbeat loop: two heartbeats fail with the kind, the loop goes on.
+      const beating = runtimeFor([HUMAN]);
+      const beatStatuses = recordedStatuses(beating);
+      Object.assign(beating, {reconnectInitialMs: 1, reconnectMaxMs: 2, heartbeatMinimumSeconds: 0.001});
+      beating.connectorSession = {sessionId: "s", heartbeatIntervalSeconds: 0.001};
+      let beats = 0;
+      beating.maintainPresence = async () => { beats += 1; if (beats <= 2) await faults.fail(kind, "heartbeat"); };
+      beating.runHeartbeat();
+      const deadline = Date.now() + 120_000;
+      while (beats < 4 && !beating.heartbeatAbort.signal.aborted && Date.now() < deadline) await pause(5);
+      assert.ok(beats >= 4 && !beating.heartbeatAbort.signal.aborted && !beating.heartbeatError, `${kind}: the heartbeat loop goes on`);
+      await beating.close();
+      // The scan: the event read fails once with the kind, then the page is read
+      // and its turn handed on.
+      const scanning = runtimeFor([START, HUMAN, PEER, ready(46, "m-42")]);
+      const scanStatuses = recordedStatuses(scanning);
+      Object.assign(scanning, {reconnectInitialMs: 1, reconnectMaxMs: 2});
+      const page = scanning.client.readEvents;
+      let reads = 0;
+      scanning.client.readEvents = async (...args) => { reads += 1; return reads === 1 ? faults.fail(kind, "events") : page(...args); };
+      const controller = new AbortController();
+      const turns = scanning.assignedTurns(controller.signal);
+      const turn = await Promise.race([turns.next(), hangGuard()]);
+      controller.abort();
+      await turns.return();
+      assert.equal(turn.done, false, `${kind}: the scan goes on`);
+      assert.ok(reads >= 2, `${kind}: read again`);
+      await scanning.close();
+      for (const [loop, statuses] of [["start", startStatuses], ["heartbeat", beatStatuses], ["scan", scanStatuses]]) {
+        assert.equal(statuses.filter(([connection, code]) => connection === "reconnecting" && code === "network").length,
+          loop === "heartbeat" ? 2 : 1, `${kind} ${loop}: ${JSON.stringify(statuses)}`);
+        assert.ok(!statuses.some((entry) => entry.includes("stopped") || entry.includes("request_not_formed")), `${kind} ${loop}`);
+      }
+    }
+  } finally {
+    faults.close();
+  }
+});
+
+// P7c-23: the transient failures of a Room contact, real: a peer that accepts
+// and never answers (timed out by the runtime's own timeout, and by a bounded
+// signal the caller passes, as the renewal and the cycle-source lookup do), a
+// peer that reads the request and resets the connection, a closed port; a DNS
+// failure as this process's resolver gives it. Each kind with its own mark.
+async function transientFaults() {
+  const net = await import("node:net");
+  const dns = (await import("node:dns")).default;
+  const listen = (server) => new Promise((resolve) => server.listen(0, "127.0.0.1", () => resolve(server.address().port)));
+  const held = new Set();
+  const stall = net.createServer((socket) => { held.add(socket); socket.on("error", () => {}); });
+  const reset = net.createServer((socket) => {
+    let received = Buffer.alloc(0);
+    socket.on("error", () => {});
+    socket.on("data", (chunk) => {
+      received = Buffer.concat([received, chunk]);
+      const end = received.indexOf("\r\n\r\n");
+      if (end < 0) return;
+      const length = Number(/\r\ncontent-length:\s*(\d+)/iu.exec(received.subarray(0, end).toString("latin1"))?.[1] ?? 0);
+      // The whole request was read; then a reset, not a close.
+      if (received.length - end - 4 >= length) socket.resetAndDestroy();
+    });
+  });
+  const ports = {stall: await listen(stall), reset: await listen(reset)};
+  const closed = net.createServer();
+  ports.closed = await listen(closed);
+  await new Promise((resolve) => closed.close(resolve));
+  const timedOut = (error) => error?.name === "TimeoutError" || error?.cause?.name === "TimeoutError";
+  const causeCode = (codes) => (error) => error instanceof RoomTransportError && codes.includes(error.cause?.code);
+  const kinds = {
+    "timeout of the runtime": (error) => error instanceof RoomTransportError && timedOut(error),
+    "timeout of a bounded signal": (error) => !(error instanceof RoomTransportError) && timedOut(error),
+    "DNS failure": causeCode(["ENOTFOUND"]),
+    "connection reset": causeCode(["ECONNRESET", "UND_ERR_SOCKET"]),
+    "connection refused": causeCode(["ECONNREFUSED"]),
+  };
+  const fail = async (kind, contact) => {
+    const port = kind.startsWith("timeout") ? ports.stall : kind === "connection reset" ? ports.reset : ports.closed;
+    const host = kind === "DNS failure" ? "localhost" : "127.0.0.1";
+    const fetchImpl = kind === "timeout of the runtime"
+      ? (url, init) => globalThis.fetch(url, {...init, signal: AbortSignal.timeout(200)})
+      : globalThis.fetch;
+    const client = new RoomClient({baseUrl: `http://${host}:${port}/api`, credential: "fixture-credential", fetchImpl});
+    const signal = kind === "timeout of a bounded signal" ? AbortSignal.timeout(200) : undefined;
+    const session = {roomId: "room-1", credential: "fixture-credential", clientInstanceId: "client-1"};
+    const lookup = dns.lookup;
+    if (kind === "DNS failure") {
+      dns.lookup = (hostname, options, callback) => {
+        const done = typeof options === "function" ? options : callback;
+        process.nextTick(done, Object.assign(new Error(`getaddrinfo ENOTFOUND ${hostname}`),
+          {code: "ENOTFOUND", errno: -3008, syscall: "getaddrinfo", hostname}));
+      };
+    }
+    try {
+      if (contact === "register") await client.register(session, {transport: "poll"}, signal);
+      else if (contact === "heartbeat") await client.heartbeat(session, "s", signal);
+      else await client.readEvents(session, 40, {signal});
+    } finally {
+      dns.lookup = lookup;
+    }
+    throw new Error(`${kind}: the ${contact} did not fail`);
+  };
+  return {
+    kinds, fail,
+    close: () => { for (const socket of held) socket.destroy(); stall.close(); reset.close(); },
+  };
+}
+
+// Every {connection, errorCode} pair a runtime's loops report, in order.
+function recordedStatuses(runtime) {
+  const statuses = [];
+  const report = runtime.reportStatus.bind(runtime);
+  runtime.reportStatus = (fields) => { statuses.push([fields?.connection, fields?.errorCode]); return report(fields); };
+  return statuses;
+}
 
 // P7c items 4 and 8: tests for mutations that survived the P6 round-2 and P7a
 // round-3 reviews (REVIEW-20261004-parity-P6-r2.md finding 4,
