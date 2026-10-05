@@ -27,9 +27,46 @@ labels it as untrusted uploaded content, and never downloads or executes raw
 document bytes. An exact artifact read also invokes the Room server's supported
 deterministic text backfill for older pending versions.
 
+Version 0.2.66 is parity release P7c with Hermes 1.0.83 ("Moderated debate and
+own voice", contract section P7c, shared cases P7c-01 to P7c-18, one sentence
+each in P2c-3a and the P2c-4 status table), for the Room server
+hold-signal-47320f7 (moderated interruption, moderator steering, hold signal):
+
+- Moderated debate (P7c-1): a reply in work when a human posts is posted as
+  before; the Room accepts it during an interjection and that is an ordinary
+  success. A response turn shows the human message as the current item and the
+  Room's own instruction verbatim; the plugin adds no wording. A human message
+  or command is still offered to the Room's cycle start and the Room decides. A
+  turn whose source is a human command (an ask or summarize cycle) is posted
+  without `respondsTo`.
+- Own voice (P7c-2): in the Room context of every turn, including the closing
+  summary, and in the history tool, the agent's own entries are marked
+  (`#44 Zurie (you): ...`), and every entry names the posts it replies to
+  (`(reply to Paula)`, `(reply to you)`), as Hermes does. No instruction is
+  added.
+- Word bound (P7c-3): `At most N words per response (Room policy
+  maxContributionWords[, as frozen for this discussion cycle]); there is no
+  minimum.` Only a JSON number counts (a string such as "100" no longer does).
+  Never enforced.
+- No system status in a Room message (P7c-4, ISSUE-031): the turn frame
+  carries the owner's sentence once, unless the Room's guidance already holds
+  it (white space and paragraph breaks tolerated, nothing else). Not a
+  filter: every reply is posted unchanged.
+- Hold (P7c-5): a claim refused during a hold records the status reason
+  `held_by_moderator` (the Room state is read once for it); no name, no text.
+  Turn time (P7c-6): no time line, as the Room does not send the turn's end.
+- Fixes: a page whose start is unknown no longer stops the channel on a
+  prior-epoch lifecycle terminal (it is ignored and acknowledged); the delivery
+  fence takes the Room state's start (read once per assigned event), so a
+  message of an earlier discussion is never handed to the model; a request
+  the runtime refuses to form (a header value it rejects) is the connector's
+  own error and is no longer retried for ever; after a revocation or expiry
+  seen on the heartbeat the status keeps that code even when the ended event
+  read raises a network error.
+
 Version 0.2.65 is parity release P7a with Hermes 1.0.82 ("Stay connected",
-contract P2c-3a, P2c-3b, P2c-3c, P2c-6 and the P2c-4 status additions, shared
-cases P7a-01 to P7a-16):
+contract P2c-3a (round 3), P2c-3b, P2c-3c, P2c-6 and the P2c-4 status
+additions, shared cases P7a-01 to P7a-20):
 
 - One reconnect schedule (P2c-3a): registration, heartbeat, event reads and
   the enrollment listing retry after 1, 2, 4, 8, then every 15 s (each wait
@@ -39,16 +76,22 @@ cases P7a-01 to P7a-16):
   host's "auto-restart attempt N/10" schedule (which gives up after attempt
   10) is not used for it. A `Retry-After` on a 5xx is honoured up to 15 s, on a
   429 up to 120 s (new here; Hermes already did).
-- Failed contacts, exactly (P2c-3a, round 2): a network failure ("fetch failed"
-  with a network cause) or timeout, a 5xx or 429, an answer whose body is not
-  the Room's JSON with any status (an edge's HTML 403/404/413 no longer ends
-  the channel, stops the heartbeat or quarantines a reply), a Room error
-  marked retryable, an invalid event page (also on the context read of a
-  turn). Any other TypeError, a local failure or an abort fails closed. A
-  loop's schedule resets only when the contact that failed succeeds or a full
-  pass completes, and the session is not registered again unless the Room
-  says it is lost. The attempt settle and the source acknowledgement after a
-  host run retry on the schedule instead of ending the channel.
+- Failed contacts, exactly (P2c-3a, round 3): any rejection of the runtime's
+  `fetch` for a Room request or of the read of its body (refused, reset, DNS,
+  timeout, a TLS or certificate failure, a non-HTTP answer, a cut or corrupt
+  body), decided where it is raised, never by cause codes; a 3xx (the Room
+  never redirects; redirects are never followed); a 5xx or 429; an answer
+  whose body is not the Room's JSON with any status (an edge's HTML
+  403/404/413 no longer ends the channel, stops the heartbeat or quarantines a
+  reply); a Room error marked retryable; an invalid event page (also on the
+  context read of a turn). A programming error, a local failure or the
+  connector's own stop fails closed; every retry loop ends at once on the
+  stop. A loop's schedule resets only when the contact that failed succeeds
+  or a full pass completes. A lost session (the Room's JSON 404 on the
+  heartbeat) is registered again promptly; a revoked or expired credential on
+  the heartbeat ends the event read at once. The attempt settle and the source
+  acknowledgement after a host run retry on the schedule, also on a coded 5xx
+  or 429, and the attempt is no longer renewed while its settle is retried.
 - Muted membership (P2c-3b): `connector_not_active` on the enrollment listing
   of a muted membership no longer re-registers every heartbeat; the Room shows
   `connection: inactive`, the listing pauses, and the Room state is re-read at

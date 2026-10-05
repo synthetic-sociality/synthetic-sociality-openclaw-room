@@ -828,7 +828,9 @@ test("P7a-16 the attempt renewal and the re-claim before a post retry on the sch
 
 test("the scan loop's schedule returns to its first step after a full pass, never after an accepted registration", async () => {
   const runtime = roomRuntime([message(41, "x")]);
-  const script = [false, false, false, true, false, false];
+  // A pass reads the Room state twice for its turn: the delivery fence
+  // (P7c-7) and the context.
+  const script = [false, false, false, true, true, false, false];
   let reads = 0;
   let registrations = 0;
   const roomState = runtime.client.roomState;

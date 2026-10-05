@@ -439,6 +439,8 @@ test("receive-boundary acknowledgement precedes coordination and model dispatch"
       activeEpochId: "epoch-1", activeEpochStartsAtSeq: 1,
       events: [event],
     }),
+    // The delivery fence reads the Room state's start (P7c-7).
+    roomState: async () => ({activeEpoch: {id: "epoch-1", startsAtSeq: 1}}),
   };
   runtime.maintainPresence = async () => { trace.push("presence"); };
   runtime.recoverPostedEvidence = async () => false;

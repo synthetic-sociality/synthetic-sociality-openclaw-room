@@ -46,8 +46,10 @@ function eventPayload(value) {
   } catch { return {}; }
 }
 
-function actorName(state, event) {
-  return speakerLabel(state?.roster, event);
+function actorName(state, event, ownMembershipId = "") {
+  const label = speakerLabel(state?.roster, event);
+  const own = String(ownMembershipId ?? "").trim();
+  return own && String(event?.actorId ?? "").trim() === own ? `${label} (you)` : label;
 }
 
 // Incrementally scan the append-only event chain for epoch starts and owner
@@ -168,7 +170,8 @@ export async function readRoomHistory({client, session, args = {}, cache = scanC
         if (!body || (query && !body.toLowerCase().includes(query))) continue;
         const bodyTruncated = body.length > HISTORY_BODY_CHARACTER_LIMIT;
         const entry = {
-          seq, id: String(event.id ?? ""), actor: actorName(state, event),
+          // Contract P7c-2: the agent's own entry is marked as its own.
+          seq, id: String(event.id ?? ""), actor: actorName(state, event, session.membershipId),
           body: body.slice(0, HISTORY_BODY_CHARACTER_LIMIT) + (bodyTruncated ? "…" : ""),
           bodyTruncated,
           respondsTo: (Array.isArray(payload.respondsTo) ? payload.respondsTo : []).map(String),

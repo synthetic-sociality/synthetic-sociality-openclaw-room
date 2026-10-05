@@ -837,6 +837,16 @@ export class OpenClawRoomRuntime {
           if (!isCanonicalCycleTransitionTerminal(event, this.state.roomId)) {
             throw new Error("Room prior-epoch lifecycle terminal lacks canonical cycle-transition evidence");
           }
+          if (!pageEpoch.startsAtSeq) {
+            // Contract P7c-7 (P6-2): with the page's start unknown the catalog
+            // cannot prove the boundary; a lifecycle terminal carries no model
+            // work, so it is ignored and acknowledged and the channel runs on.
+            await this.recordReceived([event]);
+            await this.recordTerminalEvidence(event, "ignored", {reason: "prior_epoch_lifecycle"});
+            await this.ackEvent(event);
+            scanCursor = event.seq;
+            continue;
+          }
           const epochCatalog = await this.client.listEpochs(this.state, signal);
           canonicalPriorEpochId = priorEpochIdFromCatalog(epochCatalog, pageEpoch);
         }
@@ -914,6 +924,17 @@ export class OpenClawRoomRuntime {
           scanCursor = event.seq;
           continue;
         }
+        // Contract P7c-7 (P6-2): the Room state's start fences delivery; the
+        // page's start only when the state's is unknown. A message of an
+        // earlier discussion is never handed to the model (Hermes: the receive
+        // fence, historical_epoch).
+        const stateStart = knownEpochStart((await this.client.roomState(this.state, signal))?.activeEpoch?.startsAtSeq);
+        if (stateStart && event.seq < stateStart) {
+          await this.supersedeHistoricalEvent(event, "");
+          await this.ackEvent(event);
+          scanCursor = event.seq;
+          continue;
+        }
         // Reception is independent of turn assignment: every addressed agent
         // acknowledges the source before potentially slow state/claim work.
         await this.markContextAcknowledged(event, signal);
@@ -946,6 +967,8 @@ export class OpenClawRoomRuntime {
         this.contextMissedOffered = [];
         this.contextKeptReply = "";
         this.contextKeptReplyCleared = false;
+        this.contextSourceIsCommand = false;
+        this.contextGuidanceCarriesNoStatus = false;
         const sharedContext = await this.sharedRoomContext(event, pageEpoch, signal, cycleAttempt || null);
         const normalized = normalizeEvent(
           event,
@@ -960,6 +983,7 @@ export class OpenClawRoomRuntime {
           this.contextCycleSource,
           this.contextMissedFacts,
           this.contextKeptReply,
+          {sourceIsCommand: this.contextSourceIsCommand, guidanceCarriesNoStatus: this.contextGuidanceCarriesNoStatus},
         );
         await this.clearMissedSources(this.contextMissedOffered, {mark: this.contextMissedMark, attemptReady: this.contextAttemptReady});
         if (this.contextKeptReplyCleared) await this.clearKeptReply();
@@ -1334,7 +1358,8 @@ export class OpenClawRoomRuntime {
       authorName: speakerLabel(state?.roster, sourceMessage),
       authorRole: String(sourceMessage.actorRole ?? ""),
     } : null;
-    const roomContext = canonicalRoomContext(state, page?.events, sourceMessage?.id ?? event?.id, policy, contextEpoch.startsAtSeq, startEvent);
+    const roomContext = canonicalRoomContext(state, page?.events, sourceMessage?.id ?? event?.id, policy, contextEpoch.startsAtSeq, startEvent,
+      this.state.membershipId);
     const answered = new Set([String(event?.id ?? ""), String(sourceMessage?.id ?? ""), String(eventPayload(event?.payload).sourceEventId ?? "")]);
     const attemptReady = event?.type === "discussion.cycle_attempt_ready";
     // Without a known start the durable missed sources and kept reply are
@@ -1355,6 +1380,12 @@ export class OpenClawRoomRuntime {
     const pageEvents = Array.isArray(page?.events) ? page.events : [];
     const cycleSource = await this.cycleDocumentSource(cycleAttempt, [sourceMessage, event, ...pageEvents].filter(Boolean),
       event, contextEpoch.startsAtSeq, signal);
+    // Contract P7c-1: the turn's source is known to be a human command.
+    this.contextSourceIsCommand = Boolean(cycleAttempt) && attemptReady
+      && turnSourceIsCommand(eventPayload(event?.payload), [...(Array.isArray(fetched?.events) ? fetched.events : []), cycleSource]);
+    // Contract P7c-4: the Room guidance rendered for this turn has the sentence.
+    const {preamble: guidancePreamble, lines: guidanceLines} = savedGuidance(state?.rules);
+    this.contextGuidanceCarriesNoStatus = guidanceCarriesNoStatusSentence([guidancePreamble, ...guidanceLines]);
     const library = await this.client.listArtifacts(this.state, signal);
     const artifactContext = await sourceArtifactContext(
       event,
@@ -1508,8 +1539,28 @@ export class OpenClawRoomRuntime {
     if (event.type !== "discussion.cycle_attempt_ready") return false;
     const claimed = await this.claimAssignedAttempt(String(payload.cycleId), signal);
     // Unclaimed or expired: the model never saw this attempt's source (P2a-3).
-    if (claimed === false) await this.noteMissedSource(String(payload.sourceEventId ?? ""));
+    if (claimed === false) {
+      await this.noteMissedSource(String(payload.sourceEventId ?? ""));
+      await this.noteHeldByModerator(signal);
+    }
     return claimed;
+  }
+
+  // Contract P7c-5: a claim refused while a human holds the Room records the
+  // coded reason held_by_moderator (wait 0); never the holder or any text. The
+  // Room state is read once for it; the reason is diagnostics only, so a
+  // failed read records nothing and changes nothing else.
+  async noteHeldByModerator(signal) {
+    let state = null;
+    try {
+      state = await this.client.roomState(this.state, signal);
+    } catch {
+      return;
+    }
+    const hold = state?.activeHold;
+    if (hold && typeof hold === "object" && !Array.isArray(hold)) {
+      this.reportStatus({gateWaitSeconds: 0, gateWaitReason: "held_by_moderator"});
+    }
   }
 
   // Contract P2a-3: a source whose turn never reached the model is offered
@@ -2784,6 +2835,10 @@ export class OpenClawRoomRuntime {
         if (lost) this.logger?.info?.("Room event stream resumed");
         return page;
       } catch (error) {
+        // Contract P7c-8: the read ended because the heartbeat saw the
+        // credential revoked or expired; whatever the ended read raised, that
+        // answer ends the channel and stays its status code.
+        if (this.heartbeatAbort.signal.aborted && this.heartbeatError) throw this.heartbeatError;
         if (signal?.aborted || this.closed || !transientRoomFailure(error)) throw error;
         if (!lost) this.logger?.warn?.(`Room connection lost${roomErrorDiagnostic(error)}; reconnecting`);
         lost = true;
@@ -3397,6 +3452,7 @@ export function normalizeEvent(
   cycleSource = null,
   missedFacts = [],
   keptReply = "",
+  {sourceIsCommand = false, guidanceCarriesNoStatus = false} = {},
 ) {
   const payload = eventPayload(event.payload);
   const actorRole = String(event.actorRole ?? "");
@@ -3418,8 +3474,10 @@ export function normalizeEvent(
     // Delivery/idempotency identity must remain the unique canonical event.
     // A ready event separately retains the earlier causal source for respondsTo.
     sourceEventId: event.id,
+    // Contract P7c-1: a turn whose source is a human command (an ask or
+    // summarize cycle) names no reply target.
     respondsToId: event.type === "discussion.cycle_attempt_ready"
-      ? String(payload.sourceEventId || event.id)
+      ? (sourceIsCommand ? "" : String(payload.sourceEventId || event.id))
       : event.id,
     roomId,
     epochId,
@@ -3429,7 +3487,8 @@ export function normalizeEvent(
     senderId: author.id,
     senderName: author.name,
     senderKind: author.role === "human" || author.role.startsWith("human_") ? "human" : "agent",
-    text: cyclePrompt(event, payload, cycleAttempt, sharedContext, policyWordLimit, discussionStart, currentItem, missedFacts, keptReply),
+    text: cyclePrompt(event, payload, cycleAttempt, sharedContext, policyWordLimit, discussionStart, currentItem, missedFacts, keptReply,
+      guidanceCarriesNoStatus),
     occurredAt: Date.parse(event.ts) || Date.now(),
     raw: event,
     cycleAttempt,
@@ -3448,9 +3507,38 @@ function roomSupplied(label, text) {
   return value ? `[${label}]\n${value}\n[/${label}]` : "";
 }
 
+// Contract P7c-3: a JSON number with a positive integer value (100.0 counts,
+// as in Hermes); a string, boolean, fraction, null or 0 is no bound.
 export function positiveWordLimit(value) {
-  const words = Number(value);
-  return Number.isSafeInteger(words) && words > 0 ? words : 0;
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : 0;
+}
+
+// Contract P7c-3: the word bound, stated as guidance; never enforced.
+export const WORD_BOUND_CYCLE_SOURCE = "Room policy maxContributionWords, as frozen for this discussion cycle";
+export const WORD_BOUND_POLICY_SOURCE = "Room policy maxContributionWords";
+export function wordBoundFact(words, source) {
+  return words ? `At most ${words} words per response (${source}); there is no minimum.` : "";
+}
+
+// Contract P7c-4 (ISSUE-031): the owner's sentence, verbatim, once per turn
+// frame unless the Room guidance already carries it (same in Hermes).
+export const ROOM_NO_SYSTEM_STATUS_INSTRUCTION = "Say nothing in a Room message about your tools, access, credentials, model or system status. If you cannot read a source, answer from what you have; do not claim to have read it and invent nothing about its content. You may say what your answer is based on.";
+// ASCII white space only, so both connectors count the same characters.
+const PARAGRAPH_BREAK = /[ \t\r\f\v]*\n[ \t\r\n\f\v]*/g;
+
+// Contract P7c-4: tolerant of surrounding white space and of paragraph breaks
+// only: a run of white space containing a line break counts as one space;
+// otherwise the sentence must occur character for character.
+export function guidanceCarriesNoStatusSentence(texts) {
+  return (Array.isArray(texts) ? texts : []).some((text) =>
+    String(text ?? "").replace(PARAGRAPH_BREAK, " ").includes(ROOM_NO_SYSTEM_STATUS_INSTRUCTION));
+}
+
+// Contract P7c-1: the turn's source is known to be a human command.
+export function turnSourceIsCommand(payload, known) {
+  const sourceId = String(payload?.sourceEventId ?? "").trim();
+  return Boolean(sourceId) && (Array.isArray(known) ? known : []).some((item) =>
+    item && typeof item === "object" && String(item.id ?? "") === sourceId && item.type === "human.command");
 }
 
 // Delivery contract P1a-3: procedural facts only, numbers rather than advice.
@@ -3473,7 +3561,7 @@ export function roomTurnFacts({phase = "", cycleAttempt = null, policyWordLimit 
   const words = cycleAttempt
     ? positiveWordLimit(cycleAttempt?.cycle?.budgets?.maxContributionWords)
     : positiveWordLimit(policyWordLimit);
-  if (words) lines.push(`Word limit per response: ${words} (${cycleAttempt ? "discussion cycle budget" : "Room policy"})`);
+  if (words) lines.push(wordBoundFact(words, cycleAttempt ? WORD_BOUND_CYCLE_SOURCE : WORD_BOUND_POLICY_SOURCE));
   // Contract P2a-3: missed sources as facts only.
   for (const line of Array.isArray(missed) ? missed : []) if (line) lines.push(line);
   lines.push(ROOM_PASS_ENVELOPE);
@@ -3608,7 +3696,8 @@ export function currentItemLine(message, label) {
   return `${number}${label}: ${body}`;
 }
 
-function cyclePrompt(event, payload, cycleAttempt, sharedContext = "", policyWordLimit = 0, discussionStart = null, currentItem = "", missed = [], kept = "") {
+function cyclePrompt(event, payload, cycleAttempt, sharedContext = "", policyWordLimit = 0, discussionStart = null, currentItem = "", missed = [], kept = "", guidanceCarriesNoStatus = false) {
+  const noStatus = guidanceCarriesNoStatus ? "" : ROOM_NO_SYSTEM_STATUS_INSTRUCTION;
   const context = String(sharedContext ?? "").trim();
   const preface = context ? [context, ROOM_HISTORY_INSTRUCTION] : [];
   if (event.type === "discussion.cycle_attempt_ready") {
@@ -3616,6 +3705,7 @@ function cyclePrompt(event, payload, cycleAttempt, sharedContext = "", policyWor
     return [
       ...preface,
       roomTurnFacts({phase, cycleAttempt, policyWordLimit, missed}),
+      noStatus,
       ...(discussionStart ? [discussionStartBlock(discussionStart)] : []),
       ...(currentItem ? [currentItem] : []),
       kept,
@@ -3627,18 +3717,20 @@ function cyclePrompt(event, payload, cycleAttempt, sharedContext = "", policyWor
     return [
       ...preface,
       roomTurnFacts({command: command || "unnamed", policyWordLimit, missed}),
+      noStatus,
       kept,
       roomSupplied(`Room command ${command || "unnamed"} — owner instruction`, commandInstruction(payload)),
     ].filter(Boolean).join("\n\n");
   }
   const text = currentItem || String(payload.body ?? payload.text ?? "").trim();
   if (!cycleAttempt) {
-    return [...preface, roomTurnFacts({policyWordLimit, missed}), text, kept].filter(Boolean).join("\n\n");
+    return [...preface, roomTurnFacts({policyWordLimit, missed}), noStatus, text, kept].filter(Boolean).join("\n\n");
   }
   const {phase, instruction} = cyclePhaseInstruction(cycleAttempt.attempt, cycleAttempt.cycle, payload);
   return [
     ...(context ? [context] : []),
     roomTurnFacts({phase, cycleAttempt, policyWordLimit, missed}),
+    noStatus,
     text,
     kept,
     roomSupplied("Room phase instruction — server-provided", instruction),
@@ -3875,7 +3967,15 @@ export function boundedGuidance(texts) {
   return lines;
 }
 
-export function canonicalRoomContext(state, events, currentEventId = "", policy = {}, startsAtSeq = 0, startEvent = null) {
+// Contract P7c-2: the speaker label, followed by " (you)" for the agent's own
+// entry (Hermes own_actor_label).
+export function ownActorLabel(state, event, ownMembershipId = "") {
+  const label = transcriptActorName(state, event);
+  const own = String(ownMembershipId ?? "").trim();
+  return own && String(event?.actorId ?? "").trim() === own ? `${label} (you)` : label;
+}
+
+export function canonicalRoomContext(state, events, currentEventId = "", policy = {}, startsAtSeq = 0, startEvent = null, ownMembershipId = "") {
   const policyView = policy?.policy && typeof policy.policy === "object" ? policy.policy : policy;
   const title = String(state?.title ?? "").trim();
   const purpose = String(state?.purpose ?? "").trim();
@@ -3890,16 +3990,30 @@ export function canonicalRoomContext(state, events, currentEventId = "", policy 
     ...(topicDrift ? [`Topic drift policy: ${topicDrift}.`] : []),
     ...(researchMode ? [`Research grounding policy: ${researchMode}${researchMaxSources > 0 ? `; maximum sources ${researchMaxSources}` : ""}${researchFreshness > 0 ? `; freshness window ${researchFreshness} seconds` : ""}.`] : []),
   ];
-  const transcript = (Array.isArray(events) ? events : [])
+  const messages = (Array.isArray(events) ? events : [])
     .filter((item) => item?.type === "message.posted"
       && (!startsAtSeq || (Number.isSafeInteger(item.seq) && item.seq >= startsAtSeq))
-      && String(item.id ?? "") !== String(currentEventId ?? ""))
+      && String(item.id ?? "") !== String(currentEventId ?? ""));
+  const byId = new Map(messages.filter((item) => item.id).map((item) => [String(item.id), item]));
+  const transcript = messages
     .map((item) => {
       const payload = eventPayload(item.payload);
       const body = String(payload.body ?? payload.text ?? "").trim();
-      const actor = transcriptActorName(state, item);
+      // Contract P7c-2: the agent's own entries are marked as its own, and the
+      // posts an entry replies to are named as in Hermes (context.py).
+      const actor = ownActorLabel(state, item, ownMembershipId);
+      const names = [];
+      for (const reference of Array.isArray(payload.respondsTo) ? payload.respondsTo : []) {
+        const referenceId = String(reference ?? "").trim();
+        const target = byId.get(referenceId);
+        const label = target
+          ? (ownActorLabel(state, target, ownMembershipId) !== transcriptActorName(state, target) ? "you" : transcriptActorName(state, target))
+          : `canonical event ${referenceId}`;
+        if (referenceId && !names.includes(label)) names.push(label);
+      }
+      const reply = names.length ? ` (reply to ${names.join(", ")})` : "";
       const number = Number.isSafeInteger(item.seq) && item.seq > 0 ? `#${item.seq} ` : "";
-      return body ? `${number}${actor}: ${body}` : "";
+      return body ? `${number}${actor}${reply}: ${body}` : "";
     })
     .filter(Boolean)
     .slice(-16);

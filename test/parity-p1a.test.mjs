@@ -8,7 +8,7 @@ import {readFile} from "node:fs/promises";
 import {registerHooks} from "node:module";
 import {
   OPEN_EXCHANGE_PREAMBLE_SHA256, OPEN_EXCHANGE_PREAMBLE_VERSION, OpenClawRoomRuntime, REPLY_MARKER_GUIDANCE,
-  CONTEXT_CHARACTER_LIMIT, ROOM_HISTORY_INSTRUCTION, ROOM_PASS_ENVELOPE, canonicalRoomContext, discussionHandoverContext, discussionStartInput, libraryCatalogContext,
+  CONTEXT_CHARACTER_LIMIT, ROOM_HISTORY_INSTRUCTION, ROOM_NO_SYSTEM_STATUS_INSTRUCTION, ROOM_PASS_ENVELOPE, canonicalRoomContext, discussionHandoverContext, discussionStartInput, libraryCatalogContext,
   normalizeEvent, scanCycleSourceMessage, sourceArtifactContext,
 } from "../src/runtime.js";
 import {registerRoomCommands} from "../src/commands.js";
@@ -174,7 +174,8 @@ test("P1a-03 without Room instructions only procedural facts are present", () =>
     /^\[\/?Room turn facts\]$/,
     /^Room command: \S+$/,
     /^Discussion phase: [a-z_]+(; round \d+(; turn \d+ of \d+; turns remaining after this one: \d+)?)?$/,
-    /^Word limit per response: \d+ \((discussion cycle budget|Room policy)\)$/,
+    /^At most \d+ words per response \(Room policy maxContributionWords(, as frozen for this discussion cycle)?\); there is no minimum\.$/,
+    new RegExp(`^${ROOM_NO_SYSTEM_STATUS_INSTRUCTION.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`),
     new RegExp(`^${ROOM_PASS_ENVELOPE.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`),
     new RegExp(`^${ROOM_HISTORY_INSTRUCTION.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`),
   ];
@@ -214,16 +215,16 @@ test("P1a-05 policy word limit stated as a number on every turn when set, in ope
   const ATTEMPT_KINDS = ["opening", "follow-up", "summary", "autonomous fallback"];
   for (const [kind, prompt] of Object.entries(promptKinds({words: 250}))) {
     // An assigned attempt states only its cycle budget; here it has none.
-    if (ATTEMPT_KINDS.includes(kind)) assert.doesNotMatch(prompt, /Word limit/, kind);
-    else assert.match(prompt, /Word limit per response: 250 \(Room policy\)/, kind);
+    if (ATTEMPT_KINDS.includes(kind)) assert.doesNotMatch(prompt, /words per response/, kind);
+    else assert.match(prompt, /At most 250 words per response \(Room policy maxContributionWords\); there is no minimum\./, kind);
   }
   // With an assigned attempt the cycle budget binds.
   for (const [kind, prompt] of Object.entries(promptKinds({words: 250, cycleWords: 120}))) {
     const attempt = ATTEMPT_KINDS.includes(kind);
-    assert.match(prompt, attempt ? /Word limit per response: 120 \(discussion cycle budget\)/ : /Word limit per response: 250 \(Room policy\)/, kind);
+    assert.match(prompt, attempt ? /At most 120 words per response \(Room policy maxContributionWords, as frozen for this discussion cycle\); there is no minimum\./ : /At most 250 words per response \(Room policy maxContributionWords\); there is no minimum\./, kind);
   }
   for (const words of [0, undefined, -5, 2.5]) {
-    for (const [kind, prompt] of Object.entries(promptKinds({words}))) assert.doesNotMatch(prompt, /Word limit/, `${kind} ${words}`);
+    for (const [kind, prompt] of Object.entries(promptKinds({words}))) assert.doesNotMatch(prompt, /words per response/, `${kind} ${words}`);
   }
 
   // End to end: the value is read from GET policy (open) or the claimed cycle budget (coordinated).
@@ -252,8 +253,8 @@ test("P1a-05 policy word limit stated as a number on every turn when set, in ope
     const turns = runtime.assignedTurns(controller.signal);
     const {value} = await turns.next();
     assert.match(value.text, mode === "open"
-      ? /Word limit per response: 250 \(Room policy\)/
-      : /Word limit per response: 120 \(discussion cycle budget\)/, mode);
+      ? /At most 250 words per response \(Room policy maxContributionWords\); there is no minimum\./
+      : /At most 120 words per response \(Room policy maxContributionWords, as frozen for this discussion cycle\); there is no minimum\./, mode);
     controller.abort();
     await turns.return();
   }
@@ -421,13 +422,13 @@ test("P1a-07 host fallback notice is never posted; the model reply is", async ()
 test("an assigned attempt states only its cycle word budget, never the policy value", () => {
   // The Room enforces the cycle budget for an attempt (cycles.go:394), not the policy.
   const opening = (cycleWords) => build(human("What is your view?"), cycle({round: 1, words: cycleWords}), context(), 250);
-  assert.match(opening(120), /\nWord limit per response: 120 \(discussion cycle budget\)\n/);
+  assert.match(opening(120), /\nAt most 120 words per response \(Room policy maxContributionWords, as frozen for this discussion cycle\); there is no minimum\.\n/);
   assert.doesNotMatch(opening(120), /250/);
-  for (const none of [undefined, 0]) assert.doesNotMatch(opening(none), /Word limit/, String(none));
+  for (const none of [undefined, 0]) assert.doesNotMatch(opening(none), /words per response/, String(none));
   const ready0 = build(ready(), {attempt: {id: "a", round: 1}, cycle: {id: "c", totalTurns: 0, budgets: {totalTurns: 4, maxContributionWords: 0}}}, context(), 250);
-  assert.doesNotMatch(ready0, /Word limit/);
+  assert.doesNotMatch(ready0, /words per response/);
   // Without an assigned attempt the Room policy value is stated.
-  assert.match(build(human("Direct question for you."), null, context(), 250), /Word limit per response: 250 \(Room policy\)/);
+  assert.match(build(human("Direct question for you."), null, context(), 250), /At most 250 words per response \(Room policy maxContributionWords\); there is no minimum\./);
 });
 
 test("speaker labels name the real actor and never say Room participant or system", async () => {
@@ -682,12 +683,24 @@ test("P1a-10 the agent reads the newest messages and the message it answers", as
 
   const entry = (item, name) => `#${item.seq} ${name}: ${item.payload.body}`;
   const names = {"owner-tj": "TJE", zurie: "Zurie", paula: "Paula"};
+  // Contract P7c-2: in the transcript the agent's own entries are marked.
+  const listed = {...names, zurie: "Zurie (you)"};
   for (const [source, page, newest] of [
     [owner, [start, ...earlier, owner], [earlier[15], earlier[14], earlier[13]]],
     [paula, [start, ...earlier, owner, zurie, paula], [zurie, owner, earlier[15]]],
   ]) {
     const {text} = await codingTurn(page, readyFor(source.seq + 1, source));
     const current = entry(source, names[source.actorId]);
+    // Contract P7c-2: a transcript entry names the posts it replies to.
+    const listedEntry = (item) => {
+      const replies = [];
+      for (const reference of item.payload.respondsTo ?? []) {
+        const target = page.find((other) => other.id === reference && other.type === "message.posted" && other !== source);
+        const label = !target ? `canonical event ${reference}` : target.actorId === "zurie" ? "you" : names[target.actorId];
+        if (!replies.includes(label)) replies.push(label);
+      }
+      return entry(item, `${listed[item.actorId]}${replies.length ? ` (reply to ${replies.join(", ")})` : ""}`);
+    };
     // The source message is the current item, verbatim, exactly once and
     // after the bounded context; it is not a transcript entry.
     assert.equal(text.split(current).length - 1, 1, text);
@@ -697,10 +710,10 @@ test("P1a-10 the agent reads the newest messages and the message it answers", as
     const context = text.slice(0, contextEnd + "[/Canonical Room context]".length);
     assert.ok(context.length <= CONTEXT_CHARACTER_LIMIT, `context ${context.length}`);
     // The newest transcript entries are present, whole; the oldest may be dropped.
-    for (const item of newest) assert.ok(context.includes(entry(item, names[item.actorId])), `#${item.seq} kept`);
+    for (const item of newest) assert.ok(context.includes(listedEntry(item)), `#${item.seq} kept`);
     const lines = context.split("\n");
     const transcript = lines.slice(lines.indexOf("Recent canonical transcript:") + 1, -1);
-    const expected = page.filter((item) => item.type === "message.posted" && item !== source).map((item) => entry(item, names[item.actorId]));
+    const expected = page.filter((item) => item.type === "message.posted" && item !== source).map(listedEntry);
     assert.ok(transcript.length >= 3);
     // Whole entries only, contiguous and ending with the newest.
     assert.deepEqual(transcript, expected.slice(-transcript.length));

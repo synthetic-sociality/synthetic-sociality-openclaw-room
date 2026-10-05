@@ -196,7 +196,9 @@ test("P3-01 every event read above the acknowledgement has a ledger entry before
   state.epochSessionRoutingInitialized = true;
   state.legacySessionEpochId = "epoch-1";
   const event = {id: "source-5", seq: 5, type: "message.posted", actorId: "human-1", actorRole: "human_owner", payload: {body: "Question", epochId: "epoch-1"}};
-  const runtime = runtimeFor(state, stateFile, {readEvents: async () => ({activeEpochId: "epoch-1", activeEpochStartsAtSeq: 1, events: [event]})});
+  const runtime = runtimeFor(state, stateFile, {readEvents: async () => ({activeEpochId: "epoch-1", activeEpochStartsAtSeq: 1, events: [event]}),
+    // The delivery fence reads the Room state's start (P7c-7).
+    roomState: async () => ({activeEpoch: {id: "epoch-1", startsAtSeq: 1}})});
   runtime.connectorSession = {sessionId: "s"};
   const order = [];
   runtime.persistState = async () => { order.push(["persist", structuredClone(runtime.state.receiveLedger ?? {})]); };

@@ -221,6 +221,8 @@ test(`renewed runtime scans past quarantine and never replays on restart (${lega
         return {activeEpochId: "epoch-1", activeEpochStartsAtSeq: 1, events: page};
       },
       acknowledge: async () => { throw new Error("must not acknowledge across isolated source 8"); },
+      // The delivery fence reads the Room state's start (P7c-7).
+      roomState: async () => ({activeEpoch: {id: "epoch-1", startsAtSeq: 1}}),
     };
     runtime.markContextAcknowledged = async (event) => { dispatched.push(event.id); };
     runtime.prepareCycleAttempt = async () => null;

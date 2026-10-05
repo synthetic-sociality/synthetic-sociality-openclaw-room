@@ -177,6 +177,11 @@ export class RoomClient {
     // The Room never redirects: the runtime refuses a redirect (a failed
     // contact below), so the credential never goes to another host.
     const init = {method, headers, body: body === undefined ? undefined : JSON.stringify(body), redirect: "error", signal};
+    // Contract P2c-3a, P7c item 8 (OP-12 r3 N1): a request the runtime refuses
+    // to form (a header value it does not accept, a GET with a body) is the
+    // connector's own error, raised here before any I/O and never a failed
+    // contact; the Request is built only to have the runtime check it.
+    new Request(`${this.baseUrl}${path}`, {...init, signal: undefined});
     let response;
     try {
       response = await this.fetch(`${this.baseUrl}${path}`, init);

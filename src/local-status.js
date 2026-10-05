@@ -15,7 +15,7 @@ const CONNECTION_STATES = new Set(["connecting", "connected", "reconnecting", "i
 // WEB_READ_TOOL_NAMES, the same list).
 export const WEB_READ_TOOL_NAMES = Object.freeze(["browser", "browser_navigate", "web_extract", "web_fetch", "web_search"]);
 // Contract P2c-4 (ISSUE-023): why a dispatch waited on the host.
-const GATE_WAIT_REASONS = new Set(["", "host_run_busy", "host_session_unobservable"]);
+export const GATE_WAIT_REASONS = new Set(["", "host_run_busy", "host_session_unobservable", "held_by_moderator"]);
 const CODE = /^[A-Za-z0-9_.:-]{1,64}$/;
 
 function now() {

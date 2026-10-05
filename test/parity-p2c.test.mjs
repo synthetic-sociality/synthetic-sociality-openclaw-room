@@ -485,7 +485,10 @@ test("P2c-03 after network loss and session expiry the connector reconnects with
   // accepted, and with it gone). The runtime registers again and resumes its
   // event reads without a restart.
   for (const variant of ["not_active", "session_gone"]) {
-    const room = {down: false, over: false, forgotten: new Set(), sessions: ["session-stored"], registrations: [], enrollments: [], delivered: false};
+    // order: the registrations and enrollment answers in sequence, so the wait
+    // below needs a registration after the outage and an "ok" after that one
+    // (P7c item 8: an "ok" from before the outage satisfied the old wait).
+    const room = {down: false, over: false, forgotten: new Set(), sessions: ["session-stored"], registrations: [], enrollments: [], delivered: false, order: []};
     const events = [message(2964, "paula", "participant_agent", "Before the outage.")];
     const runtime = roomRuntime(events);
     delete runtime.maintainPresence;
@@ -521,6 +524,7 @@ test("P2c-03 after network loss and session expiry the connector reconnects with
         const sessionId = `session-${room.sessions.length + 1}`;
         room.sessions.push(sessionId);
         room.registrations.push({...registration.metadata, afterOutage: room.over});
+        room.order.push(room.over ? "register after the outage" : "register");
         return {sessionId, capabilities: [], heartbeatIntervalSeconds: 0.05};
       },
       connectorEnrollments: async () => {
@@ -530,6 +534,7 @@ test("P2c-03 after network loss and session expiry the connector reconnects with
           throw new RoomAPIError(401, {code: "connector_not_active", retryable: true});
         }
         room.enrollments.push("ok");
+        room.order.push("ok");
         return [];
       },
     });
@@ -547,12 +552,16 @@ test("P2c-03 after network loss and session expiry the connector reconnects with
     }, 300);
     const deadline = Date.now() + 8_000;
     const {value} = await Promise.race([turns.next(), new Promise((_, reject) => setTimeout(() => reject(new Error("no turn after the outage")), 8_000))]);
-    while (!room.enrollments.includes("ok") && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 20));
+    const okAfterReregistration = () => {
+      const registered = room.order.indexOf("register after the outage");
+      return registered >= 0 && room.order.indexOf("ok", registered) > registered;
+    };
+    while (!okAfterReregistration() && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 20));
     controller.abort();
     await runtime.close?.();
     assert.equal(value.raw.id, "attemptready2965", variant);
     assert.ok(room.registrations.some((item) => item.afterOutage), `${variant}: registered again after the outage`);
-    assert.ok(room.enrollments.includes("ok"), `${variant}: the Room sees a live session again`);
+    assert.ok(okAfterReregistration(), `${variant}: the Room sees a live session again, after the new registration`);
     assert.equal(initializations, 0, `${variant}: no restart`);
     assert.ok(room.registrations.every((item) => item.hostLabel === HOST_LABEL));
     assert.ok(runtime.logs.some((line) => /Room connection lost/.test(line)), variant);
