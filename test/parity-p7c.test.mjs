@@ -597,11 +597,14 @@ test("the prompt start never falls back to the page start", async () => {
 test("the turn-source memory is kept per source", async () => {
   const older = Array.from({length: 70}, (_, index) => ({id: `m-${42 + index}`, seq: 42 + index, type: "message.posted",
     actorRole: "human_owner", actorId: "owner-tj", payload: {body: `Message ${42 + index}.`, epochId: "epoch-z"}}));
-  const events = [START, ...older, ready(120, "m-44")];
+  // Two turns of one connector: the first scans for m-43, the second for m-44.
+  const events = [START, ...older, ready(120, "m-43"), ready(121, "m-44")];
   const runtime = runtimeFor(events);
-  runtime.turnSourceEvents = new Map([["m-43", {floor: 41, event: older[1]}]]);
   const turns = await scan(runtime, events);
-  assert.ok(turns[0].text.includes("#44 TJE: Message 44."));
+  assert.deepEqual(turns.map((turn) => turn.raw.id), ["ready-120", "ready-121"]);
+  assert.ok(turns[0].text.includes("#43 TJE: Message 43."));
+  assert.ok(turns[1].text.includes("#44 TJE: Message 44."));
+  assert.ok(!turns[1].text.split("[/Canonical Room context]")[1].includes("Message 43."));
 });
 
 test("the topic is trimmed as guidance is", () => {
