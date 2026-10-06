@@ -275,6 +275,12 @@ export function createRoomChannel({makeClient}) {
           await markChannelActive(ctx.accountId);
           registered = true;
           client = makeClient(ctx.account, {logger: scrubbingLogger(ctx.log), waitForRenewal: true, status: localStatus});
+          // Contract P7d-5: the agent the host routes a Room conversation of
+          // this account to (the same route resolution as each turn below).
+          client.resolveRoomAgent = (conversationId, roomId) => runtime.routing.resolveAgentRoute({
+            cfg: ctx.cfg, channel: ID, accountId: ctx.accountId,
+            peer: {kind: "group", id: conversationId}, parentPeer: {kind: "group", id: roomId},
+          })?.agentId;
           const session = await client.initialize(ctx.abortSignal);
           live.set(ctx.accountId, {token: ownership.token, client, abortSignal: ctx.abortSignal});
           ctx.setStatus({...ctx.getStatus(), running: true, connected: true, lastConnectedAt: Date.now(), lastError: null});
@@ -443,11 +449,15 @@ export function createRoomChannel({makeClient}) {
               },
               });
               handlerCompleted = true;
-              // Contract P7d-5: the host run of this turn ended.
-              try {
-                await client.markDocumentsGiven?.(event.id);
-              } catch (error) {
-                ctx.log?.warn?.(`[${ctx.accountId}] Room document memory not written: ${String(error?.name || "Error")}`);
+              // Contract P7d-5: the host run of this turn ended. A run that
+              // ended in the host's operational fallback failed (it is settled
+              // as fail below) and marks nothing.
+              if (!operationalFallbackSuppressed) {
+                try {
+                  await client.markDocumentsGiven?.(event.id);
+                } catch (error) {
+                  ctx.log?.warn?.(`[${ctx.accountId}] Room document memory not written: ${String(error?.name || "Error")}`);
+                }
               }
             } finally {
               lastHostRunEndedAt = Date.now();

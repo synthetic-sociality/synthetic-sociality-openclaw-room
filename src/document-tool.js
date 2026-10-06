@@ -5,10 +5,10 @@
 // version and process (P7d-5) and cut locally. Same answers as Hermes
 // (room_tools.py room_document).
 import {RoomClient} from "./room-client.js";
-import {resolveHistorySession} from "./history.js";
+import {roomSessions, selectCallSession} from "./history.js";
 import {
   DOCUMENT_QUERY_CHARACTER_LIMIT, DOCUMENT_TOOL_NAME, DOCUMENT_TOOL_RESULT_LIMIT, DocumentReadError, discussionDocuments,
-  documentPassages, libraryEntries, noteHostSession, readVersion, refusal, resolveVersion, roomConversation, toolArguments,
+  documentPassages, libraryEntries, loggableId, noteHostSession, readVersion, refusal, resolveVersion, toolArguments,
 } from "./documents.js";
 
 export const ROOM_DOCUMENT_PARAMETERS = {
@@ -65,22 +65,15 @@ export async function readRoomDocument({client, session, args = {}, signal, logg
     code = "unavailable";
     return refusal("unavailable", `The Room is not reachable now: ${String(error?.name || "Error")}.`);
   } finally {
-    // Identifiers and a code only, never a name or text (P7d-7).
-    logger?.info?.(`Room ${session.roomId} document read: artifact=${argumentsValue.artifactId} version=${argumentsValue.versionId || "-"} code=${code}`);
+    // Identifiers in the Room's id form and a code only, never a name, text or
+    // anything else the caller typed (P7d-7).
+    logger?.info?.(`Room ${session.roomId} document read: artifact=${loggableId(argumentsValue.artifactId)} version=${argumentsValue.versionId ? loggableId(argumentsValue.versionId) : "-"} code=${code}`);
   }
-}
-
-// The Room of a call: the argument, else the Room of the turn's own session
-// (agent:<agent>:synthetic-sociality-room:group:<room>[:epoch:<hash>]).
-function requestedRoom(args, ctx) {
-  const named = typeof args?.room === "string" ? args.room.trim() : "";
-  if (named) return named;
-  return roomConversation(ctx?.sessionKey).split(":")[0] || "";
 }
 
 export function registerRoomDocumentTool(api, {
   makeClient = (session) => new RoomClient({baseUrl: session.baseUrl, credential: session.credential}),
-  resolve = resolveHistorySession,
+  sessions = (ctx) => roomSessions(api, ctx),
 } = {}) {
   if (typeof api?.registerTool !== "function") return false;
   api.registerTool((ctx) => {
@@ -93,9 +86,13 @@ export function registerRoomDocumentTool(api, {
       parameters: ROOM_DOCUMENT_PARAMETERS,
       execute: async (_toolCallId, params, signal) => {
         const args = params && typeof params === "object" ? params : {};
-        const resolved = await resolve(requestedRoom(args, ctx));
+        // Inside a Room turn the turn's own Room only: the host's session key
+        // (agent:<agent>:synthetic-sociality-room:group:<room>[:epoch:<hash>]).
+        const resolved = selectCallSession(await sessions(ctx), args.room, ctx, {logger: api.logger ?? null, tool: "document"});
         let result;
-        if (!resolved.session) {
+        if (resolved.refused) {
+          result = resolved.refused;
+        } else if (!resolved.session) {
           result = resolved.choices?.length
             ? {success: false, selectionRequired: true, rooms: resolved.choices}
             : {success: false, error: "No Synthetic Sociality Room is configured for this OpenClaw agent."};

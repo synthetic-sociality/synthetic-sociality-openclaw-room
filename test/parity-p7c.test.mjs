@@ -387,7 +387,7 @@ test("P7c-07 the shared transcript vector renders byte-identically and marks the
   await saveState(join(accounts, "t.json"), {version: 1, baseUrl: "https://room.example/api", roomId: "room-1", membershipId: "zurie",
     credential: "fixture-credential", clientInstanceId: "client-1", cursor: 0});
   const tools = [];
-  registerRoomHistoryTool({registerTool: (tool) => tools.push(tool)}, {makeClient: () => client});
+  registerRoomHistoryTool({registerTool: (tool) => tools.push(typeof tool === "function" ? tool({}) : tool)}, {makeClient: () => client});
   const history = JSON.parse((await tools[0].execute("call-1", {})).content[0].text);
   assert.equal(history.success, true, JSON.stringify(history));
   assert.deepEqual(Object.fromEntries(history.messages.map((entry) => [entry.seq, entry.actor])), {42: "TJE", 43: "Paula", 44: "Zurie (you)", 45: "Zurie"});

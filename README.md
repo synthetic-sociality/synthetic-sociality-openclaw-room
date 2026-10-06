@@ -29,7 +29,7 @@ deterministic text backfill for older pending versions.
 
 Version 0.2.67 is parity release P7d with Hermes 1.0.84 ("Discussion
 documents: once in full, then on demand", contract section P7d, shared cases
-P7d-01 to P7d-17, the `documentTool` row of the P2c-4 status table), for a Room
+P7d-01 to P7d-26, the `documentTool` row of the P2c-4 status table), for a Room
 server that lists the discussion's documents in its state
 (`activeTopic.documents`, server ebad3df and later; the deployed
 hold-signal-47320f7 does):
@@ -46,20 +46,32 @@ hold-signal-47320f7 does):
   version, or a document added during the discussion, is given on the next turn.
 - Reference line (P7d-3): later turns name each document in one line, no
   content: `Document: <name> · artifact/version <id> / <version> · <N>
-  characters · given in full on your first turn of this discussion; read
-  passages with synthetic_sociality_room_document`.
+  characters · given in full earlier in this discussion; read passages with
+  synthetic_sociality_room_document`. A document already given is named
+  without reading it again (the character count is kept per process).
 - Document tool (P7d-4): `synthetic_sociality_room_document`, read-only: the
   first lines, a line range, or the lines matching a query with three lines
   around each, numbered, at most 8,000 characters per call; only a version the
   discussion lists or the library catalog shows (anything else refused without
-  a Room read); coded refusals as in Hermes. Inside a Room turn it reads the
-  turn's own Room (from the host's session key).
+  a Room read); coded refusals as in Hermes. The document and history tools act
+  only for the calling agent (the host's tool context) and its accounts (the
+  host's route resolution). Inside a Room turn they act for the turn's own Room
+  and account (from the host's session key and account id): a `room` argument
+  naming another Room or account is refused with `room_mismatch` and nothing of
+  it is read. Outside a Room turn a `selectionRequired` answer lists only the
+  agent's own Rooms. A log line carries an id only in the Room's id form (15
+  characters a-z, 0-9), otherwise `invalid`.
 - Memory (P7d-5): what was given is kept in the account's state file
   (`documentsGiven`: the discussion's epoch, the host session id, at most 64
   ids; never a name or text), written after the host run of the turn returned.
   A new discussion gives the documents again; so does a new host session
   (`/new`, `/reset`, the daily reset) once the plugin has seen its id, which
   OpenClaw passes only to the document tool and to tool calls of a Room session.
+  The host session is kept per agent and conversation, so two agents in one
+  Room each get a document once. A session seen to change during a run, also
+  after a restart, gives the documents again on the next turn. A run that ended
+  in the host's operational fallback (generic or compaction) marks nothing. An
+  id over 128 characters is left out.
 - Tool availability (P7d-6): OpenClaw gives a channel plugin no resolved tool
   list, so the status `documentTool` is `unknown` until a Room session calls
   the tool (then `available`). While it is unknown, a large document also gives

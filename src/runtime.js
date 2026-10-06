@@ -9,7 +9,7 @@ import {renewCredential} from "./credential-renewal.js";
 import {speakerLabel, speakerName} from "./speaker.js";
 import {rememberSecrets} from "./secret-isolation.js";
 import {
-  discussionDocumentContext, discussionDocuments, documentToolState, effectiveGiven, givenMemory, observedHostSession, readVersion,
+  discussionDocumentContext, discussionDocuments, documentToolState, effectiveGiven, givenMemory, knownSize, observedHostSession, readVersion, validGivenMemory,
 } from "./documents.js";
 import {readRotationRequest, removeRotationRequest} from "./epoch-rotation.js";
 import {
@@ -1421,8 +1421,11 @@ export class OpenClawRoomRuntime {
   async discussionDocumentContext(event, listed, epochId, signal) {
     const conversationId = epochId === exactOptionalEpochId(this.state.legacySessionEpochId, "Room legacy session epoch")
       ? String(this.state.roomId) : epochConversationId(String(this.state.roomId), epochId);
-    const hostSession = observedHostSession(conversationId);
+    const agentId = this.roomAgentId(conversationId);
+    const hostSession = observedHostSession(conversationId, agentId);
     const given = effectiveGiven(this.state.documentsGiven, epochId, hostSession);
+    const memory = this.state.documentsGiven;
+    const recordedSession = memory && String(memory.epochId ?? "") === String(epochId ?? "") ? String(memory.hostSession ?? "") : "";
     const tool = documentToolState();
     let catalog = "";
     try {
@@ -1436,13 +1439,24 @@ export class OpenClawRoomRuntime {
     const scope = [String(this.client.baseUrl ?? ""), String(this.state.roomId)];
     const {context, offered, counts} = await discussionDocumentContext(listed,
       (artifactId, versionId) => readVersion(scope, (wanted) => this.client.getArtifact(this.state, wanted, signal), artifactId, versionId, {signal}),
-      {given, tool, catalog});
+      {given, tool, catalog, sizes: (artifactId, versionId) => knownSize(scope, artifactId, versionId)});
     this.documentsOffered ??= new Map();
-    this.documentsOffered.set(String(event?.id ?? ""), {epochId, conversationId, hostSession, given, offered});
+    this.documentsOffered.set(String(event?.id ?? ""), {epochId, conversationId, agentId, hostSession, recordedSession, given, offered});
     while (this.documentsOffered.size > 64) this.documentsOffered.delete(this.documentsOffered.keys().next().value);
     // Counts and codes only (P7d-7).
     this.logger?.info?.(`Room ${this.state.roomId} documents for ${String(event?.id ?? "")}: full=${counts.full} head=${counts.head} reference=${counts.reference} status=${counts.status} left_out=${counts.leftOut} tool=${tool}`);
     return context;
+  }
+
+  // The agent the host routes this account's Room conversation to (P7d-5).
+  // The channel sets resolveRoomAgent from the host's route resolution.
+  roomAgentId(conversationId) {
+    try {
+      const agentId = this.resolveRoomAgent?.(String(conversationId ?? ""), String(this.state?.roomId ?? ""));
+      return typeof agentId === "string" && agentId ? agentId.toLowerCase() : "main";
+    } catch {
+      return "main";
+    }
   }
 
   // Contract P7d-5: after the host run of the turn, remember what it was given.
@@ -1451,12 +1465,18 @@ export class OpenClawRoomRuntime {
     if (!record) return;
     this.documentsOffered.delete(String(eventId ?? ""));
     const built = record.hostSession;
-    const ran = observedHostSession(record.conversationId) || built;
-    // The host replaced the session while the turn started: the earlier
-    // documents are not in it.
-    const base = built && ran && built !== ran ? [] : record.given;
+    const recorded = record.recordedSession;
+    const ran = observedHostSession(record.conversationId, record.agentId) || built;
+    // The run's session differs from the one the turn was built for or from
+    // the one the memory records (the host replaced the session, also unseen
+    // across a restart): the earlier documents are not in it.
+    const changed = (built && ran && built !== ran) || (recorded && ran && recorded !== ran);
+    const base = changed ? [] : record.given;
     const memory = givenMemory(record.epochId, base, record.offered, ran);
     if (JSON.stringify(memory) === JSON.stringify(this.state.documentsGiven ?? null)) return;
+    // Validated before it reaches the state: an invalid memory would make every
+    // later persist of this account fail.
+    if (!validGivenMemory(memory)) throw new Error("Room document memory is invalid");
     this.state.documentsGiven = memory;
     await this.persistState();
   }

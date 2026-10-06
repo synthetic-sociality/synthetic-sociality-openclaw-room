@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import {HISTORY_PAGE_MAX, ROOM_HISTORY_TOOL_NAME, readRoomHistory, registerRoomHistoryTool, resolveHistorySession, resetHistoryScanCache} from "../src/history.js";
+import {HISTORY_PAGE_MAX, ROOM_HISTORY_TOOL_NAME, readRoomHistory, registerRoomHistoryTool, resetHistoryScanCache, roomSessions} from "../src/history.js";
 
 function timeline(epochs, hiddenIds = []) {
   const events = [];
@@ -117,7 +117,7 @@ test("protocol failures are reported, not thrown, and nothing is executed", asyn
 
 test("the tool registers through the plugin API and resolves the configured Room account", async () => {
   const registered = [];
-  const api = {registerTool: (tool) => registered.push(tool)};
+  const api = {registerTool: (tool) => registered.push(typeof tool === "function" ? tool({}) : tool)};
   const accounts = () => [{accountId: "default", stateFile: "/state/default.json"}, {accountId: "other", stateFile: "/state/other.json"}];
   const load = async (path) => path.endsWith("default.json")
     ? {roomId: "room-1", credential: "secret", baseUrl: "https://room.example/api"}
@@ -125,7 +125,7 @@ test("the tool registers through the plugin API and resolves the configured Room
   const client = fakeClient(EVENTS);
   assert.equal(registerRoomHistoryTool(api, {
     makeClient: () => client,
-    resolve: (room) => resolveHistorySession(room, {accounts, load}),
+    sessions: (ctx) => roomSessions(api, ctx, {accounts, load}),
   }), true);
   assert.equal(registered.length, 1);
   const tool = registered[0];

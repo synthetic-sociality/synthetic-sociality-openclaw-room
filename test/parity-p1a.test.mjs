@@ -130,7 +130,7 @@ test("P1a-01 no connector-authored behavioural wording in any prompt", async () 
   assert.equal(history.success, true, JSON.stringify(history));
   fixed["history result"] = JSON.stringify({...history, messages: history.messages.map(({body, ...rest}) => rest)});
   const tools = [];
-  registerRoomHistoryTool({registerTool: (tool) => tools.push(tool)});
+  registerRoomHistoryTool({registerTool: (tool) => tools.push(typeof tool === "function" ? tool({}) : tool)});
   const commands = [];
   // Stubbed: registration must not heal, join, activate or restart anything.
   registerRoomCommands({registerCommand: (item) => commands.push(item), on: () => {}, logger: {}}, {

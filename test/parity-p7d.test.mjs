@@ -7,7 +7,7 @@ import assert from "node:assert/strict";
 import test, {after, beforeEach} from "node:test";
 import {createHash} from "node:crypto";
 import {execFile} from "node:child_process";
-import {mkdtemp, readFile, rm} from "node:fs/promises";
+import {cp, mkdir, mkdtemp, readFile, readdir, rm, symlink} from "node:fs/promises";
 import {readFileSync} from "node:fs";
 import {createRequire, registerHooks} from "node:module";
 import {tmpdir} from "node:os";
@@ -34,7 +34,8 @@ after(() => rm(home, {recursive: true, force: true}));
 const {OpenClawRoomRuntime, epochConversationId} = await import("../src/runtime.js");
 // Imported, not required: on a connector without P7d each case fails on its own.
 const documents = await import("../src/documents.js").catch(() => ({}));
-const {readRoomDocument, registerRoomDocumentTool, ROOM_DOCUMENT_PARAMETERS} = await import("../src/document-tool.js").catch(() => ({}));
+const {readRoomDocument, registerRoomDocumentTool, ROOM_DOCUMENT_DESCRIPTION, ROOM_DOCUMENT_PARAMETERS} = await import("../src/document-tool.js").catch(() => ({}));
+const historyModule = await import("../src/history.js");
 const channelModule = await import("../src/channel.js");
 const statusModule = await import("../src/local-status.js");
 const {loadState, saveNewState, validateState} = await import("../src/state.js");
@@ -123,7 +124,7 @@ const claimed = (sourceEventId = "m-42") => ({attempt: {id: "attempt-1", round: 
   cycle: {id: "cycle-1", generation: 1, totalTurns: 1, sourceEventId, budgets: {totalTurns: 16, perAgentTurns: 8}}});
 
 // The turn the runtime hands to OpenClaw for the last of `events`, and the runtime.
-async function turnFor(room, events, {memory, claim = claimed()} = {}) {
+async function turnFor(room, events, {memory, claim = claimed(), agentId} = {}) {
   const runtime = new OpenClawRoomRuntime({accountId: "t", stateFile: join(home, `${Math.random()}.json`), baseUrl: room.baseUrl});
   const last = events.at(-1);
   runtime.state = {version: 1, baseUrl: room.baseUrl, roomId: "room-1", membershipId: "zurie", credential: "fixture-credential",
@@ -151,6 +152,8 @@ async function turnFor(room, events, {memory, claim = claimed()} = {}) {
   runtime.maintainPresence = async () => {};
   runtime.markContextAcknowledged = async () => {};
   runtime.startAttemptLease = () => null;
+  // The agent the host routes the conversation to (the channel sets this).
+  if (agentId) runtime.resolveRoomAgent = () => agentId;
   const controller = new AbortController();
   const turns = runtime.assignedTurns(controller.signal);
   const {value, done} = await turns.next();
@@ -166,15 +169,16 @@ const documentBlock = (text) => {
 };
 const reference = (name, artifactId, versionId, size, {given, tool = true}) => {
   const line = `Document: ${name} · artifact/version ${artifactId} / ${versionId} · ${size} characters`;
-  const clauses = [...(given ? ["given in full on your first turn of this discussion"] : []), ...(tool ? [`read passages with ${TOOL}`] : [])];
+  const clauses = [...(given ? ["given in full earlier in this discussion"] : []), ...(tool ? [`read passages with ${TOOL}`] : [])];
   return clauses.length ? `${line} · ${clauses.join("; ")}` : line;
 };
 const sessionKeyFor = (epochId) => `agent:main:${ID}:group:${epochConversationId("room-1", epochId)}`;
 
 // One agent's turns in one discussion, with the memory written after each run.
 class Discussion {
-  constructor(room) {
+  constructor(room, {agentId} = {}) {
     this.room = room;
+    this.agentId = agentId;
     this.memory = undefined;
     this.seq = 49;
   }
@@ -183,7 +187,7 @@ class Discussion {
     this.seq += 1;
     const epochId = this.room.epochId;
     const ready = event ?? readyFor(this.seq, epochId);
-    const {turn, runtime} = await turnFor(this.room, [start(epochId), humanSource(epochId), ready], {memory: this.memory, claim});
+    const {turn, runtime} = await turnFor(this.room, [start(epochId), humanSource(epochId), ready], {memory: this.memory, claim, agentId: this.agentId});
     if (beforeMark) beforeMark();
     if (mark) {
       await runtime.markDocumentsGiven(turn.id);
@@ -203,7 +207,7 @@ beforeEach(() => {
 
 test("conformance P7d case names resolve to tests in this suite; constants pinned", async () => {
   const cases = Object.entries(conformance.parityP7dCases ?? {});
-  assert.equal(cases.length, 17);
+  assert.equal(cases.length, 26);
   const source = await readFile(new URL(import.meta.url), "utf8");
   for (const [key, name] of cases) {
     assert.ok(name.startsWith(`${key} `), name);
@@ -215,6 +219,8 @@ test("conformance P7d case names resolve to tests in this suite; constants pinne
     queryCharacterLimit: documents.DOCUMENT_QUERY_CHARACTER_LIMIT, contextLines: documents.DOCUMENT_CONTEXT_LINES,
     givenLimit: documents.DOCUMENTS_GIVEN_LIMIT, cacheVersions: documents.DOCUMENT_CACHE_VERSIONS,
     cacheCharacters: documents.DOCUMENT_CACHE_CHARACTERS, libraryLimit: documents.DOCUMENT_LIBRARY_LIMIT,
+    sizeVersions: documents.DOCUMENT_SIZE_VERSIONS, idForm: documents.ROOM_ID_FORM?.source, givenClause: documents.GIVEN_CLAUSE,
+    roomMismatchError: documents.ROOM_MISMATCH_ERROR, toolDescription: ROOM_DOCUMENT_DESCRIPTION,
   });
 });
 
@@ -605,8 +611,9 @@ test("P7d-14 no document name, text or id in the status file and no name or text
   const logged = [...logs, ...toolLines].join("\n");
   for (const fragment of [secretName, "Confidential", "stage II", LARGE_TEXT.slice(0, 40)]) assert.ok(!logged.includes(fragment), fragment);
   assert.ok(logged.includes("documents for ready-50: full=1 head=0 reference=1 status=0 left_out=0 tool=available"), logged);
-  assert.ok(logged.includes("document read: artifact=doc version=- code=ok"));
-  assert.ok(logged.includes("document read: artifact=nowhere version=- code=not_in_discussion"));
+  // Ids not in the Room's id form are logged as "invalid" (P7d-7, P7d-19).
+  assert.ok(logged.includes("document read: artifact=invalid version=- code=ok"));
+  assert.ok(logged.includes("document read: artifact=invalid version=- code=not_in_discussion"));
   assert.deepEqual(Object.keys(discussion.memory).sort(), ["epochId", "given", "hostSession"]);
   assert.ok(!JSON.stringify(discussion.memory).includes(secretName));
   const path = join(await mkdtemp(join(home, "status-")), "status.json");
@@ -692,23 +699,23 @@ test("P7d-16 only a version the discussion lists or the library catalog shows is
   assert.deepEqual([cut.returnedLines, cut.truncated, cut.nextFromLine], [[2, 2], true, null]);
   const both = await call({artifactId: "shared"});
   assert.deepEqual([both.text, both.truncated, both.nextFromLine], ["1: Shared text.", true, 2]);
-  // Inside a Room turn the tool reads the turn's own Room.
-  const asked = [];
+  // Inside a Room turn the tool reads the turn's own Room; another Room named
+  // by the argument is refused (review B1: this test pinned the override).
+  const used = [];
   const registered = [];
   registerRoomDocumentTool({registerTool: (factory, options) => registered.push([factory, options]), logger: null}, {
-    makeClient: () => room.client(),
-    resolve: async (requested) => { asked.push(requested); return {session: {roomId: "room-1", credential: "c", baseUrl: room.baseUrl}}; },
+    makeClient: (session) => { used.push(session.roomId); return room.client(); },
+    sessions: async () => [{accountId: "t", roomId: "room-1", credential: "c", baseUrl: room.baseUrl, agentId: "main"},
+      {accountId: "u", roomId: "room-9", credential: "c9", baseUrl: room.baseUrl, agentId: "main"}],
   });
   const [factory, options] = registered[0];
   assert.deepEqual(options, {name: TOOL});
   const tool = factory({sessionKey: sessionKeyFor("epoch-z"), sessionId: "session-7"});
-  await tool.execute("call-1", {artifactId: "shared"});
-  await tool.execute("call-2", {artifactId: "shared", room: "room-9"});
-  assert.deepEqual(asked, ["room-1", "room-9"]);
-  const several = [];
-  registerRoomDocumentTool({registerTool: (made) => several.push(made)}, {resolve: async () => ({choices: [{roomId: "a"}, {roomId: "b"}]})});
-  const answer = await several[0]({}).execute("call-3", {artifactId: "shared"});
-  assert.deepEqual(answer.details, {success: false, selectionRequired: true, rooms: [{roomId: "a"}, {roomId: "b"}]});
+  assert.equal((await tool.execute("call-1", {artifactId: "shared"})).details.success, true);
+  assert.equal((await tool.execute("call-2", {artifactId: "shared", room: "room-9"})).details.code, "room_mismatch");
+  assert.deepEqual(used, ["room-1"]);
+  const answer = await factory({}).execute("call-3", {artifactId: "shared"});
+  assert.deepEqual(answer.details, {success: false, selectionRequired: true, rooms: [{accountId: "t", roomId: "room-1"}, {accountId: "u", roomId: "room-9"}]});
 });
 
 function installedHost() {
@@ -744,4 +751,364 @@ test("P7d-17 the document tool is registered with the host and declared in the m
   assert.deepEqual(result.tools.flat().sort(), [TOOL, "synthetic_sociality_room_history"].sort(), JSON.stringify(result));
   assert.deepEqual(result.diagnostics.filter((item) => /contracts\.tools/.test(item.message)), [], JSON.stringify(result));
   assert.equal(result.plugin.failed, false);
+});
+
+// Rooms of one gateway: agent zurie with two accounts in Room A and one in Room
+// B, agent aura with one account in Room C. Every request names the credential
+// it carries.
+function gatewayFixture() {
+  const rooms = {rooma0000000001: {title: "Alpha", doc: "doca"}, roomb0000000002: {title: "Beta", doc: "docb"}, roomc0000000003: {title: "Gamma", doc: "docc"}};
+  const accountsList = [["zurie-a", "rooma0000000001", "cred-za", "zurie"], ["zurie-a2", "rooma0000000001", "cred-za2", "zurie"],
+    ["zurie-b", "roomb0000000002", "cred-zb", "zurie"], ["aura-c", "roomc0000000003", "cred-ac", "aura"]];
+  const requests = [];
+  const made = [];
+  const api = {logger: {info: () => {}}, registerTool: (factory, options) => made.push([factory, options]),
+    // The host's own route resolution decides an account's agent.
+    runtime: {channel: {routing: {resolveAgentRoute: ({accountId}) => ({agentId: accountsList.find((item) => item[0] === accountId)[3]})}}}};
+  const accounts = () => accountsList.map(([accountId]) => ({accountId, stateFile: `/state/${accountId}.json`}));
+  const load = async (file) => {
+    const [accountId, roomId, credential] = accountsList.find((item) => file.endsWith(`/${item[0]}.json`));
+    return {roomId, credential, baseUrl: "https://room.example/api", membershipId: accountId};
+  };
+  const makeClient = (session) => {
+    const spec = rooms[session.roomId];
+    const log = (method) => requests.push([session.credential, method]);
+    return {baseUrl: "https://room.example/api",
+      roomState: async () => { log("state"); return {headSeq: 3, title: spec.title, activeEpoch: {id: "e1", startsAtSeq: 1}, activeTopic: {id: "t", documents: [entry(spec.doc)]}}; },
+      listArtifacts: async () => { log("artifacts"); return {items: []}; },
+      getArtifact: async (_session, id) => { log(`artifact ${id}`); return record(id, {v1: ["ready", `Text of ${spec.title}.`]}); },
+      readEvents: async () => { log("events"); return {events: [], hasMore: false, headSeq: 3}; },
+      listEpochs: async () => { log("epochs"); return {epochs: []}; },
+    };
+  };
+  const sessions = (ctx) => historyModule.roomSessions(api, ctx, {accounts, load});
+  registerRoomDocumentTool(api, {makeClient, sessions});
+  historyModule.registerRoomHistoryTool(api, {makeClient, sessions});
+  const call = async (ctx, name, args) => {
+    const tools = Object.fromEntries(made.map(([factory]) => { const tool = factory(ctx); return [tool.name, tool]; }));
+    return (await tools[name].execute("call", args)).details;
+  };
+  const credentials = () => [...new Set(requests.map(([credential]) => credential))];
+  return {requests, call, credentials};
+}
+
+test("P7d-18 inside a Room turn the document, history and Room-context tools act only for the turn's own Room and account; another Room named by id, title or account id is refused room_mismatch and nothing of it is read; outside a Room turn only the calling agent's own Rooms are offered", async () => {
+  const {requests, call, credentials} = gatewayFixture();
+  const HISTORY = "synthetic_sociality_room_history";
+  // OpenClaw registers no Room-context tool; the history and document tools.
+  const zurieInA = {agentId: "zurie", agentAccountId: "zurie-a", sessionKey: `agent:zurie:${ID}:group:rooma0000000001:epoch:x`, sessionId: "s1"};
+  for (const name of [TOOL, HISTORY]) {
+    for (const other of ["roomb0000000002", "Beta", "beta", "zurie-b", "zurie-a2", "aura-c", "roomc0000000003"]) {
+      assert.deepEqual(await call(zurieInA, name, {artifactId: "docb", room: other}),
+        {success: false, code: "room_mismatch", error: documents.ROOM_MISMATCH_ERROR}, `${name} ${other}`);
+    }
+  }
+  assert.deepEqual(requests, [], "no request leaves for a refused call");
+  for (const own of [undefined, "rooma0000000001", "zurie-a"]) {
+    const answer = await call(zurieInA, TOOL, own ? {artifactId: "doca", room: own} : {artifactId: "doca"});
+    assert.equal(answer.text, "1: Text of Alpha.", JSON.stringify(answer));
+  }
+  assert.equal((await call(zurieInA, HISTORY, {})).selectionRequired, undefined);
+  assert.equal((await call(zurieInA, TOOL, {artifactId: "docb"})).code, "not_in_discussion");
+  assert.deepEqual(credentials(), ["cred-za"]);
+  // Two accounts of the agent in one Room: the turn's account, no selection.
+  requests.length = 0;
+  documents.TEXT_CACHE.clear();
+  const secondAccount = {...zurieInA, agentAccountId: "zurie-a2"};
+  assert.equal((await call(secondAccount, TOOL, {artifactId: "doca"})).success, true);
+  assert.equal((await call(secondAccount, HISTORY, {})).selectionRequired, undefined);
+  assert.deepEqual(credentials(), ["cred-za2"]);
+  // Outside a Room turn: only the calling agent's own Rooms.
+  requests.length = 0;
+  const zurieMain = {agentId: "zurie", sessionKey: "agent:zurie:main", sessionId: "m1"};
+  const own = [{accountId: "zurie-a", roomId: "rooma0000000001"}, {accountId: "zurie-a2", roomId: "rooma0000000001"}, {accountId: "zurie-b", roomId: "roomb0000000002"}];
+  assert.deepEqual(await call(zurieMain, TOOL, {artifactId: "docb"}), {success: false, selectionRequired: true, rooms: own});
+  assert.deepEqual((await call(zurieMain, HISTORY, {})).rooms, own);
+  for (const foreign of ["aura-c", "roomc0000000003"]) {
+    assert.deepEqual((await call(zurieMain, TOOL, {artifactId: "docc", room: foreign})).rooms, own);
+    assert.deepEqual((await call(zurieMain, HISTORY, {room: foreign})).rooms, own);
+  }
+  assert.deepEqual(requests, []);
+  assert.equal((await call(zurieMain, TOOL, {artifactId: "docb", room: "roomb0000000002"})).text, "1: Text of Beta.");
+  assert.deepEqual(credentials(), ["cred-zb"]);
+  // A second agent of the gateway sees its own Room only, and the first
+  // agent's accounts are invisible to it.
+  requests.length = 0;
+  const auraMain = {agentId: "aura", sessionKey: "agent:aura:main"};
+  assert.equal((await call(auraMain, TOOL, {artifactId: "docc"})).text, "1: Text of Gamma.");
+  assert.deepEqual((await call(auraMain, TOOL, {artifactId: "doca", room: "zurie-a"})).rooms, [{accountId: "aura-c", roomId: "roomc0000000003"}]);
+  const auraInC = {agentId: "aura", sessionKey: `agent:aura:${ID}:group:roomc0000000003`};
+  assert.equal((await call(auraInC, HISTORY, {room: "rooma0000000001"})).code, "room_mismatch");
+  assert.deepEqual(credentials(), ["cred-ac"]);
+});
+
+test("P7d-19 a log line carries a caller-supplied id only in the Room's id form; a document name, a sentence or a line break is logged as invalid", async () => {
+  const room = new Room({doca: record("doca", {v1: ["ready", "Alpha text."]})}, [], {documentsList: [entry("doca")]});
+  const lines = [];
+  const logger = {info: (line) => lines.push(line)};
+  const session = {roomId: "rooma0000000001", credential: "c", baseUrl: room.baseUrl};
+  // A document name, a sentence, a string with a line break, a carriage return.
+  const typed = ["Befund-Zeisig-Kardiologie.md", "Unique finding: violet heron syndrome stage IX.", "x\nRoom r1 FORGED LOG LINE code=ok", "doca\r"];
+  const sessions = [{accountId: "t", roomId: "rooma0000000001", agentId: "main"}];
+  for (const value of typed) {
+    await readRoomDocument({client: room.client(), session, args: {artifactId: value}, logger});
+    await readRoomDocument({client: room.client(), session, args: {artifactId: "doca", versionId: value}, logger});
+    historyModule.selectCallSession(sessions, value, {sessionKey: `agent:main:${ID}:group:rooma0000000001`}, {logger, tool: "document"});
+    historyModule.selectCallSession(sessions, value, {sessionKey: `agent:main:${ID}:group:rooma0000000001`}, {logger, tool: "history"});
+  }
+  await readRoomDocument({client: room.client(), session, args: {artifactId: "abcde12345fghij", versionId: "v0000000000000a"}, logger});
+  for (const line of lines) {
+    assert.ok(!/[\n\r]/.test(line), line);
+    for (const value of typed) assert.ok(!line.includes(value.trim()), line);
+    for (const fragment of ["Befund", "violet", "FORGED"]) assert.ok(!line.includes(fragment), line);
+  }
+  for (const expected of ["Room rooma0000000001 document read: artifact=invalid version=- code=not_in_discussion",
+    "Room rooma0000000001 document read: artifact=invalid version=invalid code=not_in_discussion",
+    "Room rooma0000000001 document refused: code=room_mismatch", "Room rooma0000000001 history refused: code=room_mismatch",
+    "Room rooma0000000001 document read: artifact=abcde12345fghij version=v0000000000000a code=not_in_discussion"]) {
+    assert.ok(lines.includes(expected), `${expected}\n${lines.join("\n")}`);
+  }
+  assert.equal(documents.loggableId("abcde12345fghij"), "abcde12345fghij");
+  for (const value of ["abcde12345fghij\n", "ABCDE12345FGHIJ", "abcde12345fghi", "abcde12345fghijk", "abcde-2345fghij", 15, null]) {
+    assert.equal(documents.loggableId(value), "invalid", String(value));
+  }
+});
+
+// The relative modules a shipped file imports, statically or dynamically.
+const relativeImports = (text) => [...text.matchAll(/(?:\bfrom\s*|\bimport\s*\(?\s*)["'](\.{1,2}\/[^"']+)["']/g)].map((match) => match[1]);
+
+test("P7d-20 the release archive installs every runtime file it ships, byte-equal, and the installed plugin loads", async (t) => {
+  // What ships is package.json "files", packed by npm (tools/build-release.mjs
+  // packs a git archive of the release commit the same way).
+  const pkg = JSON.parse(await readFile(join(root, "package.json"), "utf8"));
+  assert.deepEqual(pkg.files, ["bin", "docs", "src", "README.md", "conformance.json", "openclaw.plugin.json"]);
+  const hostRoot = installedHost();
+  if (!hostRoot) return t.skip("the pinned OpenClaw host is not installed");
+  const npm = join(dirname(process.execPath), "npm");
+  const scratch = await mkdtemp(join(home, "pack-"));
+  const source = join(scratch, "source");
+  await cp(root, source, {recursive: true, filter: (path) => !/\/(node_modules|\.git)(\/|$)/.test(path.slice(root.length))});
+  const out = join(scratch, "out");
+  await mkdir(out);
+  const run = promisify(execFile);
+  const env = {...process.env, HOME: scratch, npm_config_cache: join(scratch, "npm-cache"), npm_config_offline: "true",
+    npm_config_update_notifier: "false", npm_config_audit: "false", npm_config_fund: "false"};
+  const {stdout} = await run(npm, ["pack", "--json", "--pack-destination", out], {cwd: source, env, timeout: 120_000, maxBuffer: 8 << 20});
+  const [packed] = JSON.parse(stdout);
+  const extracted = join(scratch, "extracted");
+  await mkdir(extracted);
+  await run("tar", ["-xzf", join(out, packed.filename), "-C", extracted]);
+  const plugin = join(extracted, "package");
+  const shipped = new Set(packed.files.map((item) => item.path));
+  // The new source files of this release are in the archive, byte-equal.
+  for (const name of ["src/documents.js", "src/document-tool.js", "src/history.js", "openclaw.plugin.json"]) {
+    assert.ok(shipped.has(name), name);
+    assert.deepEqual(await readFile(join(plugin, name)), await readFile(join(root, name)), name);
+  }
+  // Every module the entry imports, directly or through others, is shipped.
+  const pending = ["src/index.js"];
+  const seen = new Set();
+  while (pending.length) {
+    const name = pending.pop();
+    if (seen.has(name)) continue;
+    seen.add(name);
+    assert.ok(shipped.has(name), `${name} is imported but not shipped`);
+    for (const target of relativeImports(await readFile(join(plugin, name), "utf8"))) {
+      pending.push(join(dirname(name), target).replaceAll("\\", "/"));
+    }
+  }
+  assert.ok(seen.has("src/documents.js") && seen.has("src/document-tool.js"));
+  // Loaded by the host's own loader from the BUILT archive, the host as its peer.
+  await mkdir(join(plugin, "node_modules"));
+  await symlink(hostRoot, join(plugin, "node_modules", "openclaw"));
+  const loaded = await run(process.execPath, [join(root, "test/support/host-plugin-register.mjs"), hostRoot, plugin], {
+    env: {...process.env, HOME: await mkdtemp(join(scratch, "host-")), JITI_FS_CACHE: "false"}, timeout: 120_000, maxBuffer: 1 << 20,
+  });
+  const result = JSON.parse(loaded.stdout.trim().split("\n").at(-1));
+  assert.equal(result.error, undefined, JSON.stringify(result));
+  assert.deepEqual(result.plugin.toolNames, [TOOL, "synthetic_sociality_room_history"].sort(), JSON.stringify(result));
+  assert.equal(result.plugin.failed, false);
+});
+
+test("P7d-21 a version already given, or a large one while the tool is available, is named by its reference line without a Room read", async () => {
+  documents.noteDocumentToolAvailable();
+  // Review N4: more listed documents than the text cache holds.
+  const names = Array.from({length: 12}, (_, index) => `doc${String(index).padStart(2, "0")}`);
+  const room = new Room(Object.fromEntries(names.map((name) => [name, record(name, {v1: ["ready", `${name} text. `.repeat(300)]})])), [],
+    {documentsList: names.map((name) => entry(name))});
+  const discussion = new Discussion(room);
+  assert.equal((await discussion.turn()).split("\nContent:\n").length - 1, 12);
+  assert.deepEqual([...room.reads].sort(), names);
+  for (let turn = 0; turn < 3; turn += 1) {
+    assert.equal(documentBlock(await discussion.turn()).split(" · given in full earlier in this discussion").length - 1, 12);
+  }
+  assert.equal(room.reads.length, 12, "a given version is named without a Room read");
+  // A process that holds no count (a restart) reads each version once.
+  documents.TEXT_SIZES.clear();
+  documents.TEXT_CACHE.clear();
+  await discussion.turn();
+  await discussion.turn();
+  assert.equal(room.reads.length, 24);
+  // A large document while the tool is available: read once, then by count.
+  const large = new Room({long: record("long", {v1: ["ready", LARGE_TEXT]})}, [], {documentsList: [entry("long")]});
+  documents.TEXT_CACHE.clear();
+  const discussionLarge = new Discussion(large);
+  for (let turn = 0; turn < 3; turn += 1) {
+    assert.ok((await discussionLarge.turn()).includes(reference("long.md", "long", "v1", codePointLength(LARGE_TEXT), {given: false})));
+  }
+  assert.deepEqual(large.reads, ["long"]);
+  const sizes = new documents.DocumentSizes({versions: 3});
+  for (let index = 0; index < 5; index += 1) sizes.put(`k${index}`, index);
+  assert.deepEqual(Array.from({length: 5}, (_, index) => sizes.get(`k${index}`)), [null, null, 2, 3, 4]);
+});
+
+test("P7d-22 bounds: the memory keeps the newest 64 keys, a human_only library entry is refused, the text cache is per Room, a result may fill the bound exactly, no head without 24,000 characters left", async () => {
+  const keys = Array.from({length: 70}, (_, index) => `a${index}/v1`);
+  assert.deepEqual(documents.givenMemory("epoch-z", keys.slice(0, 60), keys.slice(60), "s").given, keys.slice(6));
+  const room = new Room({private: record("private", {v1: ["ready", "Owner only."]}), open: record("open", {v1: ["ready", "Open text."]})},
+    [{artifactId: "private", visibility: "human_only", currentVersion: {versionId: "v1", name: "private.md"}},
+      {artifactId: "open", visibility: "restricted", currentVersion: {versionId: "v1", name: "open.md"}}], {documentsList: []});
+  const call = toolCaller(room);
+  assert.equal((await call({artifactId: "private"})).code, "not_in_discussion");
+  assert.deepEqual(room.reads, []);
+  assert.equal((await call({artifactId: "open"})).success, true);
+  const fetched = [];
+  for (const roomId of ["rooma0000000001", "roomb0000000002"]) {
+    const version = await documents.readVersion(["https://room.example/api", roomId],
+      async (wanted) => { fetched.push(roomId); return record(wanted, {v1: ["ready", `Text of ${roomId}.`]}); }, "same", "v1");
+    assert.deepEqual(version, {status: "ready", text: `Text of ${roomId}.`});
+  }
+  assert.deepEqual(fetched, ["rooma0000000001", "roomb0000000002"]);
+  const line = "x".repeat(documents.DOCUMENT_TOOL_RESULT_LIMIT - "1: ".length);
+  const exact = documents.documentPassages("exact.md", "exact", "v1", `${line}\nsecond`, {fromLine: 1, toLine: 1});
+  assert.deepEqual([codePointLength(exact.text), exact.truncated, exact.text.at(-1)], [documents.DOCUMENT_TOOL_RESULT_LIMIT, false, "x"]);
+  const over = documents.documentPassages("over.md", "over", "v1", `${line}x`, {});
+  assert.deepEqual([codePointLength(over.text), over.truncated, over.text.at(-1)], [documents.DOCUMENT_TOOL_RESULT_LIMIT, true, "…"]);
+  const texts = {one: "a".repeat(20_001), two: "b".repeat(20_001), big: "c".repeat(30_000)};
+  const read = async (artifactId) => ({status: "ready", text: texts[artifactId]});
+  const listed = documents.discussionDocuments({activeTopic: {documents: Object.keys(texts).map((key) => entry(key))}});
+  let rendered = await documents.discussionDocumentContext(listed, read, {given: [], tool: "unknown"});
+  assert.deepEqual([rendered.offered, rendered.counts.full, rendered.counts.head], [["one/v1", "two/v1"], 2, 0]);
+  assert.ok(!rendered.context.includes("c".repeat(100)));
+  assert.ok(rendered.context.includes(reference("big.md", "big", "v1", 30_000, {given: false})));
+  texts.two = "b".repeat(16_000);
+  rendered = await documents.discussionDocumentContext(listed, read, {given: [], tool: "unknown"});
+  assert.deepEqual([rendered.offered, rendered.counts.head], [["one/v1", "two/v1", "big/v1"], 1]);
+  // OpenClaw review deferred 1: heads are charged to the budget.
+  const heads = {a: "a".repeat(30_000), b: "b".repeat(30_000), c: "c".repeat(30_000)};
+  const many = documents.discussionDocuments({activeTopic: {documents: Object.keys(heads).map((key) => entry(key))}});
+  rendered = await documents.discussionDocumentContext(many, async (artifactId) => ({status: "ready", text: heads[artifactId]}), {given: [], tool: "unknown"});
+  assert.deepEqual([rendered.offered, rendered.counts.head], [["a/v1", "b/v1"], 2]);
+});
+
+test("P7d-23 two agents in one Room each get a document in full once", async () => {
+  // OpenClaw review B2: one gateway, one Room, two agents, the host session
+  // of each seen during its run (a tool call of a Room session).
+  const room = new Room({brief: record("brief", {v1: ["ready", PROOF_TEXT]})}, [], {documentsList: [entry("brief")]});
+  const conversation = epochConversationId("room-1", "epoch-z");
+  const agents = {zurie: new Discussion(room, {agentId: "zurie"}), aura: new Discussion(room, {agentId: "aura"})};
+  const texts = {zurie: [], aura: []};
+  for (let turn = 0; turn < 8; turn += 1) {
+    for (const [agent, discussion] of Object.entries(agents)) {
+      texts[agent].push(await discussion.turn({beforeMark: () => documents.noteHostSession(`agent:${agent}:${ID}:group:${conversation}`, `session-${agent}`)}));
+    }
+  }
+  for (const [agent, turns] of Object.entries(texts)) {
+    assert.equal(turns.reduce((count, text) => count + text.split(PROOF_TEXT.trim()).length - 1, 0), 1, agent);
+    assert.ok(turns[0].includes(PROOF_TEXT.trim()), agent);
+    assert.equal(agents[agent].memory.hostSession, `session-${agent}`);
+  }
+  assert.equal(documents.observedHostSession(conversation, "zurie"), "session-zurie");
+  assert.equal(documents.observedHostSession(conversation, "aura"), "session-aura");
+});
+
+test("P7d-24 a host session that changed unseen after a restart gives the documents in full again on the next turn", async () => {
+  // OpenClaw review B3: the memory records S1; after a restart the turn is
+  // built without a known session and the run reveals S2.
+  const room = new Room({brief: record("brief", {v1: ["ready", PROOF_TEXT]})}, [], {documentsList: [entry("brief")]});
+  const key = sessionKeyFor("epoch-z");
+  const discussion = new Discussion(room);
+  assert.ok((await discussion.turn({beforeMark: () => documents.noteHostSession(key, "S1")})).includes(PROOF_TEXT.trim()));
+  assert.equal(discussion.memory.hostSession, "S1");
+  documents.resetDocumentRuntimeMemory();
+  // The turn built before the change was seen: references (P7d-5).
+  assert.ok(!(await discussion.turn({beforeMark: () => documents.noteHostSession(key, "S2")})).includes(PROOF_TEXT.slice(0, 200)));
+  assert.deepEqual(discussion.memory, {epochId: "epoch-z", hostSession: "S2", given: []});
+  assert.ok((await discussion.turn()).includes(PROOF_TEXT.trim()));
+  assert.ok(!(await discussion.turn()).includes(PROOF_TEXT.slice(0, 200)));
+  assert.deepEqual(discussion.memory.given, ["brief/v1"]);
+});
+
+test("P7d-25 a run that ended in the host's operational fallback marks nothing given", async () => {
+  // OpenClaw review B4: the channel settles such an attempt as fail.
+  const GENERIC = "⚠️ Something went wrong while processing your request. Please try again, or use /new to start a fresh session.";
+  const COMPACTION = "⚠️ Auto-compaction could not recover this turn. I kept this conversation mapped to the current session. Please try again, use /compact, or use /new to start a fresh session.\n\nTo prevent this, increase your compaction buffer by setting `agents.defaults.compaction.reserveTokensFloor` to 20000 or higher in your config.";
+  for (const [label, payload, expected, settledAs] of [
+    ["generic fallback", {text: GENERIC, isError: true}, [], "fail"],
+    ["compaction fallback", {text: COMPACTION, isError: true}, [], "fail"],
+    ["model reply", {text: "A contribution of the model."}, ["event-1"], null],
+  ]) {
+    const marked = [];
+    const settled = [];
+    const event = {id: "event-1", sourceEventId: "event-1", respondsToId: "event-1", roomId: "room-1", epochId: "epoch-z",
+      conversationId: "room-1:epoch:x", senderId: "owner-tj", senderName: "TJE", senderKind: "human", text: "question", occurredAt: 1, raw: {},
+      cycleAttempt: {cycle: {id: "cycle-1", generation: 1}, attempt: {id: "attempt-1", membershipId: "zurie"}}};
+    const client = {
+      initialize: async () => ({sessionId: "session-1"}),
+      assignedTurns: async function* () { yield event; },
+      markTurnReading: async () => {},
+      markDocumentsGiven: async (eventId) => { marked.push(eventId); },
+      postAndFinish: async () => ({eventId: "posted", sentAt: 1}),
+      settleDiscussionAttempt: async (_attempt, action) => { settled.push(action); },
+      recordSkipped: async () => {},
+      ack: async () => {},
+      close: async () => {},
+    };
+    const channel = channelModule.createRoomChannel({makeClient: () => client});
+    let status = {running: false, connected: false};
+    const ctx = {account: {accountId: "default", stateFile: join(home, `channel-p7d25-${marked.length}-${label.length}.json`)}, accountId: "default",
+      abortSignal: new AbortController().signal, cfg: ISOLATED_HOST_CONFIG, getStatus: () => status, setStatus: (next) => { status = next; },
+      log: {info: () => {}, warn: () => {}, error: () => {}},
+      channelRuntime: {
+        // The host delivers its payload and returns normally.
+        inbound: {run: async ({raw, adapter}) => {
+          const turn = adapter.resolveTurn(adapter.ingest(raw));
+          try { await turn.delivery.deliver(payload); } catch {}
+        }},
+        routing: {resolveAgentRoute: () => ({agentId: "main", accountId: "default", sessionKey: "s", mainSessionKey: "m"})},
+        session: {resolveStorePath: () => "/tmp/session-store", recordInboundSession: async () => {}},
+        reply: {dispatchReplyWithBufferedBlockDispatcher: async () => {}},
+      }};
+    await channel.plugin.gateway.startAccount(ctx).catch(() => {});
+    assert.deepEqual(marked, expected, label);
+    if (settledAs) assert.deepEqual(settled, [settledAs], label);
+  }
+});
+
+test("P7d-26 an id over 128 characters never reaches the state, and a failed library listing does not fail the turn", async () => {
+  documents.noteDocumentToolAvailable();
+  const longId = "a".repeat(129);
+  const room = new Room({brief: record("brief", {v1: ["ready", "Brief text."]}), [longId]: record(longId, {v1: ["ready", "Long id text."]})}, [],
+    {documentsList: [entry(longId), entry("brief", "v".repeat(129)), entry("brief")]});
+  assert.deepEqual(documents.discussionDocuments(room.state()).map((item) => `${item.artifactId}/${item.versionId}`), ["brief/v1"]);
+  const discussion = new Discussion(room);
+  assert.ok(!(await discussion.turn()).includes("Long id text."));
+  assert.deepEqual(room.reads, ["brief"]);
+  assert.deepEqual(discussion.memory.given, ["brief/v1"]);
+  // A memory that could not be loaded again is never written (review N3).
+  const runtime = discussion.runtime;
+  const before = structuredClone(runtime.state.documentsGiven);
+  const persisted = runtime.persisted.length;
+  runtime.documentsOffered.set("ready-x", {epochId: "epoch-z", conversationId: "c", agentId: "main", hostSession: "", recordedSession: "",
+    given: [], offered: [`${"a".repeat(300)}/v1`]});
+  await assert.rejects(runtime.markDocumentsGiven("ready-x"), /invalid/);
+  assert.deepEqual(runtime.state.documentsGiven, before);
+  assert.equal(runtime.persisted.length, persisted);
+  validateState(runtime.state);
+  // Review N5: the library listing failing leaves the documents in place.
+  const failing = new Room({brief: record("brief", {v1: ["ready", "Brief text."]})}, [], {documentsList: [entry("brief")]});
+  failing.listArtifacts = async () => { throw new RoomTransportError("library down"); };
+  const withoutLibrary = new Discussion(failing);
+  assert.ok(documentBlock(await withoutLibrary.turn()).includes("Content:\nBrief text."));
+  assert.ok(withoutLibrary.runtime.logs.some((line) => /document library unavailable: RoomTransportError/.test(line)), withoutLibrary.runtime.logs.join("\n"));
 });
