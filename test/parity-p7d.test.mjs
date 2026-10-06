@@ -404,6 +404,14 @@ test("P7d-07 the memory of what was given is in the state file and survives a re
     {epochId: "epoch-z", hostSession: "", given: [], names: ["brief.md"]}, {epochId: "", hostSession: "", given: []}, ["brief/v1"]]) {
     assert.throws(() => validateState({...state, documentsGiven: invalid}), /document memory is invalid/, JSON.stringify(invalid));
   }
+  // Written after the run through the runtime's own persist and read back.
+  const merged = join(directory, "accounts", "merged.json");
+  await saveNewState(merged, {...state, documentsGiven: undefined});
+  const persisting = new OpenClawRoomRuntime({accountId: "m", stateFile: merged, baseUrl: room.baseUrl});
+  persisting.state = await loadState(merged);
+  persisting.documentsOffered = new Map([["ready-9", {epochId: "epoch-z", conversationId: "c", hostSession: "", given: [], offered: ["brief/v1"]}]]);
+  await persisting.markDocumentsGiven("ready-9");
+  assert.deepEqual((await loadState(merged)).documentsGiven, {epochId: "epoch-z", hostSession: "", given: ["brief/v1"]});
   documents.TEXT_CACHE.clear(); // a new process has no texts
   discussion.memory = structuredClone(loaded.documentsGiven);
   const afterRestart = await discussion.turn();
@@ -659,10 +667,10 @@ test("P7d-16 only a version the discussion lists or the library catalog shows is
     denied: apiError(403),
     empty: record("empty", {v1: ["ready", null]}),
     other: record("other", {v1: ["ready", "Another discussion's text."]}),
-  }, [...Array.from({length: 33}, (_, index) => ({artifactId: `lib-${index}`, visibility: "room_shared",
-    currentVersion: {versionId: "v1", name: `lib-${index}.pdf`}})),
-  {artifactId: "shared", visibility: "room_shared", currentVersion: {versionId: "v1", name: "shared.md", mediaType: "text/markdown",
-    sha256: "e".repeat(64), extractionStatus: "ready"}}],
+  }, [{artifactId: "shared", visibility: "room_shared", currentVersion: {versionId: "v1", name: "shared.md", mediaType: "text/markdown",
+    sha256: "e".repeat(64), extractionStatus: "ready"}},
+  ...Array.from({length: 32}, (_, index) => ({artifactId: `lib-${index}`, visibility: "room_shared",
+    currentVersion: {versionId: "v1", name: `lib-${index}.pdf`}}))],
   {documentsList: [entry("shared"), entry("hidden", "v1", {classification: "human_only"}), entry("meta", "v1", {classification: "metadata_only"}),
     entry("denied"), entry("empty")]});
   const text = await new Discussion(room).turn();
@@ -674,9 +682,9 @@ test("P7d-16 only a version the discussion lists or the library catalog shows is
   assert.ok(text.includes("lib-0.pdf · artifact/version lib-0 / v1"));
   room.reads.length = 0;
   const call = toolCaller(room);
-  for (const artifactId of ["other", "hidden", "meta", "lib-32"]) assert.equal((await call({artifactId})).code, "not_in_discussion", artifactId);
+  for (const artifactId of ["other", "hidden", "meta", "lib-31"]) assert.equal((await call({artifactId})).code, "not_in_discussion", artifactId);
   assert.deepEqual(room.reads, []);
-  assert.equal((await call({artifactId: "lib-31"})).code, "not_found");
+  assert.equal((await call({artifactId: "lib-30"})).code, "not_found");
   // The bound: a line that does not fit alone is cut and ends in "…".
   const cut = await call({artifactId: "shared", fromLine: 2});
   assert.equal(codePointLength(cut.text), documents.DOCUMENT_TOOL_RESULT_LIMIT);
