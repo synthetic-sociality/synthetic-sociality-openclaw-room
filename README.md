@@ -27,6 +27,60 @@ labels it as untrusted uploaded content, and never downloads or executes raw
 document bytes. An exact artifact read also invokes the Room server's supported
 deterministic text backfill for older pending versions.
 
+Version 0.2.67 is parity release P7d with Hermes 1.0.84 ("Discussion
+documents: once in full, then on demand", contract section P7d, shared cases
+P7d-01 to P7d-17, the `documentTool` row of the P2c-4 status table), for a Room
+server that lists the discussion's documents in its state
+(`activeTopic.documents`, server ebad3df and later; the deployed
+hold-signal-47320f7 does):
+
+- Which documents (P7d-1): every turn, including the closing summary, uses the
+  documents the Room lists for the discussion (the attachments of human
+  messages, newest first); `human_only` and `metadata_only` documents and
+  versions this membership may not read are left out. Without the list the
+  0.2.63 rule (P5) applies unchanged.
+- Once in full (P7d-2): a document of at most 24,000 characters is given in
+  full once, on the agent's first turn of the discussion; all full texts of one
+  turn share 64,000 characters, newest first, and one that does not fit waits
+  for a later turn, never cut. A larger document goes by reference. A new
+  version, or a document added during the discussion, is given on the next turn.
+- Reference line (P7d-3): later turns name each document in one line, no
+  content: `Document: <name> · artifact/version <id> / <version> · <N>
+  characters · given in full on your first turn of this discussion; read
+  passages with synthetic_sociality_room_document`.
+- Document tool (P7d-4): `synthetic_sociality_room_document`, read-only: the
+  first lines, a line range, or the lines matching a query with three lines
+  around each, numbered, at most 8,000 characters per call; only a version the
+  discussion lists or the library catalog shows (anything else refused without
+  a Room read); coded refusals as in Hermes. Inside a Room turn it reads the
+  turn's own Room (from the host's session key).
+- Memory (P7d-5): what was given is kept in the account's state file
+  (`documentsGiven`: the discussion's epoch, the host session id, at most 64
+  ids; never a name or text), written after the host run of the turn returned.
+  A new discussion gives the documents again; so does a new host session
+  (`/new`, `/reset`, the daily reset) once the plugin has seen its id, which
+  OpenClaw passes only to the document tool and to tool calls of a Room session.
+- Tool availability (P7d-6): OpenClaw gives a channel plugin no resolved tool
+  list, so the status `documentTool` is `unknown` until a Room session calls
+  the tool (then `available`). While it is unknown, a large document also gives
+  its first 24,000 characters once, marked as cut.
+- Manifest: `openclaw.plugin.json` gains `"contracts": {"tools":
+  ["synthetic_sociality_room_history", "synthetic_sociality_room_document"]}`.
+  OpenClaw 2026.7.1-2 rejects every agent tool a plugin did not declare there
+  (as a diagnostic only), so the history tool was not offered to OpenClaw
+  agents before this version; a test now registers the plugin through the
+  installed host's own loader with this manifest and finds both tools.
+- P7c follow-ups (tests only): the hang bound of the refused-credential scan is
+  20 s; the refused port is closed right before each connect; the header check
+  is shared case P7c-24; a stronger marker for the discussion-start turn. After
+  a stop with `request_not_formed` (0.2.66, below) the Room comes back only
+  after the account's state is corrected and the gateway restarted: the host
+  restarts a stopped channel at most ten times, each stops again, then it gives
+  up.
+
+No state migration: 0.2.67 loads a 0.2.66 state file; the new key starts empty,
+so each agent gets the discussion's documents in full once more after the update.
+
 Version 0.2.66 is parity release P7c with Hermes 1.0.83 ("Moderated debate and
 own voice", contract section P7c, shared cases P7c-01 to P7c-22, one sentence
 each in P2c-3a and the P2c-4 status table), for the Room server
@@ -67,7 +121,8 @@ hold-signal-47320f7 (moderated interruption, moderator steering, hold signal):
   parse or whose scheme is not http or https, a port fetch blocks) is the
   plugin's own error `request_not_formed` with a fixed message that never
   quotes the credential or the URL, and the channel
-  stops (status `stopped`) instead of retrying for ever; after a revocation or expiry
+  stops (status `stopped`) instead of retrying for ever (it comes back only after
+  the state is corrected and the gateway restarted); after a revocation or expiry
   seen on the heartbeat the status keeps that code even when the ended event
   read raises a network error.
 

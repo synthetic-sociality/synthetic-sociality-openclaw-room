@@ -6,6 +6,8 @@ import {loadState, openClawStateDirectory} from "./state.js";
 import {registerRoomCommands} from "./commands.js";
 import {markChannelActive, markChannelInactive, registerPresenceFallback} from "./presence-fallback.js";
 import {registerRoomHistoryTool} from "./history.js";
+import {registerRoomDocumentTool} from "./document-tool.js";
+import {DOCUMENT_TOOL_NAME, noteDocumentToolAvailable, noteHostSession} from "./documents.js";
 import {claimRuntimeOwnership} from "./account.js";
 import {resolveRoomAccount as resolveAccount, resolvedRoomAccounts} from "./account-discovery.js";
 import {looksLikeRoomId, normalizeRoomTarget, resolveConfiguredRoomTarget} from "./target.js";
@@ -136,6 +138,15 @@ export function roomToolCallPolicy(api, {noteWebRead = false} = {}) {
       // (the host's session key is agent:<agent>:<channel>:<kind>:<peer>).
       if (noteWebRead && String(ctx?.sessionKey ?? "").split(":")[2] === ID && WEB_READ_TOOL_NAMES.includes(event?.toolName)) {
         try { roomLocalStatus(api?.logger, cfg).noteWebReadTool(event.toolName); } catch {}
+      }
+      if (noteWebRead && String(ctx?.sessionKey ?? "").split(":")[2] === ID) {
+        // Contract P7d-5, P7d-6: the host session of a Room turn, and the
+        // document tool once a Room session calls it.
+        noteHostSession(ctx?.sessionKey, ctx?.sessionId);
+        if (event?.toolName === DOCUMENT_TOOL_NAME) {
+          noteDocumentToolAvailable();
+          try { roomLocalStatus(api?.logger, cfg).setDocumentTool("available"); } catch {}
+        }
       }
       const stateDir = openClawStateDirectory();
       // Relative paths resolve where the tool runs: the hook context's
@@ -432,6 +443,12 @@ export function createRoomChannel({makeClient}) {
               },
               });
               handlerCompleted = true;
+              // Contract P7d-5: the host run of this turn ended.
+              try {
+                await client.markDocumentsGiven?.(event.id);
+              } catch (error) {
+                ctx.log?.warn?.(`[${ctx.accountId}] Room document memory not written: ${String(error?.name || "Error")}`);
+              }
             } finally {
               lastHostRunEndedAt = Date.now();
               ctx.log?.info?.(`[${ctx.accountId}] Room ${event.roomId} seq ${hostSeq} host run ended after ${((Date.now() - hostStartedAt) / 1000).toFixed(1)}s`);
@@ -506,6 +523,7 @@ export function createRoomChannel({makeClient}) {
       registerRoomCommands(api);
       registerPresenceFallback(api, {makeClient});
       registerRoomHistoryTool(api);
+      registerRoomDocumentTool(api);
     },
   });
 }

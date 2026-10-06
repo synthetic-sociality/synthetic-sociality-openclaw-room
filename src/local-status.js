@@ -47,6 +47,7 @@ export class LocalStatus {
       secretIsolationEnforced: false,
       webRead: "unknown",
       webReadTools: [],
+      documentTool: "unknown",
       rooms: {},
     };
     // Contract P2c-3a: when the current outage of a Room began (process
@@ -66,6 +67,15 @@ export class LocalStatus {
     if (!WEB_READ_TOOL_NAMES.includes(name) || this.data.webReadTools.includes(name)) return;
     this.data.webRead = "available";
     this.data.webReadTools = [...this.data.webReadTools, name].sort();
+    this.write();
+  }
+
+  // Contract P7d-6: OpenClaw cannot see the Room-turn tool selection; the
+  // value stays "unknown" until a Room session calls the document tool.
+  setDocumentTool(value) {
+    const next = value === "available" ? "available" : "unknown";
+    if (this.data.documentTool === next) return;
+    this.data.documentTool = next;
     this.write();
   }
 

@@ -8,6 +8,9 @@ import {ROOM_CONNECTOR_PROVENANCE} from "./release-provenance.js";
 import {renewCredential} from "./credential-renewal.js";
 import {speakerLabel, speakerName} from "./speaker.js";
 import {rememberSecrets} from "./secret-isolation.js";
+import {
+  discussionDocumentContext, discussionDocuments, documentToolState, effectiveGiven, givenMemory, observedHostSession, readVersion,
+} from "./documents.js";
 import {readRotationRequest, removeRotationRequest} from "./epoch-rotation.js";
 import {
   CLOSURE_EVIDENCE_PREFIX, RecoveryRefused, closuresFor, journalPath, ledgerReport, priorState,
@@ -1389,18 +1392,73 @@ export class OpenClawRoomRuntime {
     // Contract P7c-4: the Room guidance rendered for this turn has the sentence.
     const {preamble: guidancePreamble, lines: guidanceLines} = savedGuidance(state?.rules);
     this.contextGuidanceCarriesNoStatus = guidanceCarriesNoStatusSentence([guidancePreamble, ...guidanceLines]);
-    const library = await this.client.listArtifacts(this.state, signal);
-    const artifactContext = await sourceArtifactContext(
-      event,
-      sourceMessage ? [...pageEvents, sourceMessage] : page?.events,
-      (artifactId) => this.client.getArtifact(this.state, artifactId, signal),
-      library?.items,
-      cycleSource,
-    );
+    // Contract P7d-1: the documents the Room state lists for the discussion;
+    // without that list the P5 rule applies unchanged.
+    const listed = discussionDocuments(state);
+    let artifactContext;
+    if (listed === null) {
+      const library = await this.client.listArtifacts(this.state, signal);
+      artifactContext = await sourceArtifactContext(
+        event,
+        sourceMessage ? [...pageEvents, sourceMessage] : page?.events,
+        (artifactId) => this.client.getArtifact(this.state, artifactId, signal),
+        library?.items,
+        cycleSource,
+      );
+    } else {
+      artifactContext = await this.discussionDocumentContext(event, listed, sourceEpoch.id, signal);
+    }
     const combined = [roomContext, handoverContext, artifactContext].filter(Boolean).join("\n\n");
     // Bounded size telemetry for the pilot: character counts only, never content.
     this.logger?.info?.(`Room ${this.state.roomId} context sizes for ${String(event?.id ?? "")}: transcript=${roomContext.length} handover=${handoverContext.length} documents=${artifactContext.length} total=${combined.length}`);
     return combined;
+  }
+
+  // Contract P7d-2, P7d-3: the discussion's documents for this turn. A
+  // document not yet given is given in full within the bounds; every other one
+  // is named by its reference line. What was offered is marked given only
+  // after the host run of this turn (P7d-5, markDocumentsGiven).
+  async discussionDocumentContext(event, listed, epochId, signal) {
+    const conversationId = epochId === exactOptionalEpochId(this.state.legacySessionEpochId, "Room legacy session epoch")
+      ? String(this.state.roomId) : epochConversationId(String(this.state.roomId), epochId);
+    const hostSession = observedHostSession(conversationId);
+    const given = effectiveGiven(this.state.documentsGiven, epochId, hostSession);
+    const tool = documentToolState();
+    let catalog = "";
+    try {
+      const library = await this.client.listArtifacts(this.state, signal);
+      catalog = libraryCatalogContext(library?.items, new Set(listed.map((entry) => `${entry.artifactId}\0${entry.versionId}`)));
+    } catch (error) {
+      if (signal?.aborted) throw error;
+      // The documents do not depend on the catalog.
+      this.logger?.warn?.(`Room ${this.state.roomId} document library unavailable: ${singleLine(error?.name || "Error")}`);
+    }
+    const scope = [String(this.client.baseUrl ?? ""), String(this.state.roomId)];
+    const {context, offered, counts} = await discussionDocumentContext(listed,
+      (artifactId, versionId) => readVersion(scope, (wanted) => this.client.getArtifact(this.state, wanted, signal), artifactId, versionId, {signal}),
+      {given, tool, catalog});
+    this.documentsOffered ??= new Map();
+    this.documentsOffered.set(String(event?.id ?? ""), {epochId, conversationId, hostSession, given, offered});
+    while (this.documentsOffered.size > 64) this.documentsOffered.delete(this.documentsOffered.keys().next().value);
+    // Counts and codes only (P7d-7).
+    this.logger?.info?.(`Room ${this.state.roomId} documents for ${String(event?.id ?? "")}: full=${counts.full} head=${counts.head} reference=${counts.reference} status=${counts.status} left_out=${counts.leftOut} tool=${tool}`);
+    return context;
+  }
+
+  // Contract P7d-5: after the host run of the turn, remember what it was given.
+  async markDocumentsGiven(eventId) {
+    const record = this.documentsOffered?.get(String(eventId ?? ""));
+    if (!record) return;
+    this.documentsOffered.delete(String(eventId ?? ""));
+    const built = record.hostSession;
+    const ran = observedHostSession(record.conversationId) || built;
+    // The host replaced the session while the turn started: the earlier
+    // documents are not in it.
+    const base = built && ran && built !== ran ? [] : record.given;
+    const memory = givenMemory(record.epochId, base, record.offered, ran);
+    if (JSON.stringify(memory) === JSON.stringify(this.state.documentsGiven ?? null)) return;
+    this.state.documentsGiven = memory;
+    await this.persistState();
   }
 
   // The source message of the claimed cycle, for its attachments (P5-1). The

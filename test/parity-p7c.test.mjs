@@ -82,7 +82,7 @@ const count = (text, part) => text.split(part).length - 1;
 const STOP_LINE = "Room request refused by the runtime before any I/O code=request_not_formed; the channel stops";
 const pause = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 // A bound against a hang only; no outcome depends on it (an unref'd timer).
-const hangGuard = () => new Promise((_resolve, reject) => setTimeout(() => reject(new Error("hang")), 120_000).unref());
+const hangGuard = (milliseconds = 120_000) => new Promise((_resolve, reject) => setTimeout(() => reject(new Error("hang")), milliseconds).unref());
 
 function runtimeFor(events, options = {}) {
   const {claim = claimed(), rules = [], policy = {}, state = {}, client = {}} = options;
@@ -198,7 +198,7 @@ async function turnKinds(rules) {
     "missed source offered": {turn: await kind([START, HUMAN, PEER, ready(50, "m-43")], {claim: claimed("m-43")},
       (runtime) => { runtime.state.missedSources = [{sourceEventId: "m-42", sourceSeq: 42}]; }), marker: "Missed earlier: #42 TJE"},
     "discussion start as the current item": {turn: await kind([START, HUMAN, PEER, ready(50, "start-z")], {claim: claimed("start-z")}),
-      marker: "Debate"},
+      marker: "\nDebate\n[/Discussion started by "},
     // The phases the plugin itself names besides follow_up and summary
     // (cyclePhaseInstruction): opening and initial_greeting, in round 1 (OP-12
     // P7c r3 B2, N2 a-round1); a word bound frozen in the cycle (N2 a-wordbound).
@@ -242,7 +242,7 @@ test("conformance P7c case names resolve to tests in this suite", async () => {
   const sources = await Promise.all((await readdir(directory)).filter((name) => name.endsWith(".test.mjs"))
     .map((name) => readFile(new URL(name, directory), "utf8")));
   const cases = Object.entries(conformance.parityP7cCases ?? {});
-  assert.equal(cases.length, 23);
+  assert.equal(cases.length, 24);
   cases.forEach(([id, name], index) => {
     assert.equal(id, `P7c-${String(index + 1).padStart(2, "0")}`);
     assert.ok(name.startsWith(`${id} `), id);
@@ -859,7 +859,9 @@ test("P7c-21 a credential the runtime refuses in a header is never in an error, 
     const controller = new AbortController();
     const turns = runtime.assignedTurns(controller.signal);
     let ended = null;
-    try { await Promise.race([turns.next(), hangGuard()]); } catch (error) { ended = error; }
+    // The refusal comes before any I/O; a loop that retried would wait out
+    // the guard (OP-12 P7c r4 deferred 2: 20 s, not 120 s).
+    try { await Promise.race([turns.next(), hangGuard(20_000)]); } catch (error) { ended = error; }
     controller.abort();
     assert.ok(ended instanceof RoomRequestError, String(ended?.name));
     assert.equal(fetches, 0);
@@ -928,7 +930,7 @@ test("P7c-21 a credential the runtime refuses in a header is never in an error, 
   }
 });
 
-test("the header pre-check refuses a value exactly when the running Node's fetch refuses it", {timeout: 120_000}, async () => {
+test("P7c-24 the header check refuses a credential exactly when the running runtime refuses the header it would send (OpenClaw fetch, Hermes http.client)", {timeout: 120_000}, async () => {
   // OP-12 P7c r3 N4: the pre-check is a copy of the runtime's rule; this holds it
   // to the running runtime. Every code point 0x00-0xFF and a few above, alone,
   // inside, first and last in the credential: real fetch to a loopback listener
@@ -1114,6 +1116,13 @@ async function transientFaults() {
     "connection refused": causeCode(["ECONNREFUSED"]),
   };
   const fail = async (kind, contact) => {
+    // OP-12 P7c r4 deferred 3: a port closed right before this connect, so
+    // no other process can have taken it in between.
+    if (kind === "connection refused") {
+      const fresh = net.createServer();
+      ports.closed = await listen(fresh);
+      await new Promise((resolve) => fresh.close(resolve));
+    }
     const port = kind.startsWith("timeout") ? ports.stall : kind === "connection reset" ? ports.reset : ports.closed;
     const host = kind === "DNS failure" ? "localhost" : "127.0.0.1";
     const fetchImpl = kind === "timeout of the runtime"

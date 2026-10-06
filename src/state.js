@@ -6,6 +6,7 @@ import {homedir} from "node:os";
 import {validateRenewalJournal} from "./credential-renewal.js";
 import {rememberSecrets} from "./secret-isolation.js";
 import {pruneTerminalIntents} from "./recovery.js";
+import {validGivenMemory} from "./documents.js";
 
 // Contract P3-1: the state revision that carries the receive ledger. The file
 // format `version` stays 1, so OpenClaw Room 0.2.60 still loads a migrated
@@ -235,6 +236,8 @@ export function validateState(value) {
       throw new Error("Room kept reply is invalid");
     }
   }
+  // Contract P7d-5: the discussion documents given in full to this agent.
+  if (value.documentsGiven !== undefined && !validGivenMemory(value.documentsGiven)) throw new Error("Room document memory is invalid");
   if (value.terminalEvidence !== undefined && (
     !value.terminalEvidence || typeof value.terminalEvidence !== "object" || Array.isArray(value.terminalEvidence)
   )) throw new Error("Room terminal evidence ledger is invalid");
