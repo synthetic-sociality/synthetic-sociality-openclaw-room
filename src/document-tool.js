@@ -8,7 +8,8 @@ import {RoomClient} from "./room-client.js";
 import {roomSessions, selectCallSession} from "./history.js";
 import {
   DOCUMENT_QUERY_CHARACTER_LIMIT, DOCUMENT_TOOL_NAME, DOCUMENT_TOOL_RESULT_LIMIT, DocumentReadError, discussionDocuments,
-  documentPassages, libraryEntries, loggableId, noteHostSession, readVersion, refusal, resolveVersion, toolArguments,
+  documentPassages, libraryEntries, loggableId, noteDocumentToolAvailable, noteHostSession, readVersion, refusal, resolveVersion,
+  roomConversation, toolArguments,
 } from "./documents.js";
 
 export const ROOM_DOCUMENT_PARAMETERS = {
@@ -74,6 +75,7 @@ export async function readRoomDocument({client, session, args = {}, signal, logg
 export function registerRoomDocumentTool(api, {
   makeClient = (session) => new RoomClient({baseUrl: session.baseUrl, credential: session.credential}),
   sessions = (ctx) => roomSessions(api, ctx),
+  onAvailable = () => {},
 } = {}) {
   if (typeof api?.registerTool !== "function") return false;
   api.registerTool((ctx) => {
@@ -93,11 +95,15 @@ export function registerRoomDocumentTool(api, {
         if (resolved.refused) {
           result = resolved.refused;
         } else if (!resolved.session) {
-          result = resolved.choices?.length
-            ? {success: false, selectionRequired: true, rooms: resolved.choices}
-            : {success: false, error: "No Synthetic Sociality Room is configured for this OpenClaw agent."};
+          result = {success: false, selectionRequired: true, rooms: resolved.choices};
         } else {
           result = await readRoomDocument({client: makeClient(resolved.session), session: resolved.session, args, signal, logger: api.logger ?? null});
+        }
+        // Contract P7d-6: the tool counts as available once a document read
+        // of a Room session succeeded; a refused or failed call does not.
+        if (result?.success === true && roomConversation(ctx?.sessionKey)) {
+          noteDocumentToolAvailable();
+          try { onAvailable(); } catch {}
         }
         return {content: [{type: "text", text: JSON.stringify(result)}], details: result};
       },

@@ -4,13 +4,12 @@
 // model dispatch or a delivery acknowledgement. Owner-hidden messages are
 // excluded room-wide, the scan is bounded, and coverage/gaps are reported so
 // the model never mistakes a partial page for the whole history.
-import {readdirSync} from "node:fs";
-import {join} from "node:path";
-import {defaultStateDirectory, loadState} from "./state.js";
+import {normalizeAccountId} from "openclaw/plugin-sdk/account-id";
+import {loadState} from "./state.js";
 import {RoomClient} from "./room-client.js";
 import {speakerLabel} from "./speaker.js";
 import {ROOM_MISMATCH_ERROR, loggableId, refusal, roomConversation, sessionAgent} from "./documents.js";
-import {ROOM_CHANNEL_ID, resolveRoomAccount} from "./account-discovery.js";
+import {ROOM_CHANNEL_ID, resolveRoomAccount, resolvedRoomAccounts} from "./account-discovery.js";
 
 export const HISTORY_PAGE_DEFAULT = 20;
 export const HISTORY_PAGE_MAX = 50;
@@ -213,14 +212,13 @@ export async function readRoomHistory({client, session, args = {}, cache = scanC
   }
 }
 
-function stateAccounts(directory = defaultStateDirectory()) {
-  try {
-    return readdirSync(directory, {withFileTypes: true})
-      .filter((entry) => entry.isFile() && !entry.isSymbolicLink() && entry.name.endsWith(".json"))
-      .map((entry) => ({accountId: entry.name.slice(0, -5), stateFile: join(directory, entry.name)}));
-  } catch {
-    return [];
-  }
+// The Room accounts the channel runs (P7d-4): the channel's own account
+// resolution, as the host starts them (enabled and configured), each with the
+// state file it uses, also one the configuration names outside the default
+// directory.
+function runningAccounts(cfg) {
+  return resolvedRoomAccounts(cfg).filter((account) => account.enabled && account.configured && account.stateFile)
+    .map((account) => ({accountId: account.accountId, stateFile: account.stateFile}));
 }
 
 // The calling agent of a tool (P7d-4): the host's context, else the agent of
@@ -231,12 +229,14 @@ export function callingAgent(ctx) {
 
 // The Room accounts of this gateway with the agent the host routes each to
 // (the host's own route resolution, as each Room turn; without it the
-// account's configured agentId). Only local state is read, no Room request.
-export async function roomSessions(api, ctx, {accounts = stateAccounts, load = loadState} = {}) {
+// account's configured agentId). An account whose agent the host's route
+// resolution cannot name is offered to no agent. Only local state is read, no
+// Room request.
+export async function roomSessions(api, ctx, {accounts = runningAccounts, load = loadState} = {}) {
   const cfg = ctx?.getRuntimeConfig?.() ?? ctx?.runtimeConfig ?? ctx?.config ?? api?.runtime?.config?.current?.() ?? api?.config ?? {};
   const route = api?.runtime?.channel?.routing?.resolveAgentRoute;
   const sessions = [];
-  for (const account of accounts()) {
+  for (const account of accounts(cfg)) {
     try {
       const state = await load(account.stateFile);
       if (!state?.roomId || !state?.credential || !state?.baseUrl) continue;
@@ -247,16 +247,21 @@ export async function roomSessions(api, ctx, {accounts = stateAccounts, load = l
           ? route({cfg, channel: ROOM_CHANNEL_ID, accountId: account.accountId, peer: {kind: "group", id: roomId}, parentPeer: {kind: "group", id: roomId}})?.agentId
           : resolveRoomAccount(cfg, account.accountId).agentId;
       } catch {}
+      if (typeof agentId !== "string" || !agentId.trim()) continue;
       // Contract P7c-2: the membership id of the same saved state the runtime
       // uses, so the registered tool marks the agent's own entries.
       sessions.push({accountId: account.accountId, roomId, credential: String(state.credential), baseUrl: String(state.baseUrl),
-        membershipId: String(state.membershipId ?? ""), agentId: String(agentId || "main").toLowerCase()});
+        membershipId: String(state.membershipId ?? ""), agentId: agentId.trim().toLowerCase()});
     } catch {
       // Unreadable or foreign state files are skipped; they never grant access.
     }
   }
   return sessions;
 }
+
+export const NO_ROOM_ERROR = "No Synthetic Sociality Room is configured for this OpenClaw agent.";
+export const NOT_IN_ROOM_ERROR = "None of this OpenClaw agent's Room accounts is in this Room.";
+export const ACCOUNT_NOT_NAMED_ERROR = "Two or more of this OpenClaw agent's Room accounts are in this Room, and the host named none of them for this turn.";
 
 // The Room and account of a tool call (P7d-4). Only the calling agent's
 // accounts count. Inside a Room session (the host's session key names a Room
@@ -271,17 +276,21 @@ export function selectCallSession(sessions, requested, ctx, {logger = null, tool
   const turnRoom = roomConversation(ctx?.sessionKey).split(":")[0] || "";
   if (turnRoom) {
     const inRoom = own.filter((item) => item.roomId === turnRoom);
-    const accountId = typeof ctx?.agentAccountId === "string" ? ctx.agentAccountId : "";
-    const session = inRoom.find((item) => accountId && item.accountId === accountId) ?? (inRoom.length === 1 ? inRoom[0] : null);
+    // The host passes the account id in its normalised form.
+    const accountId = typeof ctx?.agentAccountId === "string" && ctx.agentAccountId.trim() ? normalizeAccountId(ctx.agentAccountId) : "";
+    const session = inRoom.find((item) => accountId && normalizeAccountId(item.accountId) === accountId) ?? (inRoom.length === 1 ? inRoom[0] : null);
     if (named && named !== turnRoom && !(session && named === session.accountId)) {
       // The argument itself is never logged (P7d-7).
       logger?.info?.(`Room ${loggableId(turnRoom)} ${tool} refused: code=room_mismatch`);
       return {refused: refusal("room_mismatch", ROOM_MISMATCH_ERROR)};
     }
-    return session ? {session} : {choices: []};
+    if (session) return {session};
+    if (inRoom.length > 1) return {refused: refusal("account_not_named", ACCOUNT_NOT_NAMED_ERROR)};
+    return {refused: refusal("no_room", own.length ? NOT_IN_ROOM_ERROR : NO_ROOM_ERROR)};
   }
   const matches = named ? own.filter((item) => item.roomId === named || item.accountId === named) : own;
   if (matches.length === 1) return {session: matches[0]};
+  if (!own.length) return {refused: refusal("no_room", NO_ROOM_ERROR)};
   return {choices: own.map((item) => ({accountId: item.accountId, roomId: item.roomId}))};
 }
 
@@ -300,9 +309,7 @@ export function registerRoomHistoryTool(api, {makeClient = (session) => new Room
       if (resolved.refused) {
         result = resolved.refused;
       } else if (!resolved.session) {
-        result = resolved.choices?.length
-          ? {success: false, selectionRequired: true, rooms: resolved.choices}
-          : {success: false, error: "No Synthetic Sociality Room is configured for this OpenClaw agent."};
+        result = {success: false, selectionRequired: true, rooms: resolved.choices};
       } else {
         result = await readRoomHistory({client: makeClient(resolved.session), session: resolved.session, args, signal, logger: api.logger ?? null});
       }

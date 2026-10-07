@@ -7,7 +7,7 @@ import {registerRoomCommands} from "./commands.js";
 import {markChannelActive, markChannelInactive, registerPresenceFallback} from "./presence-fallback.js";
 import {registerRoomHistoryTool} from "./history.js";
 import {registerRoomDocumentTool} from "./document-tool.js";
-import {DOCUMENT_TOOL_NAME, noteDocumentToolAvailable, noteHostSession} from "./documents.js";
+import {noteHostSession} from "./documents.js";
 import {claimRuntimeOwnership} from "./account.js";
 import {resolveRoomAccount as resolveAccount, resolvedRoomAccounts} from "./account-discovery.js";
 import {looksLikeRoomId, normalizeRoomTarget, resolveConfiguredRoomTarget} from "./target.js";
@@ -140,13 +140,8 @@ export function roomToolCallPolicy(api, {noteWebRead = false} = {}) {
         try { roomLocalStatus(api?.logger, cfg).noteWebReadTool(event.toolName); } catch {}
       }
       if (noteWebRead && String(ctx?.sessionKey ?? "").split(":")[2] === ID) {
-        // Contract P7d-5, P7d-6: the host session of a Room turn, and the
-        // document tool once a Room session calls it.
+        // Contract P7d-5: the host session of a Room turn.
         noteHostSession(ctx?.sessionKey, ctx?.sessionId);
-        if (event?.toolName === DOCUMENT_TOOL_NAME) {
-          noteDocumentToolAvailable();
-          try { roomLocalStatus(api?.logger, cfg).setDocumentTool("available"); } catch {}
-        }
       }
       const stateDir = openClawStateDirectory();
       // Relative paths resolve where the tool runs: the hook context's
@@ -533,7 +528,11 @@ export function createRoomChannel({makeClient}) {
       registerRoomCommands(api);
       registerPresenceFallback(api, {makeClient});
       registerRoomHistoryTool(api);
-      registerRoomDocumentTool(api);
+      // Contract P7d-6: available once a document read of a Room session
+      // succeeded; only the gateway's own registration writes the status.
+      registerRoomDocumentTool(api, gatewayLoad
+        ? {onAvailable: () => roomLocalStatus(api?.logger, api?.runtime?.config?.current?.() ?? api?.config).setDocumentTool("available")}
+        : {});
     },
   });
 }

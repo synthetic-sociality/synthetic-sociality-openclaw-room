@@ -207,7 +207,7 @@ beforeEach(() => {
 
 test("conformance P7d case names resolve to tests in this suite; constants pinned", async () => {
   const cases = Object.entries(conformance.parityP7dCases ?? {});
-  assert.equal(cases.length, 26);
+  assert.equal(cases.length, 28);
   const source = await readFile(new URL(import.meta.url), "utf8");
   for (const [key, name] of cases) {
     assert.ok(name.startsWith(`${key} `), name);
@@ -517,18 +517,47 @@ test("P7d-11 when the tool is not known to be offered a large document gives its
   assert.ok(absent.context.endsWith(`${reference("small.md", "small", "v1", 14, {given: true, tool: false})}\n${reference("long.md", "long", "v1", size, {given: false, tool: false})}\n\n${FOOTER}`));
   assert.ok(absent.context.includes(`Content (cut: the first 24000 of ${size} characters):\n${head}`));
   assert.equal(documents.referenceLine("x", "a", "v", 3, {given: false, tool: "unavailable"}), "Document: x · artifact/version a / v · 3 characters");
-  // The status: unknown until a Room session calls the tool, then available.
+  // The status: unknown until a document read of a Room session succeeded
+  // (review r2 N5); calling the tool alone, or a call that answered an error,
+  // changes nothing.
+  documents.resetDocumentRuntimeMemory();
   statusModule.resetLocalStatusWriters();
-  const api = {config: ISOLATED_HOST_CONFIG, logger: {warn: () => {}}};
-  const policy = channelModule.roomToolCallPolicy(api, {noteWebRead: true});
   const path = channelModule.roomStatusPath(ISOLATED_HOST_CONFIG);
-  channelModule.roomLocalStatus(api.logger, ISOLATED_HOST_CONFIG).setLoaded(true);
+  const registered = [];
+  const hooks = {};
+  // The channel's own full registration (the gateway's).
+  const api = new Proxy({registrationMode: "full", config: ISOLATED_HOST_CONFIG, logger: {info() {}, warn() {}, error() {}},
+    on(name, handler) { hooks[name] = handler; }, registerTool(factory) { registered.push(factory); }},
+  {get: (target, property) => (property in target ? target[property] : () => undefined)});
+  channelModule.createRoomChannel({makeClient: () => null}).registerFull(api);
   assert.equal(JSON.parse(await readFile(path, "utf8")).documentTool, "unknown");
-  policy({toolName: TOOL, params: {artifactId: "a"}}, {sessionKey: "agent:main:telegram:group:x", sessionId: "t"});
+  const roomSession = {agentId: "main", sessionKey: sessionKeyFor("epoch-z"), sessionId: "s"};
+  hooks.before_tool_call({toolName: TOOL, params: {artifactId: "a"}}, roomSession);
+  const channelTool = registered.map((factory) => factory(roomSession)).find((tool) => tool.name === TOOL);
+  // No Room account in this gateway: the call answers an error.
+  assert.equal((await channelTool.execute("c", {artifactId: "long"})).details.code, "no_room");
   assert.equal(JSON.parse(await readFile(path, "utf8")).documentTool, "unknown");
-  policy({toolName: TOOL, params: {artifactId: "a"}}, {sessionKey: sessionKeyFor("epoch-z"), sessionId: "s"});
-  assert.equal(JSON.parse(await readFile(path, "utf8")).documentTool, "available");
-  assert.equal(documents.documentToolState(), "available");
+  assert.equal(documents.documentToolState(), "unknown");
+  // The tool answered with an error: a large document keeps its first-turn head.
+  const afterError = documentBlock(await new Discussion(new Room({long: record("long", {v1: ["ready", LARGE_TEXT]})}, [],
+    {documentsList: [entry("long")]})).turn());
+  assert.ok(afterError.includes(`Content (cut: the first 24000 of ${size} characters):\n${head}`));
+  // Refused or failed reads of a Room session: still unknown.
+  const sessionsOf = [{accountId: "t", roomId: "room-1", credential: "c", baseUrl: room.baseUrl, agentId: "main"}];
+  let noted = 0;
+  const made = [];
+  registerRoomDocumentTool({registerTool: (factory) => made.push(factory)},
+    {makeClient: () => room.client(), sessions: async () => sessionsOf, onAvailable: () => { noted += 1; }});
+  const outside = made[0]({agentId: "main", sessionKey: "agent:main:telegram:group:x", sessionId: "t"});
+  const inside = made[0](roomSession);
+  for (const args of [{artifactId: "unknown"}, {artifactId: "long", room: "room-2"}, {artifactId: "long", query: "x", fromLine: 1}]) {
+    assert.equal((await inside.execute("c", args)).details.success, false, JSON.stringify(args));
+  }
+  // A successful read outside a Room session says nothing about Room turns.
+  assert.equal((await outside.execute("c", {artifactId: "long"})).details.success, true);
+  assert.deepEqual([noted, documents.documentToolState()], [0, "unknown"]);
+  assert.equal((await inside.execute("c", {artifactId: "long"})).details.success, true);
+  assert.deepEqual([noted, documents.documentToolState()], [1, "available"]);
 });
 
 test("P7d-12 a Room state without activeTopic.documents keeps the P5 rule unchanged", async () => {
@@ -1111,4 +1140,115 @@ test("P7d-26 an id over 128 characters never reaches the state, and a failed lib
   const withoutLibrary = new Discussion(failing);
   assert.ok(documentBlock(await withoutLibrary.turn()).includes("Content:\nBrief text."));
   assert.ok(withoutLibrary.runtime.logs.some((line) => /document library unavailable: RoomTransportError/.test(line)), withoutLibrary.runtime.logs.join("\n"));
+});
+
+test("P7d-27 the tools find every Room the connector runs, also one whose state the configuration places outside the default directory, and each agent sees only its own", async (t) => {
+  const hostRoot = installedHost();
+  if (!hostRoot) return t.skip("the pinned OpenClaw host is not installed");
+  // OpenClaw review r2 B1. Through the host's own loader, the registered
+  // factories, the host's own route resolution and real state files.
+  const scratch = await mkdtemp(join(home, "host-tools-"));
+  const {stdout} = await promisify(execFile)(process.execPath, [join(root, "test/support/host-room-tools.mjs"), hostRoot, root], {
+    env: {...process.env, HOME: scratch, JITI_FS_CACHE: "false"}, timeout: 120_000, maxBuffer: 4 << 20,
+  });
+  const result = JSON.parse(stdout.trim().split("\n").at(-1));
+  assert.equal(result.error, undefined, JSON.stringify(result));
+  assert.deepEqual(result.plugin, {failed: false, toolNames: [TOOL, "synthetic_sociality_room_history"].sort()});
+  assert.deepEqual(result.diagnostics, []);
+  // The accounts the host starts: the configured ones outside the default
+  // directory and the managed one inside it; not the disabled one, not a state
+  // file nobody names. The tools see exactly these.
+  assert.deepEqual(result.started, ["ZX", "ac", "ad", "default", "zb", "zm"]);
+  // The host passes the account id in its normalised form.
+  assert.deepEqual(result.contexts, {ZX: {agentId: "zurie", agentAccountId: "zx"}, ad: {agentId: "aura", agentAccountId: "ad"},
+    ac: {agentId: "aura", agentAccountId: "ac"}});
+  const {calls} = result;
+  const only = (call, request) => assert.ok(call.requests.length > 0 && call.requests.every((item) => item === request), JSON.stringify(call));
+  // In ZX's own Room turn both tools work for that Room, with its credential.
+  assert.equal(calls.zxError.answer.code, "not_in_discussion");
+  assert.equal(calls.zxDocument.answer.text, "1: Text of Alpha.", JSON.stringify(calls.zxDocument));
+  only(calls.zxDocument, "rooma0000000001 cred-zx");
+  assert.equal(calls.zxHistory.answer.success, true, JSON.stringify(calls.zxHistory));
+  assert.deepEqual(calls.zxHistory.answer.messages.map((item) => item.body), ["Message in Alpha."]);
+  only(calls.zxHistory, "rooma0000000001 cred-zx");
+  assert.deepEqual([calls.zxOtherRoom.answer.code, calls.zxOtherRoom.requests], ["room_mismatch", []]);
+  // The second agent in the same Room uses its own account.
+  assert.equal(calls.adDocument.answer.text, "1: Text of Alpha.");
+  only(calls.adDocument, "rooma0000000001 cred-ad");
+  only(calls.acHistory, "roomc0000000003 cred-ac");
+  assert.deepEqual([calls.acZurieRoom.answer.code, calls.acZurieRoom.requests], ["room_mismatch", []]);
+  // Outside a Room turn each agent is offered its own running accounts only.
+  const zurie = [{accountId: "ZX", roomId: "rooma0000000001"}, {accountId: "zb", roomId: "roomb0000000002"}, {accountId: "zm", roomId: "roomb0000000002"}];
+  assert.deepEqual(calls.zurieMain.answer, {success: false, selectionRequired: true, rooms: zurie});
+  assert.deepEqual(calls.auraMain.answer.rooms, [{accountId: "ac", roomId: "roomc0000000003"}, {accountId: "ad", roomId: "rooma0000000001"}]);
+  assert.deepEqual([calls.zurieNamesAura.answer.rooms, calls.zurieNamesAura.requests], [zurie, []]);
+  only(calls.zurieRoomB, "roomb0000000002 cred-zb");
+  // Review r2 N5: a call that answered an error does not make the tool
+  // available; the successful read of a Room session does.
+  assert.deepEqual([result.statusBefore, result.statusAfterError, result.statusAfterRead], ["unknown", "unknown", "available"]);
+});
+
+test("P7d-28 a recorded host session is never overwritten by a run whose session is unknown", async () => {
+  // OpenClaw review r2 N1: restart, a turn whose run shows no session, a host
+  // reset, then the run shows the new session.
+  const room = new Room({brief: record("brief", {v1: ["ready", PROOF_TEXT]})}, [], {documentsList: [entry("brief")]});
+  const key = sessionKeyFor("epoch-z");
+  const discussion = new Discussion(room);
+  assert.ok((await discussion.turn({beforeMark: () => documents.noteHostSession(key, "S1")})).includes(PROOF_TEXT.trim()));
+  documents.resetDocumentRuntimeMemory();
+  assert.ok(!(await discussion.turn()).includes(PROOF_TEXT.slice(0, 200)));
+  assert.deepEqual(discussion.memory, {epochId: "epoch-z", hostSession: "S1", given: ["brief/v1"]});
+  // The host reset the session; the run of the next turn shows S2.
+  assert.ok(!(await discussion.turn({beforeMark: () => documents.noteHostSession(key, "S2")})).includes(PROOF_TEXT.slice(0, 200)));
+  assert.deepEqual(discussion.memory, {epochId: "epoch-z", hostSession: "S2", given: []});
+  assert.ok((await discussion.turn()).includes(PROOF_TEXT.trim()));
+  assert.ok(!(await discussion.turn()).includes(PROOF_TEXT.slice(0, 200)));
+  // The new session known before the third turn is built: a first turn again.
+  documents.resetDocumentRuntimeMemory();
+  const known = new Discussion(room);
+  await known.turn({beforeMark: () => documents.noteHostSession(key, "S1")});
+  documents.resetDocumentRuntimeMemory();
+  await known.turn();
+  assert.equal(known.memory.hostSession, "S1");
+  documents.noteHostSession(key, "S2");
+  assert.ok((await known.turn()).includes(PROOF_TEXT.trim()));
+  assert.ok(!(await known.turn()).includes(PROOF_TEXT.slice(0, 200)));
+  assert.deepEqual(known.memory, {epochId: "epoch-z", hostSession: "S2", given: ["brief/v1"]});
+});
+
+test("P7d round 3 (OpenClaw): account ids compare in the host's normalised form; an account whose agent cannot be resolved is offered to nobody; distinct answers without a selectable account", async () => {
+  const session = (accountId, roomId, agentId) => ({accountId, roomId, agentId, credential: `cred-${accountId}`, baseUrl: "https://room.example/api"});
+  const inRoomA = (extra = {}) => ({agentId: "zurie", sessionKey: `agent:zurie:${ID}:group:rooma0000000001:epoch:x`, ...extra});
+  const two = [session("Zurie-A", "rooma0000000001", "zurie"), session("zurie-a2", "rooma0000000001", "zurie"), session("zb", "roomb0000000002", "zurie")];
+  // N4: the host passes "zurie-a" for the configured "Zurie-A".
+  assert.equal(historyModule.selectCallSession(two, undefined, inRoomA({agentAccountId: "zurie-a"})).session?.accountId, "Zurie-A");
+  assert.equal(historyModule.selectCallSession(two, undefined, inRoomA({agentAccountId: "ZURIE-A2"})).session?.accountId, "zurie-a2");
+  // Round-2 survivor: two of the agent's accounts in the turn's Room and the
+  // host named none: no account is taken, a plain coded answer.
+  const unnamed = {success: false, code: "account_not_named", error: historyModule.ACCOUNT_NOT_NAMED_ERROR};
+  assert.deepEqual(historyModule.selectCallSession(two, undefined, inRoomA()), {refused: unnamed});
+  assert.deepEqual(historyModule.selectCallSession(two, undefined, inRoomA({agentAccountId: "aura-c"})), {refused: unnamed});
+  // N3: no Room configured for the agent; none of its accounts in this Room.
+  const noRoom = {success: false, code: "no_room", error: historyModule.NO_ROOM_ERROR};
+  assert.deepEqual(historyModule.selectCallSession([], undefined, inRoomA()), {refused: noRoom});
+  assert.deepEqual(historyModule.selectCallSession([], undefined, {agentId: "zurie", sessionKey: "agent:zurie:main"}), {refused: noRoom});
+  assert.deepEqual(historyModule.selectCallSession([session("zb", "roomb0000000002", "zurie")], undefined, inRoomA()),
+    {refused: {success: false, code: "no_room", error: historyModule.NOT_IN_ROOM_ERROR}});
+  assert.equal(new Set([historyModule.NO_ROOM_ERROR, historyModule.NOT_IN_ROOM_ERROR, historyModule.ACCOUNT_NOT_NAMED_ERROR]).size, 3);
+  // N2: an account whose agent the host cannot resolve is offered to nobody,
+  // not to "main".
+  const state = {"/s/ok.json": "rooma0000000001", "/s/throws.json": "roomb0000000002", "/s/empty.json": "roomc0000000003"};
+  const accounts = () => Object.keys(state).map((stateFile) => ({accountId: stateFile.slice(3, -5), stateFile}));
+  const load = async (file) => ({roomId: state[file], credential: "c", baseUrl: "https://room.example/api"});
+  const route = ({accountId}) => {
+    if (accountId === "throws") throw new Error("no route");
+    return accountId === "empty" ? {agentId: ""} : {agentId: "main"};
+  };
+  const found = await historyModule.roomSessions({runtime: {channel: {routing: {resolveAgentRoute: route}}}}, {agentId: "main"}, {accounts, load});
+  assert.deepEqual(found.map((item) => [item.accountId, item.agentId]), [["ok", "main"]]);
+  for (const agentId of ["main", "zurie", ""]) {
+    const outside = historyModule.selectCallSession(found, "roomb0000000002", {agentId, sessionKey: `agent:${agentId || "main"}:main`});
+    assert.notEqual(outside.session?.accountId, "throws");
+    assert.ok(!(outside.choices ?? []).some((item) => ["throws", "empty"].includes(item.accountId)));
+  }
 });

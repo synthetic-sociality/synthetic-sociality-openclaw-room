@@ -29,7 +29,7 @@ deterministic text backfill for older pending versions.
 
 Version 0.2.67 is parity release P7d with Hermes 1.0.84 ("Discussion
 documents: once in full, then on demand", contract section P7d, shared cases
-P7d-01 to P7d-26, the `documentTool` row of the P2c-4 status table), for a Room
+P7d-01 to P7d-28, the `documentTool` row of the P2c-4 status table), for a Room
 server that lists the discussion's documents in its state
 (`activeTopic.documents`, server ebad3df and later; the deployed
 hold-signal-47320f7 does):
@@ -60,7 +60,14 @@ hold-signal-47320f7 does):
   naming another Room or account is refused with `room_mismatch` and nothing of
   it is read. Outside a Room turn a `selectionRequired` answer lists only the
   agent's own Rooms. A log line carries an id only in the Room's id form (15
-  characters a-z, 0-9), otherwise `invalid`.
+  characters a-z, 0-9), otherwise `invalid`. The tools see exactly the Room
+  accounts the channel runs (enabled and configured, with the state file each
+  uses, also one the configuration names outside OPENCLAW_STATE_DIR); the
+  host's account id is compared in its normalised form, and an account whose
+  agent the host's route resolution cannot name is offered to no agent. Without
+  a selectable account the answer is coded: `account_not_named` (two or more of
+  the agent's accounts in the turn's Room and the host named none) or
+  `no_room`.
 - Memory (P7d-5): what was given is kept in the account's state file
   (`documentsGiven`: the discussion's epoch, the host session id, at most 64
   ids; never a name or text), written after the host run of the turn returned.
@@ -70,11 +77,13 @@ hold-signal-47320f7 does):
   The host session is kept per agent and conversation, so two agents in one
   Room each get a document once. A session seen to change during a run, also
   after a restart, gives the documents again on the next turn. A run that ended
-  in the host's operational fallback (generic or compaction) marks nothing. An
+  in the host's operational fallback (generic or compaction) marks nothing. A
+  run whose session the plugin does not know keeps the recorded session. An
   id over 128 characters is left out.
 - Tool availability (P7d-6): OpenClaw gives a channel plugin no resolved tool
-  list, so the status `documentTool` is `unknown` until a Room session calls
-  the tool (then `available`). While it is unknown, a large document also gives
+  list, so the status `documentTool` is `unknown` until a document read of a
+  Room session succeeds (then `available`; a call that answered an error
+  changes nothing). While it is unknown, a large document also gives
   its first 24,000 characters once, marked as cut.
 - Manifest: `openclaw.plugin.json` gains `"contracts": {"tools":
   ["synthetic_sociality_room_history", "synthetic_sociality_room_document"]}`.

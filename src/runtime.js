@@ -1466,7 +1466,9 @@ export class OpenClawRoomRuntime {
     this.documentsOffered.delete(String(eventId ?? ""));
     const built = record.hostSession;
     const recorded = record.recordedSession;
-    const ran = observedHostSession(record.conversationId, record.agentId) || built;
+    // A run whose session is unknown keeps the recorded one: an empty session
+    // never overwrites a known one.
+    const ran = observedHostSession(record.conversationId, record.agentId) || built || recorded;
     // The run's session differs from the one the turn was built for or from
     // the one the memory records (the host replaced the session, also unseen
     // across a restart): the earlier documents are not in it.
