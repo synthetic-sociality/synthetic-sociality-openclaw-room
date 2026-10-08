@@ -36,7 +36,7 @@ const STORE = join(home, "openclaw", "synthetic-sociality-room");
 await mkdir(join(STORE, "accounts"), {recursive: true, mode: 0o700});
 
 const {createRoomChannel, roomToolCallPolicy, roomToolResultScrub, resetSecretRefusalLog} = await import("../src/channel.js");
-const {OpenClawRoomRuntime, HOST_LABEL, KEPT_REPLY_CHARACTER_LIMIT, keptReplyBlock} = await import("../src/runtime.js");
+const {OpenClawRoomRuntime, HOST_LABEL, KEPT_REPLY_CHARACTER_LIMIT, keptReplyBlock, resetEnrollmentLineages} = await import("../src/runtime.js");
 const {RoomAPIError, RoomTransportError} = await import("../src/room-client.js");
 const {loadState, saveState, validateState} = await import("../src/state.js");
 const {renewCredential} = await import("../src/credential-renewal.js");
@@ -453,6 +453,8 @@ test("P2c-03 after network loss and session expiry the connector reconnects with
   // nothing failed before: the enrollment check alone makes the runtime
   // register again (Wu and Real logged this check every 70 s).
   {
+    // Contract P8-2: a fresh lineage schedule for this process.
+    resetEnrollmentLineages?.();
     const sessions = ["session-stored"];
     const enrollments = [];
     const runtime = roomRuntime([message(2964, "paula", "participant_agent", "Quiet.")]);
@@ -496,6 +498,9 @@ test("P2c-03 after network loss and session expiry the connector reconnects with
     runtime.reconnectInitialMs = 20;
     runtime.reconnectMaxMs = 80;
     runtime.heartbeatMinimumSeconds = 0.05;
+    // Contract P8-2: the listing has its own interval; shortened like the heartbeat.
+    runtime.enrollmentListingIntervalMs = 50;
+    resetEnrollmentLineages?.();
     runtime.connectorSession = {sessionId: "session-stored", heartbeatIntervalSeconds: 0.05};
     let initializations = 0;
     runtime.initializeOnce = async () => { initializations += 1; return runtime.connectorSession; };

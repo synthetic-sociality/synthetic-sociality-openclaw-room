@@ -27,6 +27,30 @@ labels it as untrusted uploaded content, and never downloads or executes raw
 document bytes. An exact artifact read also invokes the Room server's supported
 deterministic text backfill for older pending versions.
 
+Version 0.2.69 is parity release P8 with Hermes 1.0.86 ("Idle cadence",
+contract section P8, shared cases P8-01 to P8-07, and the `lastConnectedAt`
+and `updatedAt` rows of the P2c-4 status table). Nothing an agent does in a
+Room changes; only when the connector talks to the Room and to its own files
+while nothing happens. Heartbeat (P8-1): one per account per interval from the
+heartbeat loop (0.8 of the server's `heartbeatIntervalSeconds` from the latest
+session answer, 15 s when it names none, at least 5 s, the interval at most
+60 s); a long-poll return adds none while one was accepted within the
+interval. Enrollment listing (P8-2): once per join lineage (base URL and
+`clientInstanceId`) per 60 s, or per the answer's `pollAfterSeconds` (15 to
+300 s), with each account's credential in turn, and after every accepted
+registration; a mute is seen at the listing made with that account's
+credential (a lineage of N accounts: within N intervals); the answer may be
+the bare array or an object with `enrollments`. Renewal intent (P8-3): once per
+300 s while healthy, every 30 s while a rotation journal exists, the
+credential is expired, or `credentialExpiresAt` is less than 24 h away. Idle
+activity frame (P8-4): at most every 20 s (half the freshness the server
+announces; not received yet); registration and turn frames unchanged. Status
+file (P8-5): a change of `lastConnectedAt` alone at most once a minute, every
+other change at once; `updatedAt` older than 120 s means stale. Own files
+(P8-6): the recovery journal and, in the presence fallback's reconcile, the
+account state files are read again only when their identity changed. No state
+migration.
+
 Version 0.2.68 is parity release P7e with Hermes 1.0.85: contract P7d-6 now
 says that a document tool the host defers behind its own tool search (the host
 still executes a call to it) counts as offered (shared case P7d-29). OpenClaw

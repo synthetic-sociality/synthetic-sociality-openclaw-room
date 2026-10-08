@@ -203,6 +203,11 @@ test("initializes one connector session when native startup and event polling ov
   });
   await runtime.maintainPresence();
   assert.equal(connectorHeartbeats, 1);
+  // Contract P8-4: the next idle frame once the half of the freshness passed.
+  assert.equal(activities.length, 1);
+  runtime.idleFrameAt -= 20_000;
+  await runtime.maintainPresence();
+  assert.equal(connectorHeartbeats, 2);
   assert.equal(activities.length, 2);
   assert.equal(activities[1].streamSeq, 2);
   await runtime.close();

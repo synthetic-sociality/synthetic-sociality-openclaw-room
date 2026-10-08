@@ -11,7 +11,7 @@
 // record. Safety rests on the Room's proof being checked again when the record
 // is applied (contract P3-4) and on the store fence that keeps agents out.
 import {createHash} from "node:crypto";
-import {closeSync, fchmodSync, fsyncSync, openSync, readFileSync, writeSync, constants as fs} from "node:fs";
+import {closeSync, fchmodSync, fsyncSync, openSync, readFileSync, statSync, writeSync, constants as fs} from "node:fs";
 
 export const REASONS = Object.freeze(["cycle_terminal", "cycle_superseded", "epoch_closed"]);
 export const TERMINAL_CYCLE_STATES = new Set(["completed", "interrupted", "timed_out", "failed"]);
@@ -262,6 +262,38 @@ export function readRecords(path) {
       // Contract P3-4: an unreadable record is skipped, never fatal.
     }
   }
+  return records;
+}
+
+// Contract P8-6: the identity of a file (size, modification time in ns,
+// inode, device), or null when it does not exist.
+export function fileIdentity(path, stat = statSync) {
+  let info;
+  try {
+    info = stat(path, {bigint: true});
+  } catch (error) {
+    if (error?.code === "ENOENT") return null;
+    throw error;
+  }
+  return `${info.size}:${info.mtimeNs}:${info.ino}:${info.dev}`;
+}
+
+const cachedRecords = new Map();
+
+// Contract P8-6: readRecords without reading a journal that has not changed
+// (an append by the recovery tool changes its size and modification time).
+// The records are shared and must not be changed.
+export function readRecordsCached(path) {
+  const identity = fileIdentity(path);
+  if (identity === null) {
+    cachedRecords.delete(path);
+    return [];
+  }
+  const cached = cachedRecords.get(path);
+  if (cached?.identity === identity) return cached.records;
+  const records = readRecords(path);
+  if (fileIdentity(path) === identity) cachedRecords.set(path, {identity, records});
+  else cachedRecords.delete(path);
   return records;
 }
 

@@ -14,7 +14,7 @@ import {
 import {readRotationRequest, removeRotationRequest} from "./epoch-rotation.js";
 import {
   CLOSURE_EVIDENCE_PREFIX, RecoveryRefused, closuresFor, journalPath, ledgerReport, priorState,
-  pruneTerminalIntents, readRecords, roomForState, serverProof,
+  pruneTerminalIntents, readRecordsCached, roomForState, serverProof,
 } from "./recovery.js";
 
 export const OPEN_EXCHANGE_PREAMBLE_VERSION = "Open Exchange – Room Behaviour Preamble v1";
@@ -479,6 +479,66 @@ export const RECONNECT_JITTER_LOW = 0.8;
 // Contract P2c-3b: an inactive (muted) membership re-reads the Room state at
 // most this often, at a heartbeat.
 export const INACTIVE_RECHECK_MS = 60_000;
+// Contract P8-1: the heartbeat interval is the server's heartbeatIntervalSeconds
+// from the session answer (15 s when it names none), at least the runtime's
+// floor (5 s) and at most 60 s, sent at 0.8 of it (the existing margin). A
+// long-poll return adds no heartbeat while one was accepted within the interval.
+export const HEARTBEAT_DEFAULT_SECONDS = 15;
+export const HEARTBEAT_MAXIMUM_SECONDS = 60;
+export const HEARTBEAT_MARGIN = 0.8;
+// Contract P8-2: one enrollment listing per join lineage (base URL and
+// clientInstanceId) per interval, process-wide; a numeric pollAfterSeconds in
+// the listing's answer replaces the interval, bounded to 15..300 s.
+export const ENROLLMENT_LISTING_INTERVAL_MS = 60_000;
+export const ENROLLMENT_POLL_AFTER_MIN_SECONDS = 15;
+export const ENROLLMENT_POLL_AFTER_MAX_SECONDS = 300;
+// Contract P8-3: the present renewal-intent cadence (while a rotation journal
+// exists, the credential is expired, or the stored expiry is less than 24 h
+// away) and the cadence of a healthy binding.
+export const RENEWAL_INTENT_CHECK_MS = 30_000;
+export const RENEWAL_INTENT_HEALTHY_MS = 300_000;
+export const RENEWAL_EXPIRY_HORIZON_MS = 24 * 3600_000;
+// Contract P8-4: the idle activity frame interval: half the freshness the
+// server announces. The plugin does not receive that value today.
+export const IDLE_ACTIVITY_FRAME_MS = 20_000;
+
+// Contract P8-4: milliseconds between two idle activity frames of a session,
+// or null for never: the answer once the server announces that presence comes
+// from the session (no such announcement exists yet).
+export function idleActivityFrameIntervalMs() {
+  return IDLE_ACTIVITY_FRAME_MS;
+}
+
+// Contract P8-3: ask at the present cadence, not once per 300 s, when the
+// stored expiry is less than 24 h away; an absent or unparsable expiry counts
+// as healthy.
+export function credentialExpiresSoon(expiresAt, now = Date.now()) {
+  if (typeof expiresAt !== "string" || !expiresAt.trim()) return false;
+  const at = Date.parse(expiresAt);
+  return Number.isFinite(at) && at - now < RENEWAL_EXPIRY_HORIZON_MS;
+}
+
+// Contract P8-2: the enrollments and the listing interval of an answer: a bare
+// array, or an object whose enrollments is the array (unknown members
+// ignored); null when malformed.
+export function enrollmentListing(value) {
+  if (Array.isArray(value)) return {enrollments: value, pollAfterMs: null};
+  if (value && typeof value === "object" && Array.isArray(value.enrollments)) {
+    const seconds = value.pollAfterSeconds;
+    const pollAfterMs = typeof seconds === "number" && Number.isFinite(seconds)
+      ? Math.min(ENROLLMENT_POLL_AFTER_MAX_SECONDS, Math.max(ENROLLMENT_POLL_AFTER_MIN_SECONDS, seconds)) * 1000
+      : null;
+    return {enrollments: value.enrollments, pollAfterMs};
+  }
+  return null;
+}
+
+// Contract P8-2: the listing schedule of each join lineage in this process.
+const enrollmentLineages = new Map();
+
+export function resetEnrollmentLineages() {
+  enrollmentLineages.clear();
+}
 
 // Contract P2c-3a: the wait before retry `step` (0 is the first retry). The
 // base doubles from firstMs to capMs and is multiplied by a factor in
@@ -584,6 +644,17 @@ export class OpenClawRoomRuntime {
     this.reconnectInitialMs = RECONNECT_FIRST_MS;
     this.reconnectMaxMs = RECONNECT_CAP_MS;
     this.heartbeatMinimumSeconds = 5;
+    // P8-1: when the Room last accepted this session, and the interval of a
+    // heartbeat answer that named one (else the registration's).
+    this.presenceAcceptedAt = 0;
+    this.instructedHeartbeatSeconds = undefined;
+    // P8-2: a listing is owed after an accepted registration. P8-3: the
+    // credential is expired. P8-4: when the last idle frame was sent.
+    this.enrollmentOwed = false;
+    this.credentialExpired = false;
+    this.idleFrameAt = 0;
+    // P8-2: the listing interval when the Room names none (pollAfterSeconds).
+    this.enrollmentListingIntervalMs = ENROLLMENT_LISTING_INTERVAL_MS;
     // P2c-3b: when an inactive membership's Room state was last read (0: active).
     this.inactiveRecheckMs = INACTIVE_RECHECK_MS;
     this.inactiveCheckedAt = 0;
@@ -655,6 +726,7 @@ export class OpenClawRoomRuntime {
           break;
         } catch (error) {
           if (!this.waitForRenewal || !(error instanceof RoomAPIError) || error.code !== "credential_expired") throw error;
+          this.credentialExpired = true;
           // Keep this enabled account's renewal-only maintenance alive even if
           // the host would otherwise exhaust its account restart budget. Never
           // infer expiry from generic auth failure, nor register a revoked base.
@@ -706,8 +778,84 @@ export class OpenClawRoomRuntime {
     await saveState(this.account.stateFile, this.state);
     rememberSecrets(this.state);
     this.reregister = false;
+    // Contract P8-1/P8-2: accepted now, its interval applies, a listing follows.
+    this.presenceAcceptedAt = Date.now();
+    this.instructedHeartbeatSeconds = undefined;
+    this.enrollmentOwed = true;
+    this.credentialExpired = false;
+    // P8-4: an idle frame follows every registration (the start sends it at once).
+    this.idleFrameAt = 0;
     this.reportStatus({connected: true, registered: true});
     return this.connectorSession;
+  }
+
+  // Contract P8-1: the instructed interval in ms, floored and capped.
+  instructedHeartbeatMs() {
+    const instructed = this.instructedHeartbeatSeconds ?? this.connectorSession?.heartbeatIntervalSeconds;
+    return Math.min(HEARTBEAT_MAXIMUM_SECONDS, Math.max(this.heartbeatMinimumSeconds, Number(instructed) || HEARTBEAT_DEFAULT_SECONDS)) * 1000;
+  }
+
+  // Contract P8-1: the heartbeat loop's cadence, with the existing margin.
+  heartbeatIntervalMs() {
+    return this.instructedHeartbeatMs() * HEARTBEAT_MARGIN;
+  }
+
+  // Contract P8-1: a long-poll return heartbeats only when none was accepted
+  // within the interval (or a registration is owed).
+  presenceDueOnRead() {
+    return this.reregister || !this.presenceAcceptedAt || Date.now() - this.presenceAcceptedAt >= this.instructedHeartbeatMs();
+  }
+
+  // Contract P8-3: once per 300 s while healthy, else the present cadence.
+  renewalIntentIntervalMs() {
+    return this.credentialExpired || credentialExpiresSoon(this.state?.credentialExpiresAt)
+      ? RENEWAL_INTENT_CHECK_MS : RENEWAL_INTENT_HEALTHY_MS;
+  }
+
+  // Contract P8-4: an idle frame is due (or an unconfirmed one is retried).
+  idleFrameDue() {
+    if (this.pendingPresence) return true;
+    const interval = idleActivityFrameIntervalMs();
+    return interval !== null && Date.now() - this.idleFrameAt >= interval;
+  }
+
+  // Contract P8-2: the listing schedule of this account's join lineage.
+  enrollmentLineage() {
+    const key = JSON.stringify([String(this.state?.baseUrl ?? ""), String(this.state?.clientInstanceId ?? "")]);
+    let lineage = enrollmentLineages.get(key);
+    if (!lineage) {
+      lineage = {dueAt: null, intervalMs: this.enrollmentListingIntervalMs, used: new Map(), members: new Map()};
+      enrollmentLineages.set(key, lineage);
+    }
+    return lineage;
+  }
+
+  // Contract P8-2: list now with this account? Directly after its accepted
+  // registration; otherwise once the lineage is due, with the account of the
+  // lineage that listed least recently among those seen at a heartbeat lately
+  // (a muted or stopped one is not seen), or with any once the due time passed
+  // by 60 s.
+  enrollmentListingDue(lineage) {
+    const now = Date.now();
+    lineage.members.set(this, now);
+    if (this.enrollmentOwed) {
+      this.enrollmentOwed = false;
+      return true;
+    }
+    if (lineage.dueAt === null) return true;
+    if (now < lineage.dueAt) return false;
+    const window = Math.max(lineage.intervalMs, HEARTBEAT_MAXIMUM_SECONDS * 1000) + 5_000;
+    let preferred = null;
+    let preferredKey = null;
+    for (const [member, seen] of lineage.members) {
+      if (now - seen > window) continue;
+      const key = [lineage.used.get(member) ?? -Infinity, String(member.account?.accountId ?? "")];
+      if (preferred === null || key[0] < preferredKey[0] || (key[0] === preferredKey[0] && key[1] < preferredKey[1])) {
+        preferred = member;
+        preferredKey = key;
+      }
+    }
+    return preferred === this || now - lineage.dueAt >= HEARTBEAT_MAXIMUM_SECONDS * 1000;
   }
 
   // Contract P2c-4: codes and times only, never a body or a secret.
@@ -744,7 +892,7 @@ export class OpenClawRoomRuntime {
         if (!this.isQuarantinedEvent(this.pendingEvent)) return false;
         this.pendingEvent = null;
       }
-      if (!this.state.credentialRotation && Date.now() - this.lastRenewalCheck < 30_000) return false;
+      if (!this.state.credentialRotation && Date.now() - this.lastRenewalCheck < this.renewalIntentIntervalMs()) return false;
       this.lastRenewalCheck = Date.now();
       const bounded = AbortSignal.timeout(15_000);
       const renewalSignal = signal ? AbortSignal.any([signal, bounded]) : bounded;
@@ -822,8 +970,9 @@ export class OpenClawRoomRuntime {
       }
       // Long-poll completion is an independent liveness clock. Maintaining
       // presence here prevents a failed timer task from leaving a locally
-      // green but remotely expired connector.
-      await this.maintainPresenceResilient(signal);
+      // green but remotely expired connector. Contract P8-1: no heartbeat while
+      // one was accepted within the interval.
+      await this.maintainPresenceResilient(signal, {heartbeat: this.presenceDueOnRead()});
       this.reportLedger();
       for (const event of page.events ?? []) {
         if (event.seq <= this.state.cursor) continue;
@@ -2209,7 +2358,8 @@ export class OpenClawRoomRuntime {
     if (!stateFile || !this.state) return;
     let records;
     try {
-      records = closuresFor(readRecords(journalPath(stateFile)), this.state.roomId, this.state.membershipId, this.state.clientInstanceId);
+      // Contract P8-6: read again only when the journal's identity changed.
+      records = closuresFor(readRecordsCached(journalPath(stateFile)), this.state.roomId, this.state.membershipId, this.state.clientInstanceId);
     } catch (error) {
       if (!this.journalUnreadableLogged) {
         this.journalUnreadableLogged = true;
@@ -2959,9 +3109,9 @@ export class OpenClawRoomRuntime {
     }
   }
 
-  async maintainPresenceResilient(signal) {
+  async maintainPresenceResilient(signal, options) {
     try {
-      await this.maintainPresence(signal);
+      await this.maintainPresence(signal, options);
     } catch (error) {
       if (signal?.aborted || this.closed || (error instanceof RoomAPIError && !error.retryable && !sessionLost(error))) throw error;
       // P2c-3a: a registration owed after a lost session is retried on the
@@ -2974,17 +3124,17 @@ export class OpenClawRoomRuntime {
   }
 
   runHeartbeat() {
-    const interval = Math.max(this.heartbeatMinimumSeconds, Number(this.connectorSession.heartbeatIntervalSeconds) || 15) * 800;
     const loop = async () => {
       // P2c-3a: a failed heartbeat is retried on the schedule, not at the
-      // heartbeat interval; success resets it.
-      let delay = interval;
+      // heartbeat interval; success resets it. P8-1: the interval of the
+      // latest session answer, at most 60 s.
+      let delay = this.heartbeatIntervalMs();
       let step = 0;
       while (!this.closed && !this.heartbeatAbort.signal.aborted) {
         await backgroundSleep(delay, this.heartbeatAbort.signal);
         try {
           await this.maintainPresence(this.heartbeatAbort.signal);
-          delay = interval;
+          delay = this.heartbeatIntervalMs();
           step = 0;
         } catch (error) {
           if (this.closed || this.heartbeatAbort.signal.aborted) return;
@@ -3019,15 +3169,20 @@ export class OpenClawRoomRuntime {
     });
   }
 
-  async maintainPresence(signal) {
+  async maintainPresence(signal, {heartbeat = true} = {}) {
     return this.withBindingOperation(async () => {
       if (this.state.credentialRotation) return;
+      let registered = false;
       if (this.reregister) {
         this.logger?.info?.("Room registering its connector session again");
         await this.registerConnector(signal);
-      } else {
+        registered = true;
+      } else if (heartbeat) {
         try {
-          await this.client.heartbeat(this.state, this.connectorSession.sessionId, signal);
+          const answer = await this.client.heartbeat(this.state, this.connectorSession.sessionId, signal);
+          this.presenceAcceptedAt = Date.now();
+          // P8-1: a later session answer's interval takes effect.
+          if (answer?.heartbeatIntervalSeconds !== undefined) this.instructedHeartbeatSeconds = answer.heartbeatIntervalSeconds;
         } catch (error) {
           // P2c-3: the Room said in its JSON that it no longer holds this
           // session; register it again (until accepted, if this one fails).
@@ -3035,11 +3190,14 @@ export class OpenClawRoomRuntime {
           this.logger?.warn?.(`Room connector session lost${roomErrorDiagnostic(error)}; registering again`);
           this.reregister = true;
           await this.registerConnector(signal);
+          registered = true;
         }
         this.reportStatus({connected: true});
       }
+      // P8-2: the listing has its own schedule; P8-4: an idle frame after a
+      // registration, else at most once per idleActivityFrameIntervalMs().
       await this.acceptConnectorEnrollments(signal);
-      await this.publishPresence(signal);
+      if (registered || this.idleFrameDue()) await this.publishPresence(signal);
     });
   }
 
@@ -3079,14 +3237,32 @@ export class OpenClawRoomRuntime {
   }
 
   async acceptConnectorEnrollments(signal) {
-    if (!await this.membershipActiveForEnrollments(signal)) return [];
+    const lineage = this.enrollmentLineage();
+    if (!await this.membershipActiveForEnrollments(signal)) {
+      // P8-2: a muted account never lists for its lineage.
+      lineage.members.delete(this);
+      return [];
+    }
+    if (!this.enrollmentListingDue(lineage)) return [];
+    const listedAt = Date.now();
+    lineage.used.set(this, listedAt);
+    lineage.dueAt = listedAt + lineage.intervalMs;
     let pending;
     try {
-      pending = await this.client.connectorEnrollments(this.state, signal);
+      const listing = enrollmentListing(await this.client.connectorEnrollments(this.state, signal));
+      if (listing) {
+        lineage.intervalMs = listing.pollAfterMs ?? this.enrollmentListingIntervalMs;
+        lineage.dueAt = listedAt + lineage.intervalMs;
+      }
+      pending = listing?.enrollments ?? null;
     } catch (error) {
       // This additive route may be absent during a rolling server upgrade.
       // Enrollment discovery must never turn a healthy Room heartbeat red.
       if (error instanceof RoomAPIError && error.code === "connector_not_active") {
+        // P8-2: this account's answer; the lineage stays due, and another of
+        // its accounts lists at its next heartbeat.
+        lineage.members.delete(this);
+        lineage.dueAt = listedAt;
         if (await this.ownMembershipStatus(signal) === "muted") {
           // P2c-3b: a muted membership is inactive, not a lost session: no
           // registration, no listing, a slow re-check of the Room state.
@@ -3166,6 +3342,7 @@ export class OpenClawRoomRuntime {
       streamSeq: this.presenceStreamSeq + 1,
     };
     this.pendingPresence = activity;
+    this.idleFrameAt = Date.now();
     try {
       const receipt = await this.client.publishActivity(this.state, activity, signal);
       this.presenceStreamSeq = acceptedActivitySequence(receipt, activity.streamSeq);
@@ -3247,6 +3424,8 @@ export class OpenClawRoomRuntime {
 
   async close() {
     this.closed = true;
+    // P8-2: a closed account no longer lists for its lineage.
+    if (this.state) this.enrollmentLineage().members.delete(this);
     // Stop every renewal before aborting, so an aborted claim is not read as lost authority.
     const stopping = [...this.attemptLeases.keys()].map((sourceEventId) => this.stopAttemptLease(sourceEventId));
     this.heartbeatAbort.abort();

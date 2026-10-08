@@ -274,6 +274,7 @@ test("P7a-05 a muted membership is inactive, not retried on the seconds schedule
   // again every 3 to 16 s.
   const directory = await mkdtemp(join(home, "status-"));
   const path = join(directory, "status.json");
+  runtimeModule.resetEnrollmentLineages?.(); // Contract P8-2: a fresh lineage schedule
   const runtime = roomRuntime([message(41, "x")]);
   delete runtime.maintainPresence;
   runtime.publishPresence = async () => {};

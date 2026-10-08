@@ -1,4 +1,4 @@
-import {existsSync, readFileSync, readdirSync, lstatSync} from "node:fs";
+import {existsSync, readFileSync, readdirSync, lstatSync, statSync} from "node:fs";
 import {join} from "node:path";
 import {defaultStateDirectory, validateState} from "./state.js";
 import {accountCandidates, resolveAccountConfig, resolveAccountSelection, selectUniqueAccountIds} from "./account.js";
@@ -13,15 +13,47 @@ function managedAccounts() {
   } catch { return []; }
 }
 
+// Contract P8-6: an account state file is parsed again only when its identity
+// changed (size, modification time in ns, inode, device, mode; every write of
+// this plugin replaces the file). The presence fallback asks every 10 s.
+const parsedStates = new Map();
+
+function identityOf(stat) {
+  return `${stat.size}:${stat.mtimeNs}:${stat.ino}:${stat.dev}:${stat.mode}`;
+}
+
+function cachedParse(path, stat, parse) {
+  const identity = identityOf(stat);
+  const key = `${parse.name}:${path}`;
+  const cached = parsedStates.get(key);
+  if (cached?.identity === identity) return cached.value;
+  const value = parse(path);
+  parsedStates.set(key, {identity, value});
+  return value;
+}
+
+function parseManaged(path) {
+  try {
+    const state = JSON.parse(readFileSync(path, "utf8"));
+    validateState(state);
+    return {baseUrl: state.baseUrl};
+  } catch { return null; }
+}
+
+function parseRevoked(path) {
+  try {
+    return JSON.parse(readFileSync(path, "utf8"))?.revoked === true;
+  } catch { return false; }
+}
+
 function managedAccount(accountId) {
   const stateFile = join(defaultStateDirectory(), `${accountId}.json`);
   if (!existsSync(stateFile)) return null;
   try {
-    const stat = lstatSync(stateFile);
-    if (!stat.isFile() || stat.isSymbolicLink() || (stat.mode & 0o077) !== 0) return null;
-    const state = JSON.parse(readFileSync(stateFile, "utf8"));
-    validateState(state);
-    return {baseUrl: state.baseUrl, stateFile};
+    const stat = lstatSync(stateFile, {bigint: true});
+    if (!stat.isFile() || stat.isSymbolicLink() || (stat.mode & 0o077n) !== 0n) return null;
+    const managed = cachedParse(stateFile, stat, parseManaged);
+    return managed ? {baseUrl: managed.baseUrl, stateFile} : null;
   } catch { return null; }
 }
 
@@ -31,7 +63,7 @@ function managedAccount(accountId) {
 function stateRetired(stateFile) {
   if (!stateFile || !existsSync(stateFile)) return false;
   try {
-    return JSON.parse(readFileSync(stateFile, "utf8"))?.revoked === true;
+    return cachedParse(stateFile, statSync(stateFile, {bigint: true}), parseRevoked);
   } catch { return false; }
 }
 

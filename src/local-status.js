@@ -17,6 +17,15 @@ export const WEB_READ_TOOL_NAMES = Object.freeze(["browser", "browser_navigate",
 // Contract P2c-4 (ISSUE-023): why a dispatch waited on the host.
 export const GATE_WAIT_REASONS = new Set(["", "host_run_busy", "host_session_unobservable", "held_by_moderator"]);
 const CODE = /^[A-Za-z0-9_.:-]{1,64}$/;
+// Contract P8-5: a change of lastConnectedAt alone is written at most this
+// often per installation; every other change is written at once.
+export const CONNECTED_AT_WRITE_MS = 60_000;
+
+function timer(milliseconds, callback) {
+  const handle = setTimeout(callback, Math.max(0, milliseconds));
+  handle.unref?.();
+  return () => clearTimeout(handle);
+}
 
 function now() {
   return new Date().toISOString().replace(/\.\d{3}Z$/, "Z");
@@ -29,10 +38,16 @@ function code(value) {
 }
 
 export class LocalStatus {
-  constructor(path, {plugin = "openclaw", version, hostLabel, logger} = {}) {
+  constructor(path, {plugin = "openclaw", version, hostLabel, logger, clock = () => Date.now(), schedule = timer} = {}) {
     this.path = path;
     this.logger = logger;
     this.failed = false;
+    // Contract P8-5: when the file was last written, and the pending write of
+    // a lastConnectedAt-only change (its cancel function).
+    this.clock = clock;
+    this.schedule = schedule;
+    this.writtenAt = null;
+    this.pendingCancel = null;
     this.data = {
       schema: STATUS_SCHEMA,
       plugin,
@@ -116,7 +131,8 @@ export class LocalStatus {
       quarantinedSeqs: [],
       ledgerCode: "",
     };
-    const before = JSON.stringify(entry);
+    const before = JSON.stringify({...entry, lastConnectedAt: null});
+    const connectedBefore = entry.lastConnectedAt;
     if (membershipId) entry.membershipId = String(membershipId);
     const key = String(roomId);
     // Contract P2c-4: `connection` is the connection's own state, with
@@ -161,10 +177,32 @@ export class LocalStatus {
       entry.lastGateWaitAt = now();
       entry.lastGateWaitReason = GATE_WAIT_REASONS.has(gateWaitReason) ? gateWaitReason : "";
     }
-    if (JSON.stringify(entry) !== before) this.write();
+    if (JSON.stringify({...entry, lastConnectedAt: null}) !== before) this.write();
+    else if (entry.lastConnectedAt !== connectedBefore) this.writeConnectedAt();
+  }
+
+  // Contract P8-5: a lastConnectedAt-only change, at most once per 60 s.
+  writeConnectedAt() {
+    if (this.pendingCancel) return; // already due; that write carries the newest value
+    const wait = this.writtenAt === null ? 0 : CONNECTED_AT_WRITE_MS - (this.clock() - this.writtenAt);
+    if (wait > 0) {
+      this.pendingCancel = this.schedule(wait, () => {
+        if (!this.pendingCancel) return;
+        this.pendingCancel = null;
+        // A deferred time alone never creates the directory again.
+        if (existsSync(dirname(this.path))) this.write();
+      });
+      return;
+    }
+    this.write();
   }
 
   write() {
+    // Contract P8-5: this write carries every pending value.
+    this.writtenAt = this.clock();
+    const cancel = this.pendingCancel;
+    this.pendingCancel = null;
+    try { cancel?.(); } catch {}
     this.data.updatedAt = now();
     const payload = `${JSON.stringify(this.data, null, 2)}\n`;
     const directory = dirname(this.path);
