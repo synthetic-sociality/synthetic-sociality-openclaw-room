@@ -4,7 +4,7 @@ import test from "node:test";
 import {mkdtemp, readFile, writeFile} from "node:fs/promises";
 import {tmpdir} from "node:os";
 import {join} from "node:path";
-import {ARTIFACT_CONTEXT_CHARACTER_LIMIT, HANDOVER_CONTEXT_CHARACTER_LIMIT, HOST_LABEL, canonicalRoomContext, commandInstruction, discussionHandoverContext, sourceArtifactContext, cyclePhaseInstruction, epochConversationId, epochEvidence, eventEpochId, isAssignedEvent, isAssignedMessage, isBoundaryEvent, isLifecycleOnlyCycleTerminal, normalizeEvent, OpenClawRoomRuntime, resolveStandaloneRecipientSelectors, validateActiveEpochPage} from "../src/runtime.js";
+import {ARTIFACT_CONTEXT_CHARACTER_LIMIT, HANDOVER_CONTEXT_CHARACTER_LIMIT, HOST_LABEL, canonicalRoomContext, commandInstruction, discussionHandoverContext, sourceArtifactContext, cyclePhaseInstruction, epochConversationId, epochEvidence, eventEpochId, isAssignedEvent, isAssignedMessage, isBoundaryEvent, isLifecycleOnlyCycleTerminal, normalizeEvent, OpenClawRoomRuntime, resetEnrollmentLineages, resolveStandaloneRecipientSelectors, validateActiveEpochPage} from "../src/runtime.js";
 import {RoomAPIError} from "../src/room-client.js";
 import {loadState, saveState, validateState} from "../src/state.js";
 // Runtimes in this file get a private scratch state file: a runtime may write
@@ -233,10 +233,16 @@ test("persists an owner-approved Room before hot activation without a gateway re
     },
   );
   runtime.state = sourceState;
+  // Contract P8-2: the listing schedule of a join lineage is process-wide, and
+  // an earlier test of this file listed for the same base URL and
+  // clientInstanceId. A fresh schedule: this is the lineage's first listing.
+  resetEnrollmentLineages();
+  let listings = 0;
   runtime.client = {
     connectorEnrollments: async (state) => {
       assert.equal(state.clientInstanceId, "client-1");
-      return [{invitationId: "invite-2", roomTitle: "WAM GGF3"}];
+      listings += 1;
+      return listings === 1 ? [{invitationId: "invite-2", roomTitle: "WAM GGF3"}] : [];
     },
     claimConnectorEnrollment: async (state, invitationId) => {
       assert.equal(state.clientInstanceId, "client-1");
@@ -257,6 +263,13 @@ test("persists an owner-approved Room before hot activation without a gateway re
   assert.equal(activations[0].persisted.credential, "secret-2");
   assert.equal(activations[0].persisted.clientInstanceId, "client-1");
   assert.equal(activations[0].persisted.cursor, 7);
+  // Contract P8-2: no second listing within the interval; directly after an
+  // accepted registration the account lists again, whatever the schedule.
+  assert.deepEqual(await runtime.acceptConnectorEnrollments(), []);
+  assert.equal(listings, 1);
+  runtime.enrollmentOwed = true; // what registerConnector sets
+  assert.deepEqual(await runtime.acceptConnectorEnrollments(), []);
+  assert.equal(listings, 2);
 });
 
 test("verified build provenance stays embedded without violating strict registration metadata", async () => {
