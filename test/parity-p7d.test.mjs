@@ -207,7 +207,7 @@ beforeEach(() => {
 
 test("conformance P7d case names resolve to tests in this suite; constants pinned", async () => {
   const cases = Object.entries(conformance.parityP7dCases ?? {});
-  assert.equal(cases.length, 28);
+  assert.equal(cases.length, 29);
   const source = await readFile(new URL(import.meta.url), "utf8");
   for (const [key, name] of cases) {
     assert.ok(name.startsWith(`${key} `), name);
@@ -1214,6 +1214,30 @@ test("P7d-28 a recorded host session is never overwritten by a run whose session
   assert.ok((await known.turn()).includes(PROOF_TEXT.trim()));
   assert.ok(!(await known.turn()).includes(PROOF_TEXT.slice(0, 200)));
   assert.deepEqual(known.memory, {epochId: "epoch-z", hostSession: "S2", given: ["brief/v1"]});
+});
+
+test("P7d-29 a document tool deferred behind the host's tool search is available", async () => {
+  // OpenClaw cannot see a host's deferral: the value is unknown, which counts
+  // as offered (the reference line names the tool); a read the host executes
+  // for the agent through its tool search makes it available.
+  const room = new Room({long: record("long", {v1: ["ready", LARGE_TEXT]})}, [], {documentsList: [entry("long")]});
+  const size = codePointLength(LARGE_TEXT);
+  assert.equal(documents.documentToolState(), "unknown");
+  const before = documentBlock(await new Discussion(room).turn());
+  assert.ok(before.endsWith(`${reference("long.md", "long", "v1", size, {given: false})}\n\n${FOOTER}`));
+  const made = [];
+  let noted = 0;
+  registerRoomDocumentTool({registerTool: (factory) => made.push(factory)}, {makeClient: () => room.client(),
+    sessions: async () => [{accountId: "t", roomId: "room-1", credential: "c", baseUrl: room.baseUrl, agentId: "main"}],
+    onAvailable: () => { noted += 1; }});
+  const tool = made[0]({agentId: "main", sessionKey: sessionKeyFor("epoch-z"), sessionId: "s"});
+  assert.equal((await tool.execute("c", {artifactId: "long", fromLine: 1, toLine: 2})).details.success, true);
+  assert.deepEqual([noted, documents.documentToolState()], [1, "available"]);
+  const discussion = new Discussion(room);
+  for (let turn = 0; turn < 2; turn += 1) {
+    assert.equal(documentBlock(await discussion.turn()), [documents.DOCUMENT_CONTEXT_HEADER,
+      reference("long.md", "long", "v1", size, {given: false}), FOOTER].join("\n\n"));
+  }
 });
 
 test("P7d round 3 (OpenClaw): account ids compare in the host's normalised form; an account whose agent cannot be resolved is offered to nobody; distinct answers without a selectable account", async () => {

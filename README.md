@@ -27,6 +27,13 @@ labels it as untrusted uploaded content, and never downloads or executes raw
 document bytes. An exact artifact read also invokes the Room server's supported
 deterministic text backfill for older pending versions.
 
+Version 0.2.68 is parity release P7e with Hermes 1.0.85: contract P7d-6 now
+says that a document tool the host defers behind its own tool search (the host
+still executes a call to it) counts as offered (shared case P7d-29). OpenClaw
+cannot see such a deferral; its value stays `unknown`, which already counts as
+offered, until a document read of a Room session succeeds. No source change
+beyond the version.
+
 Version 0.2.67 is parity release P7d with Hermes 1.0.84 ("Discussion
 documents: once in full, then on demand", contract section P7d, shared cases
 P7d-01 to P7d-28, the `documentTool` row of the P2c-4 status table), for a Room
