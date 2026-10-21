@@ -964,7 +964,7 @@ test("L1-15 a message_too_large refusal is terminal in open and coordinated Room
     }, mode);
     const completions = runtime.client.calls.filter(([kind]) => kind === "complete").map(([, , body]) => body);
     assert.deepEqual(completions, mode === "coordinated"
-      ? [{generation: 3, action: "fail", executionFailure: {layer: "runtime", code: "response_too_large"}}] : [], mode);
+      ? [{generation: 3, action: "fail", executionFailure: {layer: "runtime", code: "response_too_large", remediationHint: "The response exceeded the Room's message size limit. Retry with a shorter response."}}] : [], mode);
     // Kept under P2c-2 with the Room's byte ceiling, never a word count.
     assert.equal(runtime.state.keptReply.reason, "message_too_large (limit 16 bytes)", mode);
     assert.equal(runtime.state.keptReply.text, BODY, mode);

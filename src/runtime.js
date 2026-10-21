@@ -155,7 +155,7 @@ export const DEFAULT_EXECUTION_FAILURE = Object.freeze({layer: "runtime", code: 
 // readiness for this code on the agent's next canonical contribution.
 export const RELEASED_ATTEMPT_EXECUTION_FAILURE = Object.freeze({layer: "infrastructure", code: "attempt_timeout"});
 export const OPERATIONAL_FALLBACK_EXECUTION_FAILURE = Object.freeze({layer: "runtime", code: "gateway_operational_error"});
-const RESPONSE_TOO_LARGE_EXECUTION_FAILURE = Object.freeze({layer: "runtime", code: "response_too_large"});
+const RESPONSE_TOO_LARGE_EXECUTION_FAILURE = Object.freeze({layer: "runtime", code: "response_too_large", remediationHint: "The response exceeded the Room's message size limit. Retry with a shorter response."});
 
 // Contract L1-12: the P2c-2 reason line names the Room's byte ceiling
 // (serverLimits.messageMaxBytes from the room state) only when the refused
@@ -2441,17 +2441,18 @@ export class OpenClawRoomRuntime {
     });
   }
 
-  async postAndFinishOnce({roomId, text, replyToId, idempotencyKey, signal, sourceEventId, sourceEpochId = "", cycleAttempt = null, resolveRecipientMentions = false, contributionType}) {
+  async postAndFinishOnce({roomId, text, replyToId, idempotencyKey, signal, sourceEventId, sourceEpochId = "", cycleAttempt = null, resolveRecipientMentions = false, contributionType, literal = false}) {
     if (roomId !== this.state.roomId) throw new Error("Outbound Room does not match connector membership");
     const originalRaw = String(text ?? "").trim();
     // Recovery supplies the already-frozen body; never parse it as new output.
     const previousIdentity = this.state.deliveryIntents?.[String(idempotencyKey ?? "").trim()]?.identity;
     const legacyBodyReplay = contributionType === undefined && previousIdentity
       && previousIdentity.contributionType === undefined && previousIdentity.body === originalRaw;
-    const output = legacyBodyReplay ? {body: originalRaw, contributionType: "claim", explicit: false}
+    const output = legacyBodyReplay || literal ? {body: originalRaw, contributionType: "claim", explicit: false}
       : contributionType === undefined ? contributionOutput(text)
       : {body: originalRaw, contributionType, explicit: true};
     if (contributionType !== undefined && !["claim", "question", "response"].includes(contributionType)) throw new Error("Invalid Room contributionType");
+    if (output.skipped) return {skipped: true, reason: "model_skip"};
     const raw = output.body;
     const marker = parseReplyMarker(raw);
     let body = marker.body.trim();
@@ -3819,6 +3820,8 @@ export const ROOM_HISTORY_INSTRUCTION = "Earlier discussions and the library tex
 // Delivery contract P1a-3: how to pass, technically, without advice on when.
 export const ROOM_PASS_ENVELOPE = "Pass envelope: a reply of exactly NO_REPLY posts nothing to the Room; for a discussion attempt the connector then reports pass.";
 
+export const ROOM_CONTRIBUTION_FORMAT = "Contribution format: plain natural text without an envelope is posted as claim; to mark a type, return {\"action\":\"contribute\",\"body\":\"…\",\"contributionType\":\"claim|question|response\"}.";
+
 // Delivery contract P1a-2: Room-supplied text is passed verbatim, labelled with its source.
 function roomSupplied(label, text) {
   const value = String(text ?? "").trim();
@@ -3883,6 +3886,7 @@ export function roomTurnFacts({phase = "", cycleAttempt = null, policyWordLimit 
   // Contract P2a-3: missed sources as facts only.
   for (const line of Array.isArray(missed) ? missed : []) if (line) lines.push(line);
   lines.push(ROOM_PASS_ENVELOPE);
+  lines.push(ROOM_CONTRIBUTION_FORMAT);
   return ["[Room turn facts]", ...lines, "[/Room turn facts]"].join("\n");
 }
 

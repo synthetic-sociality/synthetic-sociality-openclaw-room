@@ -8,7 +8,7 @@ import {readFile} from "node:fs/promises";
 import {registerHooks} from "node:module";
 import {
   OPEN_EXCHANGE_PREAMBLE_SHA256, OPEN_EXCHANGE_PREAMBLE_VERSION, OpenClawRoomRuntime, REPLY_MARKER_GUIDANCE,
-  CONTEXT_CHARACTER_LIMIT, ROOM_HISTORY_INSTRUCTION, ROOM_NO_SYSTEM_STATUS_INSTRUCTION, ROOM_PASS_ENVELOPE, canonicalRoomContext, discussionHandoverContext, discussionStartInput, libraryCatalogContext,
+  CONTEXT_CHARACTER_LIMIT, ROOM_CONTRIBUTION_FORMAT, ROOM_HISTORY_INSTRUCTION, ROOM_NO_SYSTEM_STATUS_INSTRUCTION, ROOM_PASS_ENVELOPE, canonicalRoomContext, discussionHandoverContext, discussionStartInput, libraryCatalogContext,
   normalizeEvent, scanCycleSourceMessage, sourceArtifactContext,
 } from "../src/runtime.js";
 import {registerRoomCommands} from "../src/commands.js";
@@ -176,6 +176,7 @@ test("P1a-03 without Room instructions only procedural facts are present", () =>
     /^Discussion phase: [a-z_]+(; round \d+(; turn \d+ of \d+; turns remaining after this one: \d+)?)?$/,
     /^At most \d+ words per response \(Room policy maxContributionWords(, as frozen for this discussion cycle)?\); there is no minimum\.$/,
     new RegExp(`^${ROOM_NO_SYSTEM_STATUS_INSTRUCTION.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`),
+    new RegExp(`^${ROOM_CONTRIBUTION_FORMAT.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`),
     new RegExp(`^${ROOM_PASS_ENVELOPE.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`),
     new RegExp(`^${ROOM_HISTORY_INSTRUCTION.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`),
   ];
@@ -203,6 +204,7 @@ test("P1a-03 without Room instructions only procedural facts are present", () =>
 });
 
 test("P1a-04 pass envelope documented technically without usage advice", () => {
+  for (const prompt of Object.values(promptKinds())) assert.ok(prompt.includes(ROOM_CONTRIBUTION_FORMAT));
   assert.equal(ROOM_PASS_ENVELOPE, "Pass envelope: a reply of exactly NO_REPLY posts nothing to the Room; for a discussion attempt the connector then reports pass.");
   assert.deepEqual(denied(ROOM_PASS_ENVELOPE), []);
   assert.doesNotMatch(ROOM_PASS_ENVELOPE, /\b(when|if|should|unless|instead|prefer|better|consider|nothing to add|valid)\b/i);
@@ -345,7 +347,7 @@ test("P1a-07 host fallback notice is never posted; the model reply is", async ()
   // The canary sequence (addendum 2): the host's fallback notice, then the model's answer.
   const NOTICE = "↪️ Model Fallback: openrouter/deepseek/deepseek-v4-flash (selected xai/grok-4.7; format)";
   const REPLY = "↪ #976 TJE — the unresolved thread that sticks with me is the model's own answer.";
-  async function runTurn(deliveries, {cycleAttempt = null} = {}) {
+  async function runTurn(deliveries, {cycleAttempt = null, modelBoundary = false} = {}) {
     const calls = {posted: [], settled: [], skipped: [], ack: [], logs: [], results: []};
     const event = {id: "src-1", sourceEventId: "src-1", respondsToId: "src-1", roomId: "room-1", epochId: "epoch-1", conversationId: "c",
       senderId: "h", senderName: "TJ", senderKind: "human", text: "t", occurredAt: 1, raw: {}, ...(cycleAttempt ? {cycleAttempt} : {})};
@@ -353,7 +355,13 @@ test("P1a-07 host fallback notice is never posted; the model reply is", async ()
       initialize: async () => ({sessionId: "s"}),
       assignedTurns: async function* () { yield event; },
       markTurnReading: async () => {},
-      postAndFinish: async ({text}) => { calls.posted.push(text); return {eventId: `posted-${calls.posted.length}`, sentAt: 1}; },
+      postAndFinish: async ({text}) => {
+        if (modelBoundary) {
+          const boundary = new OpenClawRoomRuntime({accountId:"fixture",stateFile:UNUSED_STATE_FILE});
+          boundary.state = {roomId:"room-1"};
+          return boundary.postAndFinish({roomId:"room-1",text,idempotencyKey:"matrix"});
+        }
+        calls.posted.push(text); return {eventId: `posted-${calls.posted.length}`, sentAt: 1}; },
       settleDiscussionAttempt: async (_attempt, action) => calls.settled.push(action),
       recordSkipped: async (eventId, reason) => calls.skipped.push([eventId, reason]),
       ack: async (eventId) => calls.ack.push(eventId),
@@ -377,6 +385,14 @@ test("P1a-07 host fallback notice is never posted; the model reply is", async ()
       log: Object.fromEntries(["info", "warn", "error"].map((level) => [level, (line) => calls.logs.push(line)])),
     });
     return calls;
+  }
+
+  const matrix = JSON.parse(await readFile(new URL("./fixtures/issue-106.json",import.meta.url),"utf8"));
+  for (const item of matrix.matrix.filter((item)=>item.outcome === "pass")) {
+    const calls = await runTurn([[{text:item.raw},"final"]], {modelBoundary:true,cycleAttempt:{cycle:{id:"c",generation:1},attempt:{id:"a"}}});
+    assert.deepEqual(calls.settled,["pass"],`I106-10 input ${item.input}`);
+    assert.deepEqual(calls.posted,[]);
+    assert.deepEqual(calls.ack,["src-1"]);
   }
 
   // The incident: notice first, then the model's answer. Only the answer is posted.

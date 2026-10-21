@@ -186,6 +186,7 @@ export function createRoomChannel({makeClient}) {
         const sent = await entry.client.postAndFinish({
           roomId: ctx.to,
           text: ctx.text,
+          literal: true,
           replyToId: ctx.replyToId,
           idempotencyKey: outboundIdempotencyKey(ctx.deliveryQueueId),
           resolveRecipientMentions: true,

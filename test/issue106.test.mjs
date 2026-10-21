@@ -106,3 +106,65 @@ test("I106-06 legacy envelope prose and I106-05 nested envelope body survive res
     }
   } finally {await rm(dir,{recursive:true,force:true});}
 });
+
+// Repair round: shared prompt, matrix and external-path boundary cases.
+test("I106-09 shared procedural format is emitted by the prompt builder", async () => {
+  const {roomTurnFacts}=await import("../src/runtime.js");
+  const manifest=JSON.parse(await readFile(new URL("../conformance.json",import.meta.url)));
+  assert.equal(manifest.issue106Cases.formatSentence,fixture.formatSentence);
+  assert.ok(roomTurnFacts().includes(fixture.formatSentence));
+});
+test("I106-10 shared 28-input model-output matrix", async () => {
+  const {contributionOutput}=await import("../src/contribution.js");
+  for (const item of fixture.matrix) {
+    const posts=[],runtime=harness("unused",state(),posts);
+    if (item.outcome === "fail") {
+      assert.throws(()=>contributionOutput(item.raw), /Invalid Room contribution/, `input ${item.input}`);
+    } else if (item.outcome === "pass") {
+      const result=await runtime.postAndFinish({roomId:"room",text:item.raw,idempotencyKey:"matrix"});
+      assert.equal(result.skipped,true,`input ${item.input}`);
+      assert.equal(posts.length,0);
+      assert.deepEqual(runtime.state.deliveryIntents,{});
+    } else {
+      const parsed=contributionOutput(item.raw);
+      assert.equal(parsed.body,item.body,`input ${item.input}`);
+      assert.equal(parsed.contributionType,item.type,`input ${item.input}`);
+    }
+  }
+});
+test("I106-11 external literal envelope and old external identity survive retry", async () => {
+  const dir=await mkdtemp(join(tmpdir(),"issue106-external-"));
+  try {
+    for (const legacy of [false,true]) {
+      const file=join(dir,`${legacy}.json`),posts=[];
+      const runtime=harness(file,state(),posts,true);
+      const request={roomId:"room",text:fixture.externalText,idempotencyKey:"external",literal:true};
+      await assert.rejects(runtime.postAndFinish(request),/ambiguous/);
+      assert.equal(posts[0].body,fixture.externalText);
+      assert.equal(posts[0].contributionType,"claim");
+      const saved=await loadState(file),intent=saved.deliveryIntents.external;
+      if (legacy) {
+        delete intent.identity.contributionType;
+        intent.identity.recipientSelectors=[{kind:"membership",membershipId:"peer"}];
+        intent.post.recipientSelectors=structuredClone(intent.identity.recipientSelectors);
+        intent.post.contributionType="question";
+      }
+      const frozen=structuredClone(intent.post);
+      await saveState(file,saved);
+      const restarted=harness(file,await loadState(file),posts);
+      await restarted.postAndFinish(request);
+      assert.deepEqual(posts.at(-1),frozen);
+    }
+    const channel=await readFile(new URL("../src/channel.js",import.meta.url),"utf8");
+    assert.match(channel.split('text: async (ctx) =>')[1].split('// The epoch-path')[0],/literal: true/);
+  } finally {await rm(dir,{recursive:true,force:true});}
+});
+test("P2-2 size refusal releases the attempt with the shared remediation hint", async () => {
+  const runtime=harness("unused",state(),[]),settled=[];
+  runtime.persistState=async () => {};
+  runtime.releaseAttempt=async (attempt,failure) => settled.push({attempt,failure});
+  const attempt={cycle:{id:"cycle",generation:1},attempt:{id:"attempt"}};
+  const intent={identity:{body:"large response",sourceEventId:"",cycle:null}};
+  assert.deepEqual(await runtime.refuseTooLarge(intent,Error("too large"),attempt),{refused:true,reason:"message_too_large"});
+  assert.deepEqual(settled,[{attempt,failure:{layer:"runtime",code:"response_too_large",remediationHint:"The response exceeded the Room's message size limit. Retry with a shorter response."}}]);
+});
