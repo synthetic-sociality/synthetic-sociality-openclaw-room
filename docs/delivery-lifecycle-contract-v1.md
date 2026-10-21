@@ -54,7 +54,7 @@ canonical_event = {id, seq, ts}
 
 - A complete canonical receipt tied to the same binding is sufficient to promote legacy delivery to `posted` without a post.
 - A complete frozen request with no receipt remains replayable only through its original idempotency key.
-- Hermes 1.0.35 post-commit recovery is allowed only for the exact audited signature: source sequence ahead of acknowledgement, inbox quarantined, selected post and frozen request present, `cycle_conflict`, matching binding and cycle owner, no terminal evidence, and no local receipt. Recovery replays the frozen post solely to reconstruct the canonical receipt.
+- Hermes 1.0.35 post-commit recovery can recognize only the exact audited signature: source sequence ahead of acknowledgement, inbox quarantined, selected post and frozen request present, `cycle_conflict`, matching binding and cycle owner, no terminal evidence, and no local receipt. Such recovery replays the frozen post solely to reconstruct the canonical receipt. **2026-09-11 correction:** recognition is not consent; ordinary receive/reconnect and credential renewal must not invoke recovery on a quarantined source. Reopening requires a separate explicit, audited recovery action.
 - All near-miss legacy states remain quarantined.
 
 ## Conformance fixtures
@@ -71,6 +71,17 @@ canonical_event = {id, seq, ts}
 | `DLV1-08` | Lifecycle error is non-retryable or durable attempt budget is exhausted | Delivery remains `posted`; lifecycle becomes `blocked`; repeated automatic repair performs zero additional calls |
 
 Artifact promotion requires these fixture IDs, equivalent state snapshots, complete tests, immutable source commits, reproducible artifact digests, and zero skipped conformance rows for both Hermes and OpenClaw.
+
+## Definitive response rejection — 22 September 2026
+
+The existing completion owner preserves an authenticated `message_too_large`
+rejection as `executionFailure` with layer `runtime`, code `response_too_large`,
+and a bounded human-readable remediation hint. It must not report a successful
+model generation as a provider failure. Completion remains source- and
+dispatch-generation-bound across awaits; a newer dispatch or canonical posted
+receipt cannot be downgraded. A lost or ambiguous delivery result remains with
+its existing reconciliation owner. No deadline, word limit, credential, health,
+or replay authority changes. Only an explicit authorized retry starts new work.
 
 ## P1 — Refusal, attempt authority and failure reporting (2026-10-01)
 
@@ -946,3 +957,21 @@ account state files in the presence fallback's reconcile and the account resolut
 another process (the CLI, the recovery tool, a `hermes room` or `openclaw` command) changes the identity and is read at
 the next tick. The durability rules for changed state are untouched (fsync, atomic replace, journals and locks as
 before): a write that carries a cursor, acknowledgement, intent, quarantine or rotation journal change is never skipped.
+
+## ISSUE-106 — Author-selected contribution classification
+
+The author may supply `contributionType` in a JSON output envelope
+`{"action":"contribute","body":"...","contributionType":"response"}` (plain or fenced).
+For new output the optional field accepts `claim`, `question`, or literal `response`;
+when omitted it defaults to `claim`, independently of prose, punctuation and recipients.
+Unsupported values are rejected before posting. Both connectors expose the same envelope.
+They preserve the selected type through selection, frozen identity, serialization,
+canonical receipt, retry and restart. A delivery key cannot change its frozen type.
+Legacy selected or frozen requests without the new classification field retain their
+original question/claim derivation; existing frozen requests are never reclassified.
+Directed posts accept these three types. Recipient validation, policy budgets,
+scheduling and automatic next-peer routing remain unchanged. Other protocol types
+remain available on the public message API under its existing rules.
+Moderator response instructions belong to the Room and pass through unchanged.
+Named delegation in those instructions is advisory prose, not a directed-turn request;
+an optional interim summary stays inside the same response turn.

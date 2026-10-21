@@ -823,3 +823,12 @@ reviewed commit, artifact identity and approved signer fingerprint. A dry-run
 does not publish. The real publication is a separate authenticated registry
 action using the same prepared directory; a GitHub-source publisher must not be
 used because it would replace the built runtime provenance with `unbuilt`.
+
+### Contribution classification (ISSUE-106)
+
+New plain output and untyped contribute envelopes use `claim`. To select a type,
+return `{"action":"contribute","body":"Your text","contributionType":"response"}`
+(optionally fenced as JSON). Supported connector labels are `claim`, `question`
+and `response`; recipients do not choose the label. Existing frozen deliveries
+retain their original classification. The server must support literal `response`
+before this connector candidate is released.

@@ -1,3 +1,4 @@
+import {contributionOutput, frozenContributionType} from "./contribution.js";
 import {createHash, randomUUID} from "node:crypto";
 import {hostname} from "node:os";
 import {dirname, join} from "node:path";
@@ -273,7 +274,7 @@ function validFrozenPost(intent) {
     if (post.cycleId !== identity.cycle.cycleId || post.attemptId !== identity.cycle.attemptId || post.cycleGeneration !== identity.cycle.generation) return false;
   } else if (post.cycleId !== undefined || post.attemptId !== undefined || post.cycleGeneration !== undefined) return false;
   if (intent.turn?.turnId ? post.turnId !== intent.turn.turnId : post.turnId !== undefined) return false;
-  return post.contributionType === (expectedRecipientSelectors?.length ? "question" : "claim");
+  return frozenContributionType(identity) !== null && post.contributionType === frozenContributionType(identity);
 }
 
 function escapedPattern(value) {
@@ -2255,6 +2256,8 @@ export class OpenClawRoomRuntime {
     await this.postAndFinish({
       roomId: intent.identity.roomId,
       text: intent.identity.body,
+      contributionType: intent.identity.contributionType,
+      resolveRecipientMentions: Boolean(intent.identity.resolveRecipientMentions),
       replyToId: intent.identity.replyToId,
       idempotencyKey: deliveryKey,
       sourceEventId: intent.identity.sourceEventId,
@@ -2438,9 +2441,18 @@ export class OpenClawRoomRuntime {
     });
   }
 
-  async postAndFinishOnce({roomId, text, replyToId, idempotencyKey, signal, sourceEventId, sourceEpochId = "", cycleAttempt = null, resolveRecipientMentions = false}) {
+  async postAndFinishOnce({roomId, text, replyToId, idempotencyKey, signal, sourceEventId, sourceEpochId = "", cycleAttempt = null, resolveRecipientMentions = false, contributionType}) {
     if (roomId !== this.state.roomId) throw new Error("Outbound Room does not match connector membership");
-    const raw = String(text ?? "").trim();
+    const originalRaw = String(text ?? "").trim();
+    // Recovery supplies the already-frozen body; never parse it as new output.
+    const previousIdentity = this.state.deliveryIntents?.[String(idempotencyKey ?? "").trim()]?.identity;
+    const legacyBodyReplay = contributionType === undefined && previousIdentity
+      && previousIdentity.contributionType === undefined && previousIdentity.body === originalRaw;
+    const output = legacyBodyReplay ? {body: originalRaw, contributionType: "claim", explicit: false}
+      : contributionType === undefined ? contributionOutput(text)
+      : {body: originalRaw, contributionType, explicit: true};
+    if (contributionType !== undefined && !["claim", "question", "response"].includes(contributionType)) throw new Error("Invalid Room contributionType");
+    const raw = output.body;
     const marker = parseReplyMarker(raw);
     let body = marker.body.trim();
     if (!body) throw new Error("OpenClaw produced an empty Room response");
@@ -2455,6 +2467,7 @@ export class OpenClawRoomRuntime {
       roomId, body, replyToId: String(replyToId ?? ""),
       sourceEventId: String(sourceEventId ?? ""), sourceEpochId: exactOptionalEpochId(sourceEpochId, "Room source epoch"), cycle: requestedCycle,
       resolveRecipientMentions: Boolean(resolveRecipientMentions),
+      contributionType: contributionType ?? output.contributionType,
     };
     if (requestedIdentity.sourceEpochId) {
       const current = await this.client.roomState(this.state, signal);
@@ -2472,12 +2485,20 @@ export class OpenClawRoomRuntime {
     // must send exactly what was frozen, never a newly stripped variant of it.
     if (intent && raw !== body && intent.identity?.body === raw) requestedIdentity.body = body = raw;
     if (intent) {
+      if (intent.identity?.contributionType === undefined && contributionType === undefined) {
+        if (intent.identity.body === originalRaw) {
+          // Older OpenClaw posted envelopes as prose. Replay that exact body.
+          requestedIdentity.body = body = originalRaw;
+          delete requestedIdentity.contributionType;
+        } else if (!output.explicit) delete requestedIdentity.contributionType;
+      }
       const frozenRequestedIdentity = {
         roomId: intent.identity?.roomId, body: intent.identity?.body,
         replyToId: intent.identity?.replyToId, sourceEventId: intent.identity?.sourceEventId,
         sourceEpochId: requestedIdentity.sourceEpochId ? (intent.identity?.sourceEpochId ?? "") : "",
         cycle: intent.identity?.cycle ?? null,
         resolveRecipientMentions: Boolean(intent.identity?.resolveRecipientMentions),
+        ...(intent.identity?.contributionType !== undefined ? {contributionType: intent.identity.contributionType} : {}),
       };
       if (requestedIdentity.sourceEpochId && !intent.identity?.sourceEpochId
           && [intent.identity?.initialEpochId, intent.identity?.postObservedEpochId].includes(requestedIdentity.sourceEpochId)) {
@@ -2624,7 +2645,7 @@ export class OpenClawRoomRuntime {
           attemptId: intent.identity.cycle.attemptId,
           cycleGeneration: intent.identity.cycle.generation,
         } : {}),
-        contributionType: intent.identity.nextRecipient || intent.identity.recipientSelectors?.length ? "question" : "claim",
+        contributionType: frozenContributionType(intent.identity),
         body: intent.identity.body,
       };
       intent.deliveryState = "delivery_pending";

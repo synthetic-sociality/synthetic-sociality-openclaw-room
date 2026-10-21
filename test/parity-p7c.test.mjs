@@ -45,9 +45,7 @@ const conformance = JSON.parse(await readFile(new URL("../conformance.json", imp
 const SENTENCE = conformance.parityP7cNoStatusSentence;
 // The Room server's instruction for a response turn, verbatim (hold-signal-47320f7
 // server/application/cycles/moderation.go:27-30).
-const RESPONSE_INSTRUCTION = "The moderator has intervened; the message this turn answers is the moderator's. Respond to it first: "
-  + "acknowledge it briefly, then answer it. If the moderator's point is unclear to you, ask one short clarifying "
-  + "question instead of guessing. The discussion then continues in the direction the moderator set.";
+const RESPONSE_INSTRUCTION = "The moderator has intervened; the message this turn answers is the moderator's. Respond to it first: acknowledge it briefly, then address every sub-question by answering it or explicitly leaving it to another participant by name. If the moderator's point is unclear to you, ask one short clarifying question instead of guessing. You may include a short interim summary within this turn before the round continues. Naming another participant is advisory prose only and does not schedule a directed turn. The discussion then continues in the direction the moderator set.";
 const ROSTER = [
   {membershipId: "owner-tj", displayName: "TJE", role: "human_owner", status: "active"},
   {membershipId: "zurie", displayName: "Zurie", role: "participant_agent", status: "active"},
@@ -64,7 +62,7 @@ const OWN = {id: "m-44", seq: 44, type: "message.posted", actorRole: "participan
 const ASK = {id: "cmd-45", seq: 45, type: "human.command", actorRole: "human_owner", actorId: "owner-tj",
   payload: {epochId: "epoch-z", command: {command: "ask", arguments: {instruction: "Your view?"}}, visibleText: "/ask"}};
 const INTERJECTION = {id: "m-50", seq: 50, type: "message.posted", actorRole: "human_owner", actorId: "owner-tj",
-  payload: {body: "Please also consider the family's view.", epochId: "epoch-z"}};
+  payload: {body: "What is the family's view? What should the doctor do next?", epochId: "epoch-z"}};
 const ADDRESSED = {...INTERJECTION, payload: {...INTERJECTION.payload, resolvedRecipientMembershipIds: ["zurie"]}};
 const ready = (seq, sourceEventId, extra = {}) => ({id: `ready-${seq}`, seq, type: "discussion.cycle_attempt_ready", actorRole: "system",
   actorId: "room_coordinator", payload: {cycleId: "cycle-1", epochId: "epoch-z", generation: 1, membershipId: "zurie", round: 2, sourceEventId, ...extra}});
@@ -287,7 +285,7 @@ test("P7c-02 a response turn shows the human message as the current item and the
     texts[label] = (await turnText(events, {claim: claimed()})).turn.text;
   }
   for (const [label, text] of Object.entries(texts)) {
-    assert.ok(text.includes("\n\n#50 TJE: Please also consider the family's view.\n\n"), label);
+    assert.ok(text.includes("\n\n#50 TJE: What is the family's view? What should the doctor do next?\n\n"), label);
     assert.ok(text.includes(`[Room phase instruction — server-provided]\n${RESPONSE_INSTRUCTION}\n[/Room phase instruction — server-provided]`), label);
     assert.ok(text.includes("Discussion phase: response; round 2;"), label);
     assert.equal(count(text, "moderator"), count(RESPONSE_INSTRUCTION, "moderator"), label);
@@ -298,7 +296,7 @@ test("P7c-02 a response turn shows the human message as the current item and the
 test("P7c-03 after the response round a regular turn continues from the human message with the remaining budget", async () => {
   const events = [START, HUMAN, PEER, INTERJECTION, ready(53, "m-50")];
   const {turn} = await turnText(events, {claim: claimed("m-42", {totalTurns: 3})});
-  assert.ok(turn.text.includes("\n\n#50 TJE: Please also consider the family's view."));
+  assert.ok(turn.text.includes("\n\n#50 TJE: What is the family's view? What should the doctor do next?"));
   assert.ok(turn.text.includes("Discussion phase: follow_up; round 2; turn 4 of 6; turns remaining after this one: 2"));
   assert.ok(!turn.text.includes("[Room phase instruction"));
 });

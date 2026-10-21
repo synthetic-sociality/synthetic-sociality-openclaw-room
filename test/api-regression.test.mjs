@@ -124,7 +124,7 @@ test("cycle contribution survives an interleaved peer acknowledgement without a 
   assert.equal(message.cycleId, "cycle-1");
   assert.equal(message.attemptId, "attempt-1");
   assert.equal(message.cycleGeneration, 2);
-  assert.equal(message.contributionType, "question");
+  assert.equal(message.contributionType, "claim");
   assert.deepEqual(message.recipientSelectors, [{kind: "membership", membershipId: "paula-member"}]);
   assert.deepEqual(message.respondsTo, ["source-7"]);
   const completion = captured.find((entry) => entry.url.endsWith("/complete")).body;

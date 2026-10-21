@@ -1,3 +1,4 @@
+import {frozenContributionType} from "./contribution.js";
 import {randomUUID} from "node:crypto";
 import {open, readFile, rename, mkdir, chmod, lstat, link, unlink, copyFile} from "node:fs/promises";
 import {constants as fsConstants} from "node:fs";
@@ -298,10 +299,11 @@ function validFrozenPost(intent) {
     if (post.cycleId !== identity.cycle.cycleId || post.attemptId !== identity.cycle.attemptId || post.cycleGeneration !== identity.cycle.generation) return false;
   } else if (post.cycleId !== undefined || post.attemptId !== undefined || post.cycleGeneration !== undefined) return false;
   if (intent.turn?.turnId ? post.turnId !== intent.turn.turnId : post.turnId !== undefined) return false;
-  return post.contributionType === (identity.nextRecipient || identity.recipientSelectors?.length ? "question" : "claim");
+  return frozenContributionType(identity) !== null && post.contributionType === frozenContributionType(identity);
 }
 
 function validateDeliveryIntent(key, intent, state) {
+  if (intent?.identity && frozenContributionType(intent.identity) === null) throw new Error("Room contributionType is invalid");
   if (!key || !intent || typeof intent !== "object" || ![1, 2].includes(intent.version)) {
     throw new Error("Room delivery intent version is invalid");
   }

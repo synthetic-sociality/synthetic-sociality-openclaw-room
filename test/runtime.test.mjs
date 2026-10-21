@@ -685,7 +685,7 @@ test("standalone OpenClaw @mentions become exact Room membership selectors", asy
     {kind: "membership", membershipId: "aura-member"},
     {kind: "membership", membershipId: "zurie-member"},
   ]);
-  assert.equal(posts[0].contributionType, "question");
+  assert.equal(posts[0].contributionType, "claim");
   assert.doesNotThrow(() => validateState(runtime.state));
 });
 
