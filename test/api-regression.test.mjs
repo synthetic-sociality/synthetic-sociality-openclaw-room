@@ -34,6 +34,30 @@ function mockFetch(captured, overrides = {}) {
 
 // ── contributionType regression ──────────────────────────────────────
 
+test("attempt failure sends a bounded remediationHint unchanged on the wire", async () => {
+  const captured = [];
+  const runtime = new OpenClawRoomRuntime({accountId: "test", stateFile: UNUSED_STATE_FILE});
+  runtime.state = {roomId: "room-1", credential: "fixture-only"};
+  runtime.client = new RoomClient({baseUrl: "https://room.example/api", fetchImpl: async (url, init) => {
+    captured.push({url, method: init.method, body: JSON.parse(init.body)});
+    return new Response("{}", {status: 200});
+  }});
+  const hint = "The response exceeded the Room's message size limit. Retry with a shorter response.";
+  for (const remediationHint of [hint, "  Keep this hint unchanged.  ", "x".repeat(500), undefined, "", " \n\t", "x".repeat(501), 123]) {
+    await runtime.settleDiscussionAttempt({cycle: {id: "cycle-1", generation: 3}, attempt: {id: "attempt-1"}}, "fail", undefined,
+      {layer: "runtime", code: "response_too_large", remediationHint});
+  }
+  assert.equal(captured.length, 8);
+  for (const [index, request] of captured.entries()) {
+    assert.equal(request.url, "https://room.example/api/rooms/room-1/cycles/cycle-1/attempts/attempt-1/complete");
+    assert.equal(request.method, "POST");
+    assert.deepEqual(request.body, {generation: 3, action: "fail", executionFailure: {
+      layer: "runtime", code: "response_too_large",
+      ...(index < 3 ? {remediationHint: [hint, "  Keep this hint unchanged.  ", "x".repeat(500)][index]} : {}),
+    }});
+  }
+});
+
 test("postAndFinish sends contributionType claim (not rejected text)", async () => {
   const dir = await mkdtemp(join(tmpdir(), "openclaw-room-api-"));
   const stateFile = join(dir, "default.json");

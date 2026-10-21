@@ -19,6 +19,7 @@ const UNUSED_STATE_FILE = joinState(TEST_STATE_DIRECTORY, "state.json");
 afterStateTests(() => rmState(TEST_STATE_DIRECTORY, {recursive: true, force: true}));
 
 const mocks = {
+  "openclaw/plugin-sdk/account-id": "export const normalizeAccountId = (id) => id.trim().toLowerCase();",
   "openclaw/plugin-sdk/channel-core": "export const defineChannelPluginEntry = (entry) => entry;",
   "openclaw/plugin-sdk/channel-message": "export const defineChannelMessageAdapter = (adapter) => adapter;",
   "openclaw/plugin-sdk/channel-inbound": "export const buildChannelInboundEventContext = (context) => context;",

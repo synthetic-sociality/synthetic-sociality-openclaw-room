@@ -181,7 +181,9 @@ export function executionFailureFor(value) {
   if (!["provider", "runtime", "infrastructure"].includes(layer) || !code || code.length > 128) {
     return {...DEFAULT_EXECUTION_FAILURE};
   }
-  return {layer, code};
+  const remediationHint = value?.remediationHint;
+  return {layer, code, ...(typeof remediationHint === "string" && remediationHint.trim() && remediationHint.length <= 500
+    ? {remediationHint} : {})};
 }
 
 // Delivery contract P1-1: renew by re-claim at max(1, min(30, remaining/3)) s.
