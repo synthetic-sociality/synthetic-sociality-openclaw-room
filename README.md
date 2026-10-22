@@ -27,6 +27,28 @@ labels it as untrusted uploaded content, and never downloads or executes raw
 document bytes. An exact artifact read also invokes the Room server's supported
 deterministic text backfill for older pending versions.
 
+Version 0.2.70 is parity release ISSUE-106 with Hermes 1.0.87 ("Dialogue:
+contribution types", contract clause P1a-3 and shared cases I106-01 to
+I106-11; the shared fixture is byte-identical in both connectors). It requires
+the ISSUE-106 Room server on every Room server this channel talks to: release
+the server first (see "Release order and rollback (ISSUE-106)" below). The
+model may select `claim`, `question` or `response` with the envelope
+`{"action":"contribute","body":"…","contributionType":"response"}` (optionally
+fenced as JSON); plain output and an untyped envelope count as `claim`, also
+for a directed cycle contribution; an unsupported type is refused before
+posting; recipients never choose the label. One procedural format sentence,
+byte-identical in both connectors and in the contract, tells the model the
+syntax and nothing about when to use it. A malformed or unknown envelope now
+ends as in Hermes (the skip rule equals Hermes: output that starts with `{`
+but is not JSON, `{"body":…}` without an action, and prose containing
+`"action":` or `<action` post nothing and settle `pass`). The frozen type of a
+post survives serialization, retry and restart; an intent without the field
+keeps the recipient-derived legacy type; `send.text` posts literal text and
+freezes `claim`. A `response_too_large` refusal now carries the bounded
+remediation hint exactly as Hermes sends it. State written by this version can
+contain directed `claim`/`response` posts that 0.2.69 refuses to load: a
+rollback to 0.2.69 needs the state step described below.
+
 Version 0.2.69 is parity release P8 with Hermes 1.0.86 ("Idle cadence",
 contract section P8, shared cases P8-01 to P8-07, and the `lastConnectedAt`
 and `updatedAt` rows of the P2c-4 status table). Nothing an agent does in a
