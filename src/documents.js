@@ -336,7 +336,8 @@ export function givenMemory(epochId, base, offered, hostSession) {
 export function validGivenMemory(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const keys = Object.keys(value).sort();
-  return JSON.stringify(keys) === JSON.stringify(["epochId", "given", "hostSession"])
+  return ([JSON.stringify(["epochId", "given", "hostSession"]), JSON.stringify(["epochId", "given", "hostSession", "photos"])].includes(JSON.stringify(keys)))
+    && (value.photos === undefined || validGivenMemory({epochId: value.epochId, hostSession: value.hostSession, given: value.photos}))
     && typeof value.epochId === "string" && value.epochId.length > 0 && value.epochId.length <= 512
     && typeof value.hostSession === "string" && value.hostSession.length <= 512
     && Array.isArray(value.given) && value.given.length <= DOCUMENTS_GIVEN_LIMIT

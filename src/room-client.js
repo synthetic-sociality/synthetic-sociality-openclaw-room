@@ -402,6 +402,37 @@ export class RoomClient {
     });
   }
 
+  // P9: exact-version binary read; redirects never receive the credential.
+  async downloadArtifact(session, artifactId, versionId, mimeType, signal) {
+    const path = `/rooms/${encodeURIComponent(session.roomId)}/artifacts/${encodeURIComponent(artifactId)}/versions/${encodeURIComponent(versionId)}/download`;
+    let response;
+    try {
+      response = await this.fetch(`${this.baseUrl}${path}`, {method: "GET", redirect: "error", signal,
+        headers: {Accept: mimeType, Authorization: `Bearer ${session.credential}`}});
+    } catch (error) { throw transportFailure(error, signal); }
+    if (response.status !== 200) {
+      await response.body?.cancel?.();
+      throw new Error("Photo fetch failed");
+    }
+    const reader = response.body?.getReader?.();
+    if (!reader) throw new Error("Photo stream unavailable");
+    const chunks = [];
+    let size = 0;
+    try {
+      while (true) {
+        const {done, value} = await reader.read();
+        if (done) break;
+        size += value.byteLength;
+        if (size > 1_900_000) {
+          await reader.cancel();
+          throw Object.assign(new Error("Photo exceeds size cap"), {code: "photo_size_cap"});
+        }
+        chunks.push(value);
+      }
+    } finally { reader.releaseLock(); }
+    return {data: Buffer.concat(chunks, size), contentType: response.headers.get("content-type") ?? ""};
+  }
+
   listArtifacts(session, signal) {
     return this.request(`/rooms/${encodeURIComponent(session.roomId)}/artifacts`, {
       credential: session.credential, signal, expected: [200],

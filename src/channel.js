@@ -357,6 +357,7 @@ export function createRoomChannel({makeClient}) {
                       commandBody: input.textForCommands ?? input.rawText,
                       senderLabel: event.senderName,
                     },
+                    media: event.media ?? [],
                     contextVisibility: "room_only",
                     extra: {canonicalRoomEvent: event.raw},
                   });

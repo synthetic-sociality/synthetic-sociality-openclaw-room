@@ -1,3 +1,4 @@
+import {PHOTO_TYPES, appendPhotoContext, effectivePhotos, hostImageStore, photoContext, sourcePhotos} from "./photos.js";
 import {contributionOutput, frozenContributionType} from "./contribution.js";
 import {createHash, randomUUID} from "node:crypto";
 import {hostname} from "node:os";
@@ -1126,6 +1127,7 @@ export class OpenClawRoomRuntime {
         this.contextKeptReplyCleared = false;
         this.contextSourceIsCommand = false;
         this.contextGuidanceCarriesNoStatus = false;
+        this.contextMedia = [];
         const sharedContext = await this.sharedRoomContext(event, pageEpoch, signal, cycleAttempt || null);
         const normalized = normalizeEvent(
           event,
@@ -1142,6 +1144,7 @@ export class OpenClawRoomRuntime {
           this.contextKeptReply,
           {sourceIsCommand: this.contextSourceIsCommand, guidanceCarriesNoStatus: this.contextGuidanceCarriesNoStatus},
         );
+        normalized.media = this.contextMedia ?? [];
         await this.clearMissedSources(this.contextMissedOffered, {mark: this.contextMissedMark, attemptReady: this.contextAttemptReady});
         if (this.contextKeptReplyCleared) await this.clearKeptReply();
         // The model runs while the consumer holds this yield; keep its claimed
@@ -1560,6 +1563,9 @@ export class OpenClawRoomRuntime {
     } else {
       artifactContext = await this.discussionDocumentContext(event, listed, sourceEpoch.id, signal);
     }
+    const photoEntries = listed ?? sourcePhotos(event, sourceMessage ? [...pageEvents, sourceMessage] : pageEvents, cycleSource);
+    const photoStatuses = await this.photoContext(event, photoEntries, sourceEpoch.id, signal);
+    artifactContext = appendPhotoContext(artifactContext, photoStatuses);
     const combined = [roomContext, handoverContext, artifactContext].filter(Boolean).join("\n\n");
     // Bounded size telemetry for the pilot: character counts only, never content.
     this.logger?.info?.(`Room ${this.state.roomId} context sizes for ${String(event?.id ?? "")}: transcript=${roomContext.length} handover=${handoverContext.length} documents=${artifactContext.length} total=${combined.length}`);
@@ -1600,6 +1606,35 @@ export class OpenClawRoomRuntime {
     return context;
   }
 
+  async photoContext(event, entries, epochId, signal) {
+    const conversationId = epochId === exactOptionalEpochId(this.state.legacySessionEpochId, "Room legacy session epoch")
+      ? String(this.state.roomId) : epochConversationId(String(this.state.roomId), epochId);
+    const agentId = this.roomAgentId(conversationId);
+    const hostSession = observedHostSession(conversationId, agentId);
+    const given = effectivePhotos(this.state.documentsGiven, epochId, hostSession);
+    if (!given.length && !entries.some((entry) => PHOTO_TYPES.has(entry.mimeType))) {
+      this.contextMedia = [];
+      return "";
+    }
+    const result = await photoContext(entries, given, this.state.membershipId,
+      (aid) => this.client.getArtifact(this.state, aid, signal),
+      (aid, vid, mime) => this.client.downloadArtifact(this.state, aid, vid, mime, signal),
+      entries.some((entry) => PHOTO_TYPES.has(entry.mimeType)) ? await hostImageStore() : null);
+    signal?.throwIfAborted();
+    this.contextMedia = result.media;
+    this.documentsOffered ??= new Map();
+    const id = String(event?.id ?? "");
+    if (!this.documentsOffered.has(id)) {
+      const memory = this.state.documentsGiven;
+      this.documentsOffered.set(id, {epochId, conversationId, agentId, hostSession,
+        recordedSession: memory?.epochId === epochId ? memory.hostSession : "",
+        given: effectiveGiven(memory, epochId, hostSession), offered: []});
+    }
+    Object.assign(this.documentsOffered.get(id), {photosGiven: given, photosOffered: result.offered});
+    while (this.documentsOffered.size > 64) this.documentsOffered.delete(this.documentsOffered.keys().next().value);
+    return result.statuses;
+  }
+
   // The agent the host routes this account's Room conversation to (P7d-5).
   // The channel sets resolveRoomAgent from the host's route resolution.
   roomAgentId(conversationId) {
@@ -1627,6 +1662,9 @@ export class OpenClawRoomRuntime {
     const changed = (built && ran && built !== ran) || (recorded && ran && recorded !== ran);
     const base = changed ? [] : record.given;
     const memory = givenMemory(record.epochId, base, record.offered, ran);
+    if (record.photosGiven?.length || record.photosOffered?.length) {
+      memory.photos = givenMemory(record.epochId, changed ? [] : (record.photosGiven ?? []), record.photosOffered ?? [], ran).given;
+    }
     if (JSON.stringify(memory) === JSON.stringify(this.state.documentsGiven ?? null)) return;
     // Validated before it reaches the state: an invalid memory would make every
     // later persist of this account fail.
@@ -4124,7 +4162,7 @@ export async function sourceArtifactContext(event, events, fetchArtifact, librar
     const lines = [
       `Document: ${singleLine(manifest?.name || "document")}`,
       `Artifact/version: ${artifactId} / ${versionId}`,
-      `Media type: ${singleLine(manifest?.mediaType || "unknown")}`,
+      `Media type: ${singleLine(manifest?.mimeType || "unknown")}`,
       `SHA-256: ${singleLine(manifest?.sha256 || "unknown")}`,
     ];
     try {

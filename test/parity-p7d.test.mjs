@@ -563,7 +563,7 @@ test("P7d-11 when the tool is not known to be offered a large document gives its
 test("P7d-12 a Room state without activeTopic.documents keeps the P5 rule unchanged", async () => {
   const brief = {brief: {artifactId: "brief", visibility: "room_shared",
     currentVersion: {versionId: "v1", name: "brief.md", extractionStatus: "ready", extractedText: "The P5 brief."}}};
-  const attachments = [{artifactId: "brief", versionId: "v1", name: "brief.md", mediaType: "text/markdown", sha256: "c".repeat(64)}];
+  const attachments = [{artifactId: "brief", versionId: "v1", name: "brief.md", mimeType: "text/markdown", sha256: "c".repeat(64)}];
   for (const [label, topic] of [["no activeTopic", false], ["no documents field", true]]) {
     const room = new Room(brief, [], {documentsList: null, topic});
     let memory;
@@ -703,7 +703,7 @@ test("P7d-16 only a version the discussion lists or the library catalog shows is
     denied: apiError(403),
     empty: record("empty", {v1: ["ready", null]}),
     other: record("other", {v1: ["ready", "Another discussion's text."]}),
-  }, [{artifactId: "shared", visibility: "room_shared", currentVersion: {versionId: "v1", name: "shared.md", mediaType: "text/markdown",
+  }, [{artifactId: "shared", visibility: "room_shared", currentVersion: {versionId: "v1", name: "shared.md", mimeType: "text/markdown",
     sha256: "e".repeat(64), extractionStatus: "ready"}},
   ...Array.from({length: 32}, (_, index) => ({artifactId: `lib-${index}`, visibility: "room_shared",
     currentVersion: {versionId: "v1", name: `lib-${index}.pdf`}}))],

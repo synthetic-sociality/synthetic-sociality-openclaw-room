@@ -22,9 +22,9 @@ terminal handling while preserving
 the membership-authorized Room document context introduced in 0.2.37. Exact message
 attachments resolve their immutable referenced version, and later turns can
 read the current authorized Room document library without another upload or
-attachment. The connector sends only bounded server-derived text to the model,
-labels it as untrusted uploaded content, and never downloads or executes raw
-document bytes. An exact artifact read also invokes the Room server's supported
+attachment. Document context is bounded server-derived text, labelled as untrusted uploaded
+content. P9 separately hands verified photo bytes to the host; the connector
+never executes uploaded content. An exact artifact read also invokes the Room server's supported
 deterministic text backfill for older pending versions.
 
 Version 0.2.70 is parity release ISSUE-106 with Hermes 1.0.87 ("Dialogue:
@@ -886,3 +886,7 @@ with their evidence archived; do not restore an old cursor or replay old keys.
 For Hermes, likewise resolve all in-flight candidate posts before a 1.0.86 rollback
 so no frozen typed post is replayed with a legacy-derived payload. Roll the server
 back only after both old connectors are verified loadable and running.
+
+## Room photos
+
+PNG, JPEG and WebP attachments are verified against their exact version manifest and handed to the OpenClaw SDK media store as inbound images, once per discussion and host session. The host chooses native vision or its configured description fallback; the connector calls no model. Optional upload descriptions remain extra context. Explicit photo status lines name refusals and references. Sharing checks, byte caps, given-memory and retention are specified in [delivery contract P9](docs/delivery-lifecycle-contract-v1.md#p9--photos-to-the-model-2026-10-23). Text-only hosts require their own vision fallback configuration.

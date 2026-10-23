@@ -39,9 +39,9 @@ const ROSTER = [
   {membershipId: "zurie", displayName: "Zurie", role: "participant_agent", status: "active"},
   {membershipId: "paula", displayName: "Paula", role: "participant_agent", status: "active"},
 ];
-const manifest = (artifactId) => ({artifactId, versionId: "v1", name: `${artifactId}.md`, mediaType: "text/markdown", sha256: "c".repeat(64)});
+const manifest = (artifactId) => ({artifactId, versionId: "v1", name: `${artifactId}.md`, mimeType: "text/markdown", sha256: "c".repeat(64)});
 const artifact = (artifactId, text) => ({artifactId, visibility: "room_shared",
-  currentVersion: {versionId: "v1", name: `${artifactId}.md`, mediaType: "text/markdown", sha256: "c".repeat(64), extractionStatus: "ready", extractedText: text}});
+  currentVersion: {versionId: "v1", name: `${artifactId}.md`, mimeType: "text/markdown", sha256: "c".repeat(64), extractionStatus: "ready", extractedText: text}});
 const ARTIFACTS = {brief: artifact("brief", BRIEF_TEXT), peer: artifact("peer", PEER_TEXT), open: artifact("open", OPEN_TEXT)};
 
 const START = {id: "start-z", seq: 41, type: "discussion.started", actorRole: "human_owner", actorId: "owner-tj",
