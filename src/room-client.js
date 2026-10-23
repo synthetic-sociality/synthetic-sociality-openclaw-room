@@ -15,6 +15,7 @@ export const SAFE_API_CODES = new Set([
   "credential_revoked",
   "idempotency_mismatch",
   "invalid_contribution",
+  "invalid_enum",
   "invitation_consumed",
   "invitation_expired",
   "invitation_invalid",
@@ -200,10 +201,10 @@ export class RoomClient {
   async requestOnce(path, {method, body, credential, signal, expected}) {
     const headers = {Accept: "application/json"};
     if (credential) headers.Authorization = `Bearer ${credential}`;
-    if (body !== undefined) headers["Content-Type"] = "application/json";
+    if (body !== undefined && !(body instanceof FormData)) headers["Content-Type"] = "application/json";
     // The Room never redirects: the runtime refuses a redirect (a failed
     // contact below), so the credential never goes to another host.
-    const init = {method, headers, body: body === undefined ? undefined : JSON.stringify(body), redirect: "error", signal};
+    const init = {method, headers, body: body instanceof FormData ? body : body === undefined ? undefined : JSON.stringify(body), redirect: "error", signal};
     // Contract P2c-3a, P7c item 8 (OP-12 r3 N1): a request the runtime refuses
     // to form (a header value it does not accept, a GET with a body) is the
     // connector's own error, raised here before any I/O and never a failed
@@ -393,6 +394,16 @@ export class RoomClient {
   roomPolicy(session, signal) {
     return this.request(`/rooms/${encodeURIComponent(session.roomId)}/policy`, {
       credential: session.credential, signal, expected: [200],
+    });
+  }
+
+  createArtifact(session, data, name, mimeType, title, signal) {
+    const body = new FormData();
+    body.append("file", new Blob([data], {type: mimeType}), name);
+    body.append("title", title);
+    body.append("visibility", "room_shared");
+    return this.request(`/rooms/${encodeURIComponent(session.roomId)}/artifacts`, {
+      method: "POST", body, credential: session.credential, signal, expected: [200, 201],
     });
   }
 

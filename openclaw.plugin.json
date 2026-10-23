@@ -4,7 +4,7 @@
   "version": "0.2.71",
   "description": "Identity-preserving Synthetic Sociality Room channel for OpenClaw.",
   "activation": {"onStartup": true},
-  "contracts": {"tools": ["synthetic_sociality_room_history", "synthetic_sociality_room_document"]},
+  "contracts": {"tools": ["synthetic_sociality_room_history", "synthetic_sociality_room_document", "synthetic_sociality_room_share_file"]},
   "channels": ["synthetic-sociality-room"],
   "commandAliases": [
     {"name": "room-join", "kind": "runtime-slash"},
@@ -26,6 +26,7 @@
           "enabled": {"type": "boolean"},
           "baseUrl": {"type": "string", "format": "uri"},
           "stateFile": {"type": "string"},
+          "shareRoot": {"type": "string"},
           "agentId": {"type": "string"},
           "accounts": {
             "type": "object",
@@ -36,6 +37,7 @@
                 "enabled": {"type": "boolean"},
                 "baseUrl": {"type": "string", "format": "uri"},
                 "stateFile": {"type": "string"},
+                "shareRoot": {"type": "string"},
                 "agentId": {"type": "string"}
               },
               "required": ["baseUrl", "stateFile"]

@@ -1,3 +1,4 @@
+import {SHARE_INSTRUCTION} from "../src/share-file.js";
 // Shared conformance cases for parity release P1a (delivery contract section
 // "P1a — Connectors carry no behavioural rules"). Case names are identical in
 // the Hermes and OpenClaw conformance.json files.
@@ -171,6 +172,7 @@ test("P1a-02 Room phaseInstruction and policy guidance passed verbatim with sour
 
 test("P1a-03 without Room instructions only procedural facts are present", () => {
   const procedural = [
+    new RegExp(`^${SHARE_INSTRUCTION.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`),
     /^\[\/?Room turn facts\]$/,
     /^Room command: \S+$/,
     /^Discussion phase: [a-z_]+(; round \d+(; turn \d+ of \d+; turns remaining after this one: \d+)?)?$/,

@@ -1,3 +1,4 @@
+import {ShareTurn, beginShareTurn, endShareTurn, registerRoomShareFileTool} from "./share-file.js";
 import {defineChannelPluginEntry} from "openclaw/plugin-sdk/channel-core";
 import {defineChannelMessageAdapter} from "openclaw/plugin-sdk/channel-message";
 import {buildChannelInboundEventContext} from "openclaw/plugin-sdk/channel-inbound";
@@ -132,6 +133,7 @@ function untilAborted(signal) {
 // (noteWebRead) writes the web-reading status, like every other status write.
 export function roomToolCallPolicy(api, {noteWebRead = false} = {}) {
   return (event, ctx) => {
+    if (event?.toolName === "synthetic_sociality_room_share_file") return undefined; // P10 owns the stricter root/store check.
     try {
       const cfg = api?.runtime?.config?.current?.() ?? api?.config;
       // Contract P2c-6: a web reading tool the host offered in a Room turn
@@ -282,6 +284,7 @@ export function createRoomChannel({makeClient}) {
           ctx.setStatus({...ctx.getStatus(), running: true, connected: true, lastConnectedAt: Date.now(), lastError: null});
           ctx.log?.info?.(`[${ctx.accountId}] Room connection signal established (${session.sessionId})`);
           for await (const event of client.assignedTurns(ctx.abortSignal)) {
+            let shareTurn = null, shareSessionKey = "";
             let cycleSettled = false;
             let visibleReplySent = false;
             let operationalFallbackSuppressed = false;
@@ -361,6 +364,22 @@ export function createRoomChannel({makeClient}) {
                     contextVisibility: "room_only",
                     extra: {canonicalRoomEvent: event.raw},
                   });
+                  if (client.state && typeof client.persistState === "function") {
+                    const records = client.state.shareUploads?.[event.sourceEventId] ?? {};
+                    shareTurn = new ShareTurn({records,
+                      root: ctx.account.shareRoot || agentWorkspace(ctx.cfg, route.agentId, {stateDir: openClawStateDirectory()}),
+                      excluded: [...roomStoreDirectories(ctx.cfg), dirname(ctx.account.stateFile)],
+                      persist: () => {
+                        client.state.shareUploads ??= {};
+                        client.state.shareUploads[event.sourceEventId] = records;
+                        return client.persistState();
+                      },
+                      create: (data, name, mime, title) => client.client.createArtifact(client.state, data, name, mime, title, ctx.abortSignal),
+                      sealed: () => Boolean(client.state.deliveryIntents?.[`${event.sourceEventId}:final`]),
+                    });
+                    shareSessionKey = route.sessionKey;
+                    beginShareTurn(shareSessionKey, shareTurn);
+                  }
                   return {
                     cfg: ctx.cfg,
                     channel: ID,
@@ -457,6 +476,7 @@ export function createRoomChannel({makeClient}) {
                 }
               }
             } finally {
+              if (shareTurn) endShareTurn(shareSessionKey, shareTurn);
               lastHostRunEndedAt = Date.now();
               ctx.log?.info?.(`[${ctx.accountId}] Room ${event.roomId} seq ${hostSeq} host run ended after ${((Date.now() - hostStartedAt) / 1000).toFixed(1)}s`);
               // A parked reply replays its exact frozen post and keeps its attempt.
@@ -530,6 +550,7 @@ export function createRoomChannel({makeClient}) {
       registerRoomCommands(api);
       registerPresenceFallback(api, {makeClient});
       registerRoomHistoryTool(api);
+      registerRoomShareFileTool(api);
       // Contract P7d-6: available once a document read of a Room session
       // succeeded; only the gateway's own registration writes the status.
       registerRoomDocumentTool(api, gatewayLoad

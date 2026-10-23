@@ -1,3 +1,4 @@
+import {SHARE_INSTRUCTION, refs as shareRefs} from "./share-file.js";
 import {PHOTO_TYPES, appendPhotoContext, effectivePhotos, hostImageStore, photoContext, sourcePhotos} from "./photos.js";
 import {contributionOutput, frozenContributionType} from "./contribution.js";
 import {createHash, randomUUID} from "node:crypto";
@@ -254,6 +255,7 @@ function validFrozenPost(intent) {
   const identity = intent?.identity;
   const legacy = intent?.version === 1;
   if (!post || typeof post !== "object" || !identity) return false;
+  if (JSON.stringify(post.attachments ?? []) !== JSON.stringify(identity.attachments ?? [])) return false;
   if (post.body !== identity.body || post.idempotencyKey !== intent.messageIdempotencyKey) return false;
   if (!Number.isSafeInteger(post.observedSeq) || post.observedSeq < 0) return false;
   if (!legacy || identity.postObservedSeq !== undefined) {
@@ -2506,6 +2508,7 @@ export class OpenClawRoomRuntime {
     } : null;
     const requestedIdentity = {
       roomId, body, replyToId: String(replyToId ?? ""),
+      ...(shareRefs(this.state.shareUploads?.[String(sourceEventId ?? "")] ?? {}).length ? {attachments: shareRefs(this.state.shareUploads[sourceEventId])} : {}),
       sourceEventId: String(sourceEventId ?? ""), sourceEpochId: exactOptionalEpochId(sourceEpochId, "Room source epoch"), cycle: requestedCycle,
       resolveRecipientMentions: Boolean(resolveRecipientMentions),
       contributionType: contributionType ?? output.contributionType,
@@ -2535,7 +2538,9 @@ export class OpenClawRoomRuntime {
       }
       const frozenRequestedIdentity = {
         roomId: intent.identity?.roomId, body: intent.identity?.body,
-        replyToId: intent.identity?.replyToId, sourceEventId: intent.identity?.sourceEventId,
+        replyToId: intent.identity?.replyToId,
+        ...(intent.identity?.attachments?.length ? {attachments: intent.identity.attachments} : {}),
+        sourceEventId: intent.identity?.sourceEventId,
         sourceEpochId: requestedIdentity.sourceEpochId ? (intent.identity?.sourceEpochId ?? "") : "",
         cycle: intent.identity?.cycle ?? null,
         resolveRecipientMentions: Boolean(intent.identity?.resolveRecipientMentions),
@@ -2686,6 +2691,7 @@ export class OpenClawRoomRuntime {
           attemptId: intent.identity.cycle.attemptId,
           cycleGeneration: intent.identity.cycle.generation,
         } : {}),
+        ...(intent.identity.attachments?.length ? {attachments: structuredClone(intent.identity.attachments)} : {}),
         contributionType: frozenContributionType(intent.identity),
         body: intent.identity.body,
       };
@@ -3925,6 +3931,7 @@ export function roomTurnFacts({phase = "", cycleAttempt = null, policyWordLimit 
   if (words) lines.push(wordBoundFact(words, cycleAttempt ? WORD_BOUND_CYCLE_SOURCE : WORD_BOUND_POLICY_SOURCE));
   // Contract P2a-3: missed sources as facts only.
   for (const line of Array.isArray(missed) ? missed : []) if (line) lines.push(line);
+  lines.push(SHARE_INSTRUCTION);
   lines.push(ROOM_PASS_ENVELOPE);
   lines.push(ROOM_CONTRIBUTION_FORMAT);
   return ["[Room turn facts]", ...lines, "[/Room turn facts]"].join("\n");

@@ -1,3 +1,4 @@
+import {validUploads, validRefs} from "./share-file.js";
 import {frozenContributionType} from "./contribution.js";
 import {randomUUID} from "node:crypto";
 import {open, readFile, rename, mkdir, chmod, lstat, link, unlink, copyFile} from "node:fs/promises";
@@ -238,6 +239,7 @@ export function validateState(value) {
     }
   }
   // Contract P7d-5: the discussion documents given in full to this agent.
+  if (value.shareUploads !== undefined && !validUploads(value.shareUploads)) throw new Error("Room share upload journal is invalid");
   if (value.documentsGiven !== undefined && !validGivenMemory(value.documentsGiven)) throw new Error("Room document memory is invalid");
   if (value.terminalEvidence !== undefined && (
     !value.terminalEvidence || typeof value.terminalEvidence !== "object" || Array.isArray(value.terminalEvidence)
@@ -279,6 +281,7 @@ function validFrozenPost(intent) {
   const identity = intent?.identity;
   const legacy = intent?.version === 1;
   if (!post || typeof post !== "object" || !identity) return false;
+  if (JSON.stringify(post.attachments ?? []) !== JSON.stringify(identity.attachments ?? [])) return false;
   if (post.body !== identity.body || post.idempotencyKey !== intent.messageIdempotencyKey) return false;
   if (!Number.isSafeInteger(post.observedSeq) || post.observedSeq < 0) return false;
   if (!legacy || identity.postObservedSeq !== undefined) {
@@ -312,6 +315,7 @@ function validateDeliveryIntent(key, intent, state) {
   }
   if (!["v1", "v2"].includes(intent.messagePayloadDialect)) throw new Error("Room delivery intent dialect is invalid");
   const identity = intent.identity;
+  if (!validRefs(identity?.attachments ?? [])) throw new Error("Room frozen attachments are invalid");
   if (!identity || identity.roomId !== state.roomId || typeof identity.body !== "string" || typeof identity.sourceEventId !== "string") {
     throw new Error("Room delivery intent identity is invalid");
   }

@@ -78,6 +78,7 @@ export function resolveRoomAccount(cfg, accountId = "default", {managedResolver 
     baseUrl: selected.baseUrl,
     stateFile: selected.stateFile,
     agentId: String(raw.agentId ?? "main"),
+    shareRoot: typeof raw.shareRoot === "string" ? raw.shareRoot : "",
   };
 }
 
