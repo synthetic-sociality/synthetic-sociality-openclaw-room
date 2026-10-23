@@ -1,3 +1,4 @@
+import {sanitizeTitle} from './share-file.js';
 // Room state may legitimately include several base64-encoded profile avatars.
 // Keep a finite guard while allowing the protocol's complete room snapshot.
 const MAX_RESPONSE_BYTES = 16 << 20;
@@ -400,7 +401,7 @@ export class RoomClient {
   createArtifact(session, data, name, mimeType, title, signal) {
     const body = new FormData();
     body.append("file", new Blob([data], {type: mimeType}), name);
-    body.append("title", title);
+    body.append("title", sanitizeTitle(title));
     body.append("visibility", "room_shared");
     return this.request(`/rooms/${encodeURIComponent(session.roomId)}/artifacts`, {
       method: "POST", body, credential: session.credential, signal, expected: [200, 201],

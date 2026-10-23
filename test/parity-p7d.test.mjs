@@ -762,7 +762,7 @@ function installedHost() {
 
 test("P7d-17 the document tool is registered with the host and declared in the manifest", async (t) => {
   const manifest = JSON.parse(await readFile(join(root, "openclaw.plugin.json"), "utf8"));
-  assert.deepEqual(manifest.contracts, {tools: ["synthetic_sociality_room_history", TOOL]});
+  assert.deepEqual(manifest.contracts, {tools: ["synthetic_sociality_room_history", TOOL, "synthetic_sociality_room_share_file"]});
   assert.deepEqual(Object.keys(ROOM_DOCUMENT_PARAMETERS.properties).sort(), ["artifactId", "fromLine", "query", "room", "toLine", "versionId"]);
   assert.deepEqual(ROOM_DOCUMENT_PARAMETERS.required, ["artifactId"]);
   const hostRoot = installedHost();
@@ -776,8 +776,8 @@ test("P7d-17 the document tool is registered with the host and declared in the m
   });
   const result = JSON.parse(stdout.trim().split("\n").at(-1));
   assert.equal(result.error, undefined, JSON.stringify(result));
-  assert.deepEqual(result.plugin.toolNames, [TOOL, "synthetic_sociality_room_history"].sort(), JSON.stringify(result));
-  assert.deepEqual(result.tools.flat().sort(), [TOOL, "synthetic_sociality_room_history"].sort(), JSON.stringify(result));
+  assert.deepEqual(result.plugin.toolNames, [TOOL, "synthetic_sociality_room_history", "synthetic_sociality_room_share_file"].sort(), JSON.stringify(result));
+  assert.deepEqual(result.tools.flat().sort(), [TOOL, "synthetic_sociality_room_history", "synthetic_sociality_room_share_file"].sort(), JSON.stringify(result));
   assert.deepEqual(result.diagnostics.filter((item) => /contracts\.tools/.test(item.message)), [], JSON.stringify(result));
   assert.equal(result.plugin.failed, false);
 });
@@ -955,7 +955,7 @@ test("P7d-20 the release archive installs every runtime file it ships, byte-equa
   });
   const result = JSON.parse(loaded.stdout.trim().split("\n").at(-1));
   assert.equal(result.error, undefined, JSON.stringify(result));
-  assert.deepEqual(result.plugin.toolNames, [TOOL, "synthetic_sociality_room_history"].sort(), JSON.stringify(result));
+  assert.deepEqual(result.plugin.toolNames, [TOOL, "synthetic_sociality_room_history", "synthetic_sociality_room_share_file"].sort(), JSON.stringify(result));
   assert.equal(result.plugin.failed, false);
 });
 
@@ -1153,7 +1153,7 @@ test("P7d-27 the tools find every Room the connector runs, also one whose state 
   });
   const result = JSON.parse(stdout.trim().split("\n").at(-1));
   assert.equal(result.error, undefined, JSON.stringify(result));
-  assert.deepEqual(result.plugin, {failed: false, toolNames: [TOOL, "synthetic_sociality_room_history"].sort()});
+  assert.deepEqual(result.plugin, {failed: false, toolNames: [TOOL, "synthetic_sociality_room_history", "synthetic_sociality_room_share_file"].sort()});
   assert.deepEqual(result.diagnostics, []);
   // The accounts the host starts: the configured ones outside the default
   // directory and the managed one inside it; not the disabled one, not a state

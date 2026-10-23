@@ -133,8 +133,8 @@ function untilAborted(signal) {
 // (noteWebRead) writes the web-reading status, like every other status write.
 export function roomToolCallPolicy(api, {noteWebRead = false} = {}) {
   return (event, ctx) => {
-    if (event?.toolName === "synthetic_sociality_room_share_file") return undefined; // P10 owns the stricter root/store check.
     try {
+      if (event?.toolName === "synthetic_sociality_room_share_file") return undefined; // P10 owns the stricter root/store check.
       const cfg = api?.runtime?.config?.current?.() ?? api?.config;
       // Contract P2c-6: a web reading tool the host offered in a Room turn
       // (the host's session key is agent:<agent>:<channel>:<kind>:<peer>).
@@ -417,6 +417,7 @@ export function createRoomChannel({makeClient}) {
                         replyText = text;
                         let sent;
                         try {
+                          if (shareTurn) await shareTurn.sealForPost();
                           sent = await client.postAndFinish({
                             roomId: event.roomId,
                             text,
