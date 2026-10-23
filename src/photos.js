@@ -11,7 +11,8 @@ export function sourcePhotos(event, events, cycleSource = null) {
   let source = event?.type === "message.posted" ? event : null;
   const sourceId = event?.payload?.sourceEventId;
   if (sourceId) source = [event, ...(events ?? [])].find((item) => item?.id === sourceId);
-  const entries = [cycleSource, source].flatMap((item) => Array.isArray(item?.payload?.attachments) ? item.payload.attachments : []);
+  const entries = [cycleSource, source].flatMap((item) => Array.isArray(item?.payload?.attachments)
+    ? item.payload.attachments.map((attachment) => ({...attachment, sourceSeq: item.seq || 0})) : []);
   return discussionDocuments({activeTopic: {documents: entries}}) ?? [];
 }
 
@@ -55,8 +56,9 @@ export async function photoContext(entries, given, membership, artifact, downloa
         const current = await artifact(aid);
         const visibility = current?.visibility;
         const audience = current?.allowedMembershipIds ?? [];
+        const manifestAudience = Object.hasOwn(entry, "allowedMembershipIds") ? (entry.allowedMembershipIds ?? []) : audience;
         if (!["room_shared", "restricted"].includes(visibility) || (visibility === "restricted" && !audience.includes(membership))) reason = "sharing";
-        else if (entry.classification === "restricted" && !(entry.allowedMembershipIds ?? audience).includes(membership)) reason = "sharing";
+        else if (entry.classification === "restricted" && !manifestAudience.includes(membership)) reason = "sharing";
         else {
           const {data, contentType} = await download(aid, vid, mime);
           if (data.length > PHOTO_MAX_BYTES) reason = "size cap";
@@ -84,6 +86,6 @@ export async function photoContext(entries, given, membership, artifact, downloa
 
 export function appendPhotoContext(context, statuses) {
   if (!statuses) return context;
-  if (context.includes(DOCUMENT_CONTEXT_FOOTER)) return context.replace(DOCUMENT_CONTEXT_FOOTER, `${statuses}\n\n${DOCUMENT_CONTEXT_FOOTER}`);
+  if (context.includes(DOCUMENT_CONTEXT_FOOTER)) return context.replace(DOCUMENT_CONTEXT_FOOTER, () => `${statuses}\n\n${DOCUMENT_CONTEXT_FOOTER}`);
   return `${context}${context ? "\n\n" : ""}${DOCUMENT_CONTEXT_HEADER}\n\n${statuses}\n\n${DOCUMENT_CONTEXT_FOOTER}`;
 }
