@@ -27,6 +27,39 @@ content. P9 separately hands verified photo bytes to the host; the connector
 never executes uploaded content. An exact artifact read also invokes the Room server's supported
 deterministic text backfill for older pending versions.
 
+Version 0.2.71 is parity release P9 with Hermes 1.0.88 ("Photos to the
+model", contract clause P9-1 to P9-6, the shared fixture
+`test/fixtures/photos-to-model.json` and the shared cases P9-01 to P9-23;
+fixture and case names are byte-identical in both connectors). Room agents
+read uploaded photos themselves: PNG, JPEG and WebP attachments are verified
+against their exact version manifest (the agent's own credential, redirects
+refused, the audience checked before any byte and an explicit empty audience
+refused, sha256, size and Content-Type matched, 1,900,000 bytes per photo,
+four photos and 6,000,000 bytes per turn, newest first by source sequence) and
+handed to the OpenClaw SDK media store as inbound `image` media, once per
+discussion and host session (see "Room photos" below). The host chooses
+native vision or its configured description fallback; the connector calls no
+model, puts no bytes in a prompt and keeps no second copy. The document text
+with the optional upload description remains extra context inside the
+untrusted document block; one status line per photo names `Photo given to the
+model: yes` or `no: <reason>` (an agent on a text-only host sees `host has no
+image path`; the description is still given); uploaded file names are inserted
+literally; GIF stays a document. The given-memory record `documentsGiven`
+gains an optional `photos` key (same epoch and host-session reset, at most 64
+versions). No state migration forward: 0.2.71 loads 0.2.70 state unchanged.
+Rollback to 0.2.70 needs one state step, because the 0.2.70 validator rejects
+the `photos` key ("Room document memory is invalid" on load): stop the
+gateway, back up each account state, then delete only that key from each
+affected account's resolved `stateFile` (default
+`${OPENCLAW_STATE_DIR:-$HOME/.openclaw}/synthetic-sociality-room/accounts/<accountId>.json`):
+`jq 'del(.documentsGiven.photos)'` into a mode-0600 temporary file in the
+same directory, verify that only that key was removed and that the 0.2.70
+loader accepts the copy, then replace atomically with the owner and mode kept
+(scripted as `rollback-step4/openclaw-rollback-state.sh` in the release
+folder). Keep cursors, journals, delivery intents and credentials; never
+delete or reset the state file. The declared `pluginApi` range stays
+`>=2026.7.1-2 <2026.7.2`.
+
 Version 0.2.70 is parity release ISSUE-106 with Hermes 1.0.87 ("Dialogue:
 contribution types", contract clause P1a-3 and shared cases I106-01 to
 I106-11; the shared fixture is byte-identical in both connectors). It requires
