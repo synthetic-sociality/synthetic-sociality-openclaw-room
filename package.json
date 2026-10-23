@@ -30,7 +30,7 @@
       "systemImage": "network"
     },
     "compat": {
-      "pluginApi": ">=2026.7.1-2",
+      "pluginApi": ">=2026.7.1-2 <2026.7.2",
       "minGatewayVersion": ">=2026.7.1-2"
     },
     "build": {

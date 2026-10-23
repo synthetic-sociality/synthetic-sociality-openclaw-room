@@ -69,7 +69,8 @@ test("declares the compatibility and install metadata required by ClawHub", asyn
   );
   assert.equal(ROOM_CONNECTOR_PROVENANCE.sourceCommit, "unbuilt");
   assert.equal(ROOM_CONNECTOR_PROVENANCE.artifactIdentity, "unbuilt");
-  assert.equal(packageJson.openclaw.compat.pluginApi, ">=2026.7.1-2");
+  assert.equal(packageJson.openclaw.compat.pluginApi, ">=2026.7.1-2 <2026.7.2");
+  assert.equal(conformance.supportedRuntime.openclaw.pluginApi, packageJson.openclaw.compat.pluginApi);
   assert.equal(packageJson.openclaw.compat.minGatewayVersion, ">=2026.7.1-2");
   assert.equal(packageJson.openclaw.build.openclawVersion, "2026.7.1-2");
   assert.equal(packageJson.openclaw.build.pluginSdkVersion, "2026.7.1-2");

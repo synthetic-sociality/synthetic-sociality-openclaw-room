@@ -173,7 +173,7 @@
     "node": "26.3.0",
     "operatingSystems": ["linux", "macos"],
     "openclaw": {
-      "pluginApi": ">=2026.7.1-2",
+      "pluginApi": ">=2026.7.1-2 <2026.7.2",
       "testedVersions": ["2026.7.1-2"]
     }
   },
