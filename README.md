@@ -27,6 +27,30 @@ content. P9 separately hands verified photo bytes to the host; the connector
 never executes uploaded content. An exact artifact read also invokes the Room server's supported
 deterministic text backfill for older pending versions.
 
+Version 0.2.73 is parity release P11 with Hermes 1.0.90 ("Share authority
+bound to the dispatch", ISSUE-116). The contract gains clause P10-1a,
+host-neutral run binding of the file share: the share capability is bound only
+to the host session the run resolved at dispatch; a routing key is not a member
+identity, hooks never grant initial authority and a replayed or foreign hook
+never binds; calls from unbound sessions, after run completion or after the
+canonical post is sealed return `no-room-turn`. The Hermes connector was
+repaired to it; this connector already binds its share turn to the host
+session key of the dispatch, so no code of the Room turn changes, and the
+contract file is byte-identical in both connectors again. New README section
+"Room tools under a tool profile": a gateway with `tools.profile` (for example
+`coding`) strips `synthetic_sociality_room_share_file`,
+`synthetic_sociality_room_document` and `synthetic_sociality_room_history`
+from every Room turn unless `tools.alsoAllow` grants them additively (found
+2026-10-24 on two gateways); at account start the connector now logs one
+warning per process, `room_tools_not_granted`, naming the missing grants, and
+starts anyway. No change to the state format, the delivery lifecycle or the
+tools' behaviour; no state migration in either direction. Rollback to 0.2.72:
+stop the gateway, settle in-flight delivery intents with
+`openclaw-room-recovery`, back up each account state, restore the 0.2.72 tree
+from the anchor (the installer's ClawHub-latest preflight cannot downgrade);
+a rollback past 0.2.71 still needs the P9 photos-key step first. The declared
+`pluginApi` range stays `>=2026.7.1-2 <2026.7.2`.
+
 Version 0.2.72 is parity release P10 with Hermes 1.0.89 ("Agent files to the
 Room", contract clause P10-1 to P10-6, the shared fixture
 `test/fixtures/agent-files.json` and the shared cases P10-01 to P10-11 with
