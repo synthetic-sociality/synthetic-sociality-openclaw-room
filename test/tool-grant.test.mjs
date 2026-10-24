@@ -67,10 +67,10 @@ test("a tool profile without the additive grant is reported per scope; the grant
     [{scope: "gateway", missing: ROOM_TOOLS}, {scope: "agent", missing: ROOM_TOOLS}]);
 });
 
-test("at account start the gap is logged once per process with the scope and the missing tools, and the account starts", async () => {
+test("at account start the gap is logged once per process with the scope and the missing tools, and the account starts even when the warning sink fails", async () => {
   const stateFile = join(STORE, "accounts", "zurie.json");
   await writeFile(stateFile, JSON.stringify({credential: `room-cred-TEST-${"0f1e2d3c".repeat(4)}`}), {mode: 0o600});
-  const startTwice = async (cfg) => {
+  const startTwice = async (cfg, {warnThrows = false} = {}) => {
     resetLocalStatusWriters();
     let made = 0;
     const client = {
@@ -86,7 +86,7 @@ test("at account start the gap is logged once per process with the scope and the
       const running = channel.plugin.gateway.startAccount({
         account: {accountId: "zurie", stateFile}, accountId: "zurie", abortSignal: controller.signal, cfg,
         channelRuntime: {inbound: {run: async () => {}}}, getStatus: () => status, setStatus: (next) => { status = next; },
-        log: {info: () => {}, warn: (line) => lines.warn.push(line), error: (line) => lines.error.push(line)},
+        log: {info: () => {}, warn: (line) => { lines.warn.push(line); if (warnThrows && line.includes(TOOLS_NOT_GRANTED)) throw new Error("synthetic warning sink unavailable"); }, error: (line) => lines.error.push(line)},
       });
       await new Promise((resolve) => setTimeout(resolve, 50));
       controller.abort();
@@ -109,6 +109,12 @@ test("at account start the gap is logged once per process with the scope and the
   const granted = await startTwice({...ISOLATED_HOST_CONFIG, tools: {...ISOLATED_HOST_CONFIG.tools, profile: "coding", alsoAllow: ["message", ...ROOM_TOOLS]}});
   assert.equal(granted.made, 2);
   assert.equal(granted.lines.warn.filter((line) => line.includes(TOOLS_NOT_GRANTED)).length, 0);
+  // OP-12 round 1 (2026-10-24, P2): a failing warning sink never touches the account start; the warning is attempted
+  // once (the flag is set before the sink is called) and the start proceeds.
+  const noisy = await startTwice({...ISOLATED_HOST_CONFIG, tools: {...ISOLATED_HOST_CONFIG.tools, profile: "coding", alsoAllow: ["message"]}}, {warnThrows: true});
+  assert.equal(noisy.made, 2, "a throwing warn logger does not stop the account");
+  assert.equal(noisy.lines.error.length, 0);
+  assert.equal(noisy.lines.warn.filter((line) => line.includes(TOOLS_NOT_GRANTED)).length, 1);
   const noProfile = await startTwice(ISOLATED_HOST_CONFIG);
   assert.equal(noProfile.made, 2);
   assert.equal(noProfile.lines.warn.filter((line) => line.includes(TOOLS_NOT_GRANTED)).length, 0);

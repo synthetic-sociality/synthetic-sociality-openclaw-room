@@ -275,10 +275,16 @@ export function createRoomChannel({makeClient}) {
           // README "Room tools under a tool profile": a host tool profile strips
           // the Room tools from every Room turn unless tools.alsoAllow grants
           // them. Reporting only, once per process; the account starts.
-          const grantGaps = roomToolGrantGaps(ctx.cfg);
-          if (grantGaps.length && !toolGrantWarningLogged) {
-            toolGrantWarningLogged = true;
-            ctx.log?.warn?.(`Room connector: ${TOOLS_NOT_GRANTED} (${grantGaps.map((gap) => `${gap.scope}: ${gap.missing.join(" ")}`).join("; ")}). The host's tool profile removes these Room tools from every Room turn; grant them additively with tools.alsoAllow (README "Room tools under a tool profile"). The account starts.`);
+          // Reporting only: neither the check nor a failing logger may touch
+          // the account start (OP-12 2026-10-24, P2).
+          try {
+            const grantGaps = roomToolGrantGaps(ctx.cfg);
+            if (grantGaps.length && !toolGrantWarningLogged) {
+              toolGrantWarningLogged = true;
+              ctx.log?.warn?.(`Room connector: ${TOOLS_NOT_GRANTED} (${grantGaps.map((gap) => `${gap.scope}: ${gap.missing.join(" ")}`).join("; ")}). The host's tool profile removes these Room tools from every Room turn; grant them additively with tools.alsoAllow (README "Room tools under a tool profile"). The account starts.`);
+            }
+          } catch {
+            // best effort: the account starts regardless of the warning sink
           }
           const replyPolicy = roomReplyDeliveryPolicy();
           ctx.setStatus({...ctx.getStatus(), running: true, connected: false, lastError: null});
