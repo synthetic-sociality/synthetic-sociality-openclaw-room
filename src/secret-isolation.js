@@ -162,6 +162,44 @@ function storeReachabilityOf(cfg, storeDirectories, {stateDir = "", home = homed
   return [...reasons];
 }
 
+// README "Room tools under a tool profile": the Room tools this connector
+// registers for Room turns. A host tool profile (`tools.profile`, or an
+// explicit `tools.allow` list) selects the tools a turn is offered and strips
+// every other registered tool; the Room tools must then be granted additively
+// (`tools.alsoAllow`), on the gateway and on every agent entry that sets its
+// own profile or list.
+export const ROOM_TURN_TOOLS = Object.freeze(["synthetic_sociality_room_share_file", "synthetic_sociality_room_document", "synthetic_sociality_room_history"]);
+export const TOOLS_NOT_GRANTED = "room_tools_not_granted";
+
+// The Room tools a tool profile would strip, per scope ("gateway" or an agent
+// id): [] when no profile or list is set, or when every Room tool is granted
+// on the gateway or on the agent entry (a grant on either counts). Reporting
+// only: the account starts either way; never throws, and a configuration that
+// cannot be read reports nothing (storeReachability covers that case).
+export function roomToolGrantGaps(cfg) {
+  try {
+    const gaps = [];
+    const scopes = [["gateway", cfg?.tools, undefined]];
+    const agents = Array.isArray(cfg?.agents?.list) ? cfg.agents.list : [];
+    for (const agent of agents) {
+      if (agent && typeof agent === "object" && agent.tools && typeof agent.tools === "object" && !Array.isArray(agent.tools)) {
+        scopes.push([String(agent.id ?? "agent"), agent.tools, cfg?.tools]);
+      }
+    }
+    for (const [scope, tools, inherited] of scopes) {
+      const profile = tools?.profile ?? inherited?.profile;
+      const allow = Array.isArray(tools?.allow) ? tools.allow : Array.isArray(inherited?.allow) ? inherited.allow : null;
+      if (!profile && !allow) continue;
+      const granted = new Set([...list(tools?.alsoAllow), ...list(inherited?.alsoAllow), ...list(allow)]);
+      const missing = ROOM_TURN_TOOLS.filter((name) => !granted.has(name));
+      if (missing.length) gaps.push({scope, missing});
+    }
+    return gaps;
+  } catch {
+    return [];
+  }
+}
+
 function* stringLeaves(value, depth = 0) {
   if (depth > 6) return;
   if (typeof value === "string") yield value;

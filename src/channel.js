@@ -21,7 +21,7 @@ import {
   RELEASED_ATTEMPT_EXECUTION_FAILURE,
   statusErrorCode,
 } from "./runtime.js";
-import {BLOCK_MESSAGE, REFUSAL_CODE, agentWorkspace, scrubDeep, scrubbingLogger, secretIsolationEnforced, storeReachability, toolCallBlock} from "./secret-isolation.js";
+import {BLOCK_MESSAGE, REFUSAL_CODE, TOOLS_NOT_GRANTED, agentWorkspace, roomToolGrantGaps, scrubDeep, scrubbingLogger, secretIsolationEnforced, storeReachability, toolCallBlock} from "./secret-isolation.js";
 import {WEB_READ_TOOL_NAMES, localStatusFor} from "./local-status.js";
 import {ROOM_CONNECTOR_PROVENANCE} from "./release-provenance.js";
 import {
@@ -118,6 +118,10 @@ export function roomLocalStatus(logger, cfg) {
 let secretRefusalLogged = false;
 export function resetSecretRefusalLog() {
   secretRefusalLogged = false;
+}
+let toolGrantWarningLogged = false;
+export function resetToolGrantWarningLog() {
+  toolGrantWarningLogged = false;
 }
 
 function untilAborted(signal) {
@@ -267,6 +271,14 @@ export function createRoomChannel({makeClient}) {
             ctx.setStatus({...ctx.getStatus(), running: true, connected: false, lastError: REFUSAL_CODE});
             await untilAborted(ctx.abortSignal);
             return;
+          }
+          // README "Room tools under a tool profile": a host tool profile strips
+          // the Room tools from every Room turn unless tools.alsoAllow grants
+          // them. Reporting only, once per process; the account starts.
+          const grantGaps = roomToolGrantGaps(ctx.cfg);
+          if (grantGaps.length && !toolGrantWarningLogged) {
+            toolGrantWarningLogged = true;
+            ctx.log?.warn?.(`Room connector: ${TOOLS_NOT_GRANTED} (${grantGaps.map((gap) => `${gap.scope}: ${gap.missing.join(" ")}`).join("; ")}). The host's tool profile removes these Room tools from every Room turn; grant them additively with tools.alsoAllow (README "Room tools under a tool profile"). The account starts.`);
           }
           const replyPolicy = roomReplyDeliveryPolicy();
           ctx.setStatus({...ctx.getStatus(), running: true, connected: false, lastError: null});

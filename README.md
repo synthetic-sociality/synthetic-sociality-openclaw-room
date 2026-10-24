@@ -791,6 +791,43 @@ General shell access is not required. Keep `exec` denied where appropriate. The
 adapter accepts only a native Room ID that matches the Room bound to the
 selected account's private state file.
 
+## Room tools under a tool profile
+
+A gateway that sets `tools.profile` (for example `coding`) offers an agent
+only that profile's tools, in Room turns as in every other session, and
+strips every other registered tool before the model sees it. The three tools
+this connector registers for Room turns —
+`synthetic_sociality_room_share_file`, `synthetic_sociality_room_document` and
+`synthetic_sociality_room_history` — must therefore be granted additively,
+exactly like the `message` grant above, on the gateway and on every agent
+entry in `agents.list` that sets its own `tools.profile` or `tools.allow`:
+
+```json5
+{
+  tools: {
+    profile: "coding",
+    alsoAllow: [
+      "message",
+      "synthetic_sociality_room_share_file",
+      "synthetic_sociality_room_document",
+      "synthetic_sociality_room_history"
+    ]
+  }
+}
+```
+
+Without the grant a Room turn has no document, history or file-share tool:
+the agent cannot read the Room's documents on demand, cannot recall the Room
+history and cannot share a produced file, and asked to share it may loop on
+tool calls that do not exist (found 2026-10-24 on two gateways running the
+`coding` profile; the host's tool-policy log line names the removed tools). A
+gateway without `tools.profile` or `tools.allow` offers every registered tool
+and needs no grant. At account start the connector compares the gateway's and
+every listed agent's profile, allow list and `alsoAllow` with these three
+names and logs one warning per process, `room_tools_not_granted`, naming the
+scope and the missing tools; the account starts either way (reporting only),
+and a grant on either the gateway or the agent entry counts.
+
 ## Automated, model-independent invitation
 
 After the plugin is installed, an authorized operator sends the complete
