@@ -27,6 +27,24 @@ content. P9 separately hands verified photo bytes to the host; the connector
 never executes uploaded content. An exact artifact read also invokes the Room server's supported
 deterministic text backfill for older pending versions.
 
+Version 0.2.74 is parity release P12, paired with Hermes 1.0.92 ("Room share
+keeps working after context compression"). Initial share authority still
+comes only from dispatch. A core `subagent_spawned` notification can extend
+that live turn to its reported child and descendants; tool-supplied parents,
+routing metadata, inferred identities, historical and foreign lineage grant
+nothing. OpenClaw compaction keeps its session key and therefore its existing
+binding. A child calling before the post-launch notification is refused;
+turn end and canonical post sealing refuse sharing and new lineage. Contract
+P12 and the shared `parityP12Cases` are pinned in the binding suite. The base
+contract difference is preserved: P11b exists only in the Hermes copy.
+No change to the persisted state format or delivery lifecycle; no state
+migration in either direction. Rollback to 0.2.73: stop the gateway, settle
+in-flight delivery intents with `openclaw-room-recovery`, back up each account
+state, then restore the 0.2.73 tree from the anchor (the installer's
+ClawHub-latest preflight cannot downgrade). A rollback past 0.2.71 still needs
+the P9 photos-key step first. The declared `pluginApi` range stays
+`>=2026.7.1-2 <2026.7.2`.
+
 Version 0.2.73 is parity release P11 with Hermes 1.0.90 ("Share authority
 bound to the dispatch", ISSUE-116). The contract gains clause P10-1a,
 host-neutral run binding of the file share: the share capability is bound only

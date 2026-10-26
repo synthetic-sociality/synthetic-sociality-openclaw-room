@@ -46,7 +46,7 @@ test("declares the compatibility and install metadata required by ClawHub", asyn
   const conformance = JSON.parse(await readFile(join(packageRoot, "conformance.json"), "utf8"));
   assert.equal(packageJson.private, undefined);
   assert.equal(packageJson.name, "@synthetic-sociality/openclaw-room");
-  assert.equal(packageJson.version, "0.2.73");
+  assert.equal(packageJson.version, "0.2.74");
   assert.equal(packageJson.version, pluginManifest.version);
   assert.equal(packageJson.version, conformance.adapterVersion);
   assert.equal(packageJson.version, ROOM_CONNECTOR_PROVENANCE.version);
