@@ -1,9 +1,41 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import {mkdtemp, writeFile, rm} from 'node:fs/promises';
+import {mkdtemp, writeFile, rm, readFile} from 'node:fs/promises';
 import {join} from 'node:path';
 import {tmpdir} from 'node:os';
 import {ShareTurn, beginShareTurn, endShareTurn, registerRoomShareFileTool, refused} from '../src/share-file.js';
+
+
+const CASES = [
+  "P12-01 own session shares without a hook or matching turn identifier",
+  "P12-02 host-reported continuation of a bound live session can share",
+  "P12-03 routing provenance or historical Room mapping grants no authority",
+  "P12-04 host-reported descendant chain shares and reuses the receipt",
+  "P12-05 turn end refuses bound sessions and late continuations",
+  "P12-06 historical continuations cannot join a successor turn",
+  "P12-07 missing identities and tool-supplied or unrecorded lineage are refused",
+  "P12-08 foreign lineage cannot move authority between Rooms",
+  "P12-09 unresolved dispatch and historical parent grant no authority",
+  "P12-10 canonical post sealing refuses sharing and new lineage"
+];
+
+test('P12 conformance names the clause and shared cases', async () => {
+  const conformance = JSON.parse(await readFile(new URL('../conformance.json', import.meta.url), 'utf8'));
+  const contract = await readFile(new URL('../docs/delivery-lifecycle-contract-v1.md', import.meta.url), 'utf8');
+  assert.deepEqual(conformance.parityP12Cases, CASES);
+  const [document, anchor] = conformance.parityP12Contract.split('#');
+  assert.equal(document, 'docs/delivery-lifecycle-contract-v1.md');
+  assert.equal(anchor, 'p12--share-authority-follows-the-hosts-own-session-continuation-2026-10-26');
+  const heading = "P12 — Share authority follows the host's own session continuation (2026-10-26)";
+  const headings = contract.split('\n').filter(line => line.startsWith('## ')).map(line => line.slice(3));
+  const anchors = headings.map(title => title.trim().toLowerCase().replace(/[^\w\- ]/g, '').replace(/ /g, '-'));
+  assert.ok(anchors.includes(anchor));
+  assert.equal(headings.filter(title => title === heading).length, 1);
+  assert.ok(contract.includes('\nP12-1 Host-owned continuation authority.'));
+  assert.ok(contract.includes('\nP12-2 Shared conformance.'));
+  const section = contract.split(`## ${heading}`)[1];
+  assert.deepEqual(section.split('\n').filter(line => line.startsWith('- ')).map(line => line.slice(2)), CASES);
+});
 
 // Port of Hermes tests/test_share_session_binding.py. OpenClaw tool ctx has
 // no parent: feed lineage through the actual subagent_spawned API instead.
@@ -34,13 +66,13 @@ async function setup(t) {
   return {created, hooks, key, begin, spawn, call, tool, own, turn};
 }
 
-test('share lineage 1: own session needs no hook, session UUID or matching run ID', async t => {
+test(CASES[0], async t => {
   const s = await setup(t);
   assert.equal((await s.call({sessionKey: s.key('session'), sessionId: 'rotated-uuid', runId: 'different-scheme'})).success, true);
   assert.deepEqual(s.created, ['session']);
 });
 
-test('share lineage 2: unknown child refuses before core hook, then shares', async t => {
+test(CASES[1], async t => {
   const s = await setup(t);
   assert.deepEqual(await s.call({sessionKey: s.key('child'), parentSessionKey: s.key('session')}), refused('no-room-turn'));
   const prebuilt = s.tool({sessionKey: s.key('child')});
@@ -49,7 +81,7 @@ test('share lineage 2: unknown child refuses before core hook, then shares', asy
   assert.deepEqual(s.created, ['session']);
 });
 
-test('share lineage 3: Room routing provenance alone grants nothing; core parent binds child', async t => {
+test(CASES[2], async t => {
   const s = await setup(t);
   const ctx = {sessionKey: s.key('mapped-child'), messageChannel: 'synthetic-sociality-room',
     deliveryContext: {channel: 'synthetic-sociality-room', to: 'room'}, agentAccountId: 'default'};
@@ -59,7 +91,7 @@ test('share lineage 3: Room routing provenance alone grants nothing; core parent
   assert.deepEqual(s.created, ['session']);
 });
 
-test('share lineage 4: reported descendants extend only the current turn, reusing its receipt', async t => {
+test(CASES[3], async t => {
   const s = await setup(t);
   s.hooks.get('subagent_spawned')?.({childSessionKey: ` ${s.key('rotated')} `},
     {childSessionKey: s.key('rotated'), requesterSessionKey: ` ${s.key('session')} `});
@@ -70,7 +102,7 @@ test('share lineage 4: reported descendants extend only the current turn, reusin
   assert.deepEqual(s.created, ['session']);
 });
 
-test('share lineage 5: ended turn refuses own, bound child and late descendant', async t => {
+test(CASES[4], async t => {
   const s = await setup(t);
   s.spawn('child', 'session');
   endShareTurn(s.key('session'), s.turn);
@@ -79,7 +111,7 @@ test('share lineage 5: ended turn refuses own, bound child and late descendant',
   assert.deepEqual(s.created, []);
 });
 
-test('share lineage 6: historical sessions and parents cannot join a successor', async t => {
+test(CASES[5], async t => {
   const s = await setup(t);
   s.spawn('old-child', 'session');
   endShareTurn(s.key('session'), s.turn);
@@ -95,7 +127,7 @@ test('share lineage 6: historical sessions and parents cannot join a successor',
   assert.equal(current.active, true);
 });
 
-test('share lineage 7: unrelated, missing and invalid identities cannot gain authority', async t => {
+test(CASES[6], async t => {
   const s = await setup(t);
   assert.deepEqual(await s.own('unrelated'), refused('no-room-turn'));
   for (const value of [undefined, null, 7, ' ']) {
@@ -110,7 +142,7 @@ test('share lineage 7: unrelated, missing and invalid identities cannot gain aut
   assert.deepEqual(s.created, []);
 });
 
-test('share lineage 8: foreign active and historical origins cannot move authority', async t => {
+test(CASES[7], async t => {
   const s = await setup(t);
   const other = s.begin('other-session');
   s.spawn('foreign-history', 'other-session');
@@ -125,7 +157,7 @@ test('share lineage 8: foreign active and historical origins cannot move authori
   assert.deepEqual(s.created, ['other-session', 'session']);
 });
 
-test('share lineage 9: unresolved dispatch and historical parent cannot create authority', async t => {
+test(CASES[8], async t => {
   const s = await setup(t);
   assert.throws(() => beginShareTurn('', s.turn), /unbound/);
   const historical = s.begin('historical');
@@ -135,7 +167,7 @@ test('share lineage 9: unresolved dispatch and historical parent cannot create a
   assert.deepEqual(s.created, []);
 });
 
-test('share lineage 10: parent lineage cannot bypass canonical sealing', async t => {
+test(CASES[9], async t => {
   const s = await setup(t);
   s.spawn('bound-child', 'session');
   s.turn.sealed = () => true;
