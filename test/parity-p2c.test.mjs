@@ -160,7 +160,7 @@ test("P2c-01 the credential is not readable through the agent's tools and never 
   if (!hostRoot) t.diagnostic("installed host 2026.7.1-2 unavailable; host proof skipped");
   else {
     const fenced = await hostToolCall(hostRoot, stateDir, stateFile, notes);
-    assert.deepEqual(fenced.hooks, ["before_tool_call", "gateway_stop", "inbound_claim", "tool_result_persist"]);
+    assert.deepEqual(fenced.hooks, ["before_tool_call", "gateway_stop", "inbound_claim", "subagent_spawned", "tool_result_persist"]);
     for (const label of ["readStore", "bashStore", "readStoreRelative"]) {
       assert.match(JSON.stringify(fenced[label]), /not available to agent tools/, label);
       assert.doesNotMatch(JSON.stringify(fenced[label]), new RegExp(FAKE_CREDENTIAL), label);
