@@ -129,21 +129,43 @@ export class ShareTurn {
   }
 }
 const active = new Map();
+// Provenance is a fence only, never authority for a later turn. Keep it after
+// end so a reported child cannot move a session from another dispatch origin.
+const origins = new Map();
+const sessionKeyText = value => typeof value === 'string' ? value.trim() : '';
 export function beginShareTurn(sessionKey, turn) {
-  if (!sessionKey || active.has(sessionKey)) throw new Error('Room share run already active or unbound');
+  sessionKey = sessionKeyText(sessionKey);
+  if (!sessionKey || active.has(sessionKey) || (origins.has(sessionKey) && origins.get(sessionKey) !== sessionKey)) throw new Error('Room share run already active or unbound');
   active.set(sessionKey, turn);
+  origins.set(sessionKey, sessionKey);
 }
 export function endShareTurn(sessionKey, turn) {
   turn.active = false;
-  if (active.get(sessionKey) === turn) active.delete(sessionKey);
+  for (const [key, bound] of active) if (bound === turn) active.delete(key);
+}
+function noteShareChild(event, ctx) {
+  // Core 2026.7.1-2: hook-types-DQ9eTy2x.d.ts:793-805 and
+  // openclaw-tools-KulZ1cdH.js:11619-11638. Tool ctx has no parent field.
+  const child = sessionKeyText(event?.childSessionKey);
+  const parent = sessionKeyText(ctx?.requesterSessionKey);
+  if (!child || !parent || (ctx?.childSessionKey !== undefined && sessionKeyText(ctx.childSessionKey) !== child)) return;
+  const turn = active.get(parent);
+  if (!turn || turn.closed()) return;
+  const origin = origins.get(parent);
+  if ((active.has(child) && active.get(child) !== turn) || (origins.has(child) && origins.get(child) !== origin)) return;
+  active.set(child, turn);
+  origins.set(child, origin);
 }
 export function registerRoomShareFileTool(api) {
   if (typeof api?.registerTool !== 'function') return false;
+  // This is post-launch observation. Before it arrives an unbound child must
+  // refuse; do not infer lineage from routing, tool arguments or key shapes.
+  if (typeof api.on === 'function') api.on('subagent_spawned', noteShareChild);
   api.registerTool(ctx => ({name: TOOL_NAME, label: 'Share Room file', description: DESCRIPTION, parameters: PARAMETERS,
     execute: async (_id, params) => {
       let result;
       try {
-        const turn = active.get(ctx?.sessionKey);
+        const turn = active.get(sessionKeyText(ctx?.sessionKey));
         result = turn ? await turn.share(params) : refused('no-room-turn');
       } catch { result = refused('upload'); }
       const {name, title, ...details} = result;
