@@ -50,6 +50,39 @@ function hostReplyPayload() {
   return hostReplyPayloadTask;
 }
 
+// ISSUE-163: nobody can answer a private approval in a Room session. On OpenClaw
+// 2026.7.1-2 exec answers "approval pending" at once and keeps the request open for
+// 30 minutes (bash-tools-DHyGpWCr.js:1299-1389; a Room is no native approval
+// channel), while the host drops the model's text in that run
+// (selection-JInn13lc.js:1626, payloads-1r4oLFNi.js:333). The deny goes by the
+// tool result's approval id through the host's own approval runtime; the host's
+// follow-up then gives the model the denial. A failing deny leaves the request to
+// the host's expiry and touches neither the turn nor the Room.
+let hostApprovalGatewayTask = null;
+function hostApprovalGateway() {
+  hostApprovalGatewayTask ??= import("openclaw/plugin-sdk/approval-gateway-runtime").catch(() => ({}));
+  return hostApprovalGatewayTask;
+}
+
+export function roomApprovalDeny(api) {
+  return async (event, ctx) => {
+    const details = event?.result?.details;
+    if (details?.status !== "approval-pending" || String(ctx?.sessionKey ?? "").split(":")[2] !== ID) return;
+    try {
+      const {resolveApprovalOverGateway} = await hostApprovalGateway();
+      await resolveApprovalOverGateway({
+        cfg: api?.runtime?.config?.current?.() ?? api?.config,
+        approvalId: details.approvalId,
+        decision: "deny",
+        clientDisplayName: "Room connector policy",
+      });
+      api?.logger?.info?.("Room private approval denied");
+    } catch (error) {
+      api?.logger?.warn?.(`Room private approval deny failed; the host's expiry stays in force${roomErrorDiagnostic(error)}`);
+    }
+  };
+}
+
 // Delivery contract P1a-6: payloads the host generates itself are never a Room
 // contribution. Markers as defined by OpenClaw 2026.7.1-2 (dist):
 // - isFallbackNotice: model fallback and fallback-cleared notices
@@ -62,8 +95,10 @@ function hostReplyPayload() {
 //   (reply-payload-BK_jICQ3.js:21-24; agent-runner.runtime-DtdxZiBX.js:541);
 // - nonTerminalToolErrorWarning metadata: the host's tool-error warning beside a
 //   reply (payloads-1r4oLFNi.js:467-482), read through the SDK helper;
+// - channelData.execApproval: the private approval prompt (exec-approval-reply-DiCxsYva.js:217);
 // - delivery kind "tool": tool-result and plan-status deliveries (dispatch-DnzGTpPs.js:1843-1860).
 export async function hostNoticeKind(payload, info) {
+  if (payload?.channelData?.execApproval) return "approval_prompt";
   if (payload?.isFallbackNotice === true) return "fallback_notice";
   if (payload?.isCompactionNotice === true) return "compaction_notice";
   if (payload?.isStatusNotice === true) return "status_notice";
@@ -414,6 +449,8 @@ export function createRoomChannel({makeClient}) {
                       deliver: async (payload, info) => {
                         const notice = await hostNoticeKind(payload, info);
                         if (notice) {
+                          // The host drops the model's text in this run: not a model that chose silence.
+                          if (notice === "approval_prompt") skipReason = "approval_required";
                           ctx.log?.info?.(`[${ctx.accountId}] Room host notice not posted kind=${notice} delivery=${info?.kind ?? "-"} source=${event.sourceEventId}`);
                           return {visibleReplySent: false};
                         }
@@ -562,6 +599,7 @@ export function createRoomChannel({makeClient}) {
       if (typeof api?.on === "function") {
         api.on("before_tool_call", roomToolCallPolicy(api, {noteWebRead: gatewayLoad}), {priority: 1000});
         api.on("tool_result_persist", roomToolResultScrub);
+        api.on("after_tool_call", roomApprovalDeny(api));
         if (gatewayLoad) api.on("gateway_stop", () => { roomLocalStatus(api?.logger, api?.runtime?.config?.current?.() ?? api?.config).setLoaded(false); });
       } else {
         api?.logger?.warn?.("Room connector: this OpenClaw host offers no tool hooks; the start gate still applies");
