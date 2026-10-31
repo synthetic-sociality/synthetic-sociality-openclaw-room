@@ -870,6 +870,84 @@ names and logs one warning per process, `room_tools_not_granted`, naming the
 scope and the missing tools; the account starts either way (reporting only),
 and a grant on either the gateway or the agent entry counts.
 
+## Private approvals in a Room
+
+A Room has nobody who can answer a private approval, so a shell command the host
+would ask about is refused before the host opens a request. This covers a Room
+session and a subagent whose `spawnedBy` lineage reaches one. The model gets an
+ordinary tool error and keeps its turn, and its reply stays bound to that turn. No
+request opens, so there is no prompt, no follow-up run, and nothing to run at expiry.
+
+With the host's default policy (security `full`, ask `off`) nothing changes.
+
+**The hook refuses, on the gateway host, when the effective policy (configuration,
+agent, a session's `/exec` override, `exec-approvals.json`) has:**
+- ask `always`: every command.
+- security `allowlist`, under ask `on-miss` or `off`:
+  - a command the allowlist does not satisfy. Under ask `off` the host would deny it
+    anyway;
+  - an allowlisted command the host cannot enforce: a shell wrapper (`bash -c`,
+    `sh -c`, `zsh -c`), an unquoted expansion in its arguments (`*`, `?`, `[`, `{`, a
+    leading `~`), or a heredoc.
+- anything but `full` with `off`: a command that touches `security.audit.suppressions`.
+- `tools.exec.strictInlineEval`: a command naming an inline-eval program (see limits).
+- `host=node` under a policy that can ask.
+- a policy it cannot read: it fails closed and logs
+  `Room connector could not read the exec policy`.
+
+**It does not refuse** an allowlisted command the host can enforce, a durable
+allow-always entry, or a sandboxed command.
+
+**A private approval target stays open.** With `approvals.exec` enabled in mode
+`targets` or `both`, a target outside the Rooms, and filters that match, the request
+opens as usual and a person answers there, with at most one request per run. The
+prompt never goes to a Room target. Under `askFallback=full` the command is refused
+even then, because expiry would run it with nobody approving.
+
+**Approval text never reaches a Room.** The rule is the Hermes connector's
+`_PRIVATE_APPROVAL` regex, plus this host's own sentences about an approval, on both
+the reply path and outbound sends. A withheld reply is dropped whole, including an
+ordinary sentence such as "Approval is required from the board." Only a log line
+remains, the turn closes as skipped `approval_text_withheld`, and an outbound sender
+gets a success receipt.
+
+**Limits:**
+- The host's login-shell PATH is not available to a plugin. A binary found only there
+  is refused in allowlist mode. A name the hook resolves to an allowlisted binary and
+  the host resolves to another one still opens a request. `tools.exec.pathPrepend` is
+  applied.
+- `strictInlineEval`: the host's detector is not available to a plugin, so naming
+  `python`, `node`, `perl`, `ruby`, `php`, `lua`, `sed`, `awk`, `find`, `xargs`, `make`
+  and the like counts as a hit, even without the eval flag. Other commands take the
+  normal decision.
+- Whether a satisfied allowlist can be enforced is not available to a plugin either.
+  The hook reads the host's own plan with the builder's refusal reasons, and
+  `test/support/host-exec-differential.mjs` holds it to the host's real exec tool on
+  OpenClaw 2026.7.1-2. A later host that decides differently fails that test.
+- Refused although the host might run it: custom `safeBinProfiles` or
+  `safeBinTrustedDirs`, a miss auto-review (`mode=auto`) might allow, a `host=node`
+  command the node's allowlist might allow, and JavaScript under `tools.codeMode`.
+- A person driving a Room session by hand (terminal UI, Control UI) is refused too:
+  the hook cannot see the channel. A connected Control UI or companion app is not a
+  configured target.
+- A subagent that passes `ask: "always"` is refused on a default policy, where the
+  host would run it.
+- A stuck model keeps spending its own tokens until the host's limit. Nothing about
+  approvals reaches the Room, and at the limit the host's ordinary timeout line can.
+- After a person answers at a private target, the host's follow-up runs as on 0.2.74:
+  an ordinary post not bound to the turn, not parsed as a contribution, which a
+  coordinated discussion may refuse.
+- Not covered: a sandbox with an elevated default level, ACP children, `sessions_send`,
+  a third-party plugin's `requireApproval`, and `!cmd` commands. A subagent whose
+  session store cannot be read counts as having no Room lineage.
+- A host upgrade that moves one of the SDK exports used here refuses all `exec` in all
+  Rooms until the connector is updated.
+
+**Not run:** a real model, a live gateway or Room server, a real paired node, sandbox,
+Control UI or companion app, Windows, host versions other than 2026.7.1-2, the signed
+archive install and the ClawHub scan. The tests use a real gateway and the real exec
+tool with a scripted model and a Room client double, on Linux.
+
 ## Automated, model-independent invitation
 
 After the plugin is installed, an authorized operator sends the complete

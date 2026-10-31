@@ -10,13 +10,13 @@
 //
 // roomExecNeedsApproval follows the host's own decision, createExecTool and
 // processGatewayAllowlist (bash-tools-DHyGpWCr.js:3270-3295, 980-1061), using the
-// SDK's evaluators. Where the SDK cannot answer it says yes, so it refuses rather
-// than guesses: tools.exec.strictInlineEval, custom safeBin profiles or trusted
-// directories, a miss the host's auto-review might still allow, and any host=node
-// command under a policy that can ask (its node decides remotely). A person driving
-// a Room session by hand counts as a Room session too: the hook context does not
-// name the channel.
-import {resolve} from "node:path";
+// SDK's evaluators. The SDK lacks two of the host's answers, so they are read from
+// the host's own evaluation: whether a satisfied allowlist can be enforced, and
+// whether a segment evals inline. Where the SDK cannot answer it says yes, so it
+// refuses rather than guesses. README "Private approvals in a Room" lists what that
+// costs. test/support/host-exec-differential.mjs holds the decision against the
+// host's real exec tool, so a host that decides differently fails the suite.
+import {delimiter, resolve} from "node:path";
 import {agentWorkspace} from "./secret-isolation.js";
 import {openClawStateDirectory} from "./state.js";
 
@@ -54,7 +54,7 @@ function agentExec(cfg, agentId) {
   return list.find((agent) => String(agent?.id ?? "").trim().toLowerCase() === id)?.tools?.exec;
 }
 
-// Effective policy before any command is looked at. Reads only.
+// Effective policy before any command is looked at.
 async function execPolicy({cfg, agentId, sessionKey, params, roomSession}) {
   const host = await import("openclaw/plugin-sdk/infra-runtime");
   const {resolveExecApprovalsFromFile, loadExecApprovals} = await import("openclaw/plugin-sdk/exec-approvals-runtime");
@@ -85,14 +85,45 @@ async function execPolicy({cfg, agentId, sessionKey, params, roomSession}) {
     fallback: host.minSecurity(security, file.askFallback),
     strictInlineEval: (localExec?.strictInlineEval ?? globalExec?.strictInlineEval) === true,
     safeBins: localExec?.safeBins ?? globalExec?.safeBins,
+    pathPrepend: localExec?.pathPrepend ?? globalExec?.pathPrepend,
   };
 }
 
+// The host asks when it cannot build an enforced command from a satisfied allowlist
+// (bash-tools-DHyGpWCr.js:1018-1033, 1048). Its builder is not in the SDK, so these
+// are the builder's refusals (exec-authorization-render-cF5Yzo-G.js:96-128, 175-200,
+// hasUnquotedShellExpansionSource :13-52), asked of the plan the host's evaluator
+// returned. Quoted text cannot expand; a shell wrapper's payload cannot be rewritten.
+const QUOTED_OR_ESCAPED = /\\[\s\S]|'[^']*'|"(?:\\[\s\S]|[^"\\])*"/g;
+const UNQUOTED_EXPANSION = /(?:^|\s)~|[{*?[]/;
+function enforceablePlan(host, {authorizationPlan: plan, segmentSatisfiedBy}) {
+  if (!plan?.ok || plan.dialect !== "posix-shell") return false;
+  const candidates = plan.groups.flatMap((group) => group.candidates);
+  if ((segmentSatisfiedBy ?? []).length !== candidates.length) return false;
+  return candidates.every(({sourceSegment, sourceStep, transport}) => {
+    if (transport?.kind === "shell-wrapper" || !host.resolvePlannedSegmentArgv(sourceSegment)?.[0]) return false;
+    const args = sourceStep.text.slice(Math.max(0, sourceStep.executableSpan.endIndex - sourceStep.span.startIndex));
+    return !UNQUOTED_EXPANSION.test(args.replace(QUOTED_OR_ESCAPED, ""));
+  });
+}
+
+// tools.exec.strictInlineEval: the host's detector (risks-CnLHDNUX.js:572) is not in
+// the SDK. A segment that names one of its inline-eval programs is taken as a hit, also
+// without its flag, also behind a wrapper such as env or timeout.
+const INLINE_EVAL_PROGRAMS = new Set(["awk", "bun", "deno", "find", "gawk", "gmake", "gsed", "lua", "make", "mawk", "nawk", "node", "nodejs",
+  "osascript", "perl", "php", "pypy", "python", "r", "rscript", "ruby", "sed", "xargs"]);
+function namesInlineEvalProgram(segment) {
+  return [...(segment?.resolution?.effectiveArgv ?? []), ...(segment?.argv ?? [])].some((token) => {
+    const name = String(token).split("/").pop().toLowerCase().replace(/-?\d+(?:\.\d+)*$/, "");
+    return INLINE_EVAL_PROGRAMS.has(name);
+  });
+}
+
 export async function roomExecNeedsApproval({cfg, agentId, sessionKey, params, cwd, policy}) {
-  const {host, target, security, ask, strictInlineEval, safeBins} = policy;
+  const {host, target, security, ask, strictInlineEval, safeBins, pathPrepend} = policy;
   if (target === "sandbox" || security === "deny") return false;
   if (security === "full" && ask === "off" && !strictInlineEval) return false;
-  if (target !== "gateway" || ask === "always" || strictInlineEval) return true;
+  if (target !== "gateway" || ask === "always") return true;
   const approvals = host.resolveExecApprovals(agentId, {security, ask});
   const hostSecurity = host.minSecurity(security, approvals.agent.security);
   const hostAsk = host.maxAsk(ask, approvals.agent.ask);
@@ -101,18 +132,27 @@ export async function roomExecNeedsApproval({cfg, agentId, sessionKey, params, c
   const command = String(params?.command ?? "");
   const workdir = params?.workdir ? resolve(cwd, String(params.workdir)) : cwd;
   const env = {...process.env, ...params?.env};
+  // As the host does for the gateway. Its login-shell PATH is not in the SDK.
+  const prepended = (Array.isArray(pathPrepend) ? pathPrepend : []).map((entry) => String(entry).trim()).filter(Boolean);
+  if (prepended.length) env.PATH = [...prepended, env.PATH].filter(Boolean).join(delimiter);
   const evaluation = await host.evaluateShellAllowlistWithAuthorization({
     command, allowlist: approvals.allowlist, safeBins: host.resolveSafeBins(safeBins), cwd: workdir, env, platform: process.platform,
   });
+  if (strictInlineEval && evaluation.segments.some(namesInlineEvalProgram)) return true;
   const {analysisOk} = evaluation;
   const allowlistSatisfied = hostSecurity === "allowlist" && analysisOk ? evaluation.allowlistSatisfied : false;
   const durableApprovalSatisfied = host.hasDurableExecApproval({
     analysisOk, segmentAllowlistEntries: evaluation.segmentAllowlistEntries, allowlist: approvals.allowlist, commandText: command,
   });
-  return Boolean(host.requiresExecApproval({ask: hostAsk, security: hostSecurity, analysisOk, allowlistSatisfied, durableApprovalSatisfied})
+  // An allowlist miss: the host asks, or under ask=off denies; here it does not run
+  // either way. Refusing both also covers a miss on this PATH that the host's
+  // login-shell PATH resolves, allowlists and then cannot enforce.
+  return Boolean((hostSecurity === "allowlist" && !allowlistSatisfied && !durableApprovalSatisfied)
     || (allowlistSatisfied && evaluation.segments.some((segment) => segment.argv.some((token) => token.startsWith("<<"))))
-    || (allowlistSatisfied && process.platform !== "win32" && !evaluation.authorizationPlan
-      && !host.hasExactCommandDurableExecApproval({allowlist: approvals.allowlist, commandText: command}))
+    || (allowlistSatisfied && !host.hasExactCommandDurableExecApproval({allowlist: approvals.allowlist, commandText: command})
+      && !(process.platform === "win32"
+        ? host.buildEnforcedShellCommand({command, segments: evaluation.segments, platform: process.platform}).ok === true
+        : enforceablePlan(host, evaluation)))
     || (!(hostSecurity === "full" && hostAsk === "off")
       && host.commandRequiresSecurityAuditSuppressionApproval({command, cwd: workdir, env, segments: evaluation.segments})));
 }

@@ -35,7 +35,7 @@ registerHooks({
 
 process.env.HOME = await mkdtemp(join(tmpdir(), "openclaw-room-163-home-"));
 const {createRoomChannel} = await import("../src/channel.js");
-const {isPrivateApprovalText} = await import("../src/exec-approval-policy.js");
+const {isPrivateApprovalText, roomExecApprovalPolicy, ROOM_EXEC_REFUSAL} = await import("../src/exec-approval-policy.js");
 
 test("the approval text rule is the same as Hermes's, plus this host's own sentences", () => {
   // tests/test_issue163_room_auto_deny.py and the Hermes review's probe.
@@ -142,6 +142,18 @@ test("an outbound send with approval text is counted as sent and never posted", 
   assert.doesNotMatch(calls.warn.join("\n"), /did not run|approval required/i);
 });
 
+test("a policy that cannot be read refuses in a Room session: fail closed", async () => {
+  const warned = [];
+  const unreadable = new Proxy({}, {get() { throw new Error("moved in a host bump"); }});
+  const hook = roomExecApprovalPolicy({runtime: {config: {current: () => unreadable}}, logger: {warn: (message) => warned.push(message)}});
+  const ctx = {sessionKey: "agent:main:synthetic-sociality-room:group:room-1:epoch:e1", agentId: "main", runId: "r1"};
+  assert.deepEqual(await hook({toolName: "exec", params: {command: "ls"}}, ctx), {block: true, blockReason: ROOM_EXEC_REFUSAL});
+  assert.ok(warned.some((message) => message.includes("could not read the exec policy")), warned.join("\n"));
+  // Other tools and other sessions never get that far.
+  assert.equal(hook({toolName: "read", params: {}}, ctx), undefined);
+  assert.equal(await hook({toolName: "exec", params: {command: "ls"}}, {sessionKey: "agent:main:telegram:direct:owner"}), undefined);
+});
+
 test("the host's approval forwarding never takes a Room as its target", () => {
   const {plugin} = createRoomChannel({makeClient: () => null});
   assert.equal(plugin.approvalCapability.delivery.shouldSuppressForwardingFallback({target: {channel: "synthetic-sociality-room", to: "room-1"}}), true);
@@ -180,6 +192,36 @@ function assertRefusedInTurn(report, {replySecondsBelow = 10} = {}) {
   assert.deepEqual(report.turn.map((item) => item.kind), ["ack"], detail);
 }
 
+test("the hook decides as the host's own exec tool does", async () => {
+  const {stdout} = await promisify(execFile)(process.execPath, [join(root, "test/support/host-exec-differential.mjs"), hostRoot(), root], {
+    timeout: 170_000, maxBuffer: 1 << 24,
+  });
+  const rows = JSON.parse(stdout.trim().split("\n").at(-1));
+  assert.ok(rows.length > 300, `${rows.length} rows`);
+  const differ = rows.filter((row) => row.expected !== row.hook);
+  assert.deepEqual(differ, []);
+  // The cases the source exists for, by name: each would pass with its clause gone.
+  const row = (config, command) => rows.find((item) => item.config === config && item.command === command);
+  for (const [config, command, hook, host] of [
+    ["on_miss", "bash -c 'git status'", "REFUSE", "ASK"],
+    ["allowlist_off", "ls *", "REFUSE", "ASK"],
+    ["on_miss", "cat <<EOF\nhi\nEOF", "REFUSE", "ASK"],
+    ["on_miss", "cat '<<EOF'", "REFUSE", "ASK"],
+    ["on_miss", "echo hi | tr a b", "pass", "RUN"],
+    ["allowlist_off", "./script.py", "REFUSE", "DENY"],
+    ["on_miss", "git status", "pass", "RUN"],
+    ["path_prepend", "mytool", "pass", "RUN"],
+    ["strict", "ls", "pass", "RUN"],
+    ["strict", "node -e 1", "REFUSE", "ASK"],
+    ["full_on_miss", "echo security.audit.suppressions", "REFUSE", "ASK"],
+    ["host_node_on_miss", "ls", "REFUSE", "not run"],
+    ["host_node_default", "ls", "pass", "not run"],
+  ]) {
+    const found = row(config, command);
+    assert.deepEqual(found && [found.hook, found.host], [hook, host], `${config}: ${command} ${JSON.stringify(found)}`);
+  }
+});
+
 describe("real gateway", {concurrency: 4}, () => {
   test("default policy: the command runs and nothing is refused", async () => {
     const report = await realTurn("default-policy");
@@ -201,6 +243,18 @@ describe("real gateway", {concurrency: 4}, () => {
     assert.equal(allowed.followUps, 0, detail);
     assert.deepEqual(allowed.posts.map((post) => post.sourceEventId), ["evt-5"], detail);
     assertRefusedInTurn(await realTurn("on-miss-miss"));
+  });
+
+  test("allowlisted but not enforceable: refused, and never run at expiry under askFallback=allowlist", async () => {
+    assertRefusedInTurn(await realTurn("allowlist-wrapper"));
+    assertRefusedInTurn(await realTurn("allowlist-glob"));
+  });
+
+  test("strictInlineEval leaves a plain command to the normal decision", async () => {
+    const report = await realTurn("strict-plain-command");
+    const detail = JSON.stringify(report);
+    assert.equal(report.commandRan, true, detail);
+    assert.equal(report.refusals, 0, detail);
   });
 
   test("askFallback=full never runs it, past the host's approval expiry", async () => {

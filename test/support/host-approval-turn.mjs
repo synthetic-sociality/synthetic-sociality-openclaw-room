@@ -27,6 +27,11 @@ const CASES = {
   "ask-always": {exec: ASKS, minMs: 4_000, maxMs: 20_000},
   "on-miss-allowlisted": {exec: ON_MISS, allowlistTouch: true, minMs: 2_000, maxMs: 15_000},
   "on-miss-miss": {exec: ON_MISS, minMs: 2_000, maxMs: 15_000},
+  // Allowlisted, but the host cannot enforce it and asks: with askFallback=allowlist
+  // the expiry would run it, approved by nobody.
+  "allowlist-wrapper": {exec: ON_MISS, allowlistTouch: true, askFallback: "allowlist", command: "bash -c 'touch MARKER'", expiryMs: 4_000, minMs: 7_000, maxMs: 25_000},
+  "allowlist-glob": {exec: {host: "gateway", security: "allowlist", ask: "off"}, allowlistTouch: true, askFallback: "allowlist", command: "touch MARKER*", expiryMs: 4_000, minMs: 7_000, maxMs: 25_000},
+  "strict-plain-command": {exec: {strictInlineEval: true}, minMs: 2_000, maxMs: 15_000},
   // Past the host's fixed 30 minute approval timer, cut to 4 s here.
   "fallback-full-expiry": {exec: FULL_ASKS, askFallback: "full", expiryMs: 4_000, minMs: 7_000, maxMs: 25_000},
   // The model asks for a guarded command for ever: the window is fixed, and longer
@@ -162,7 +167,7 @@ function chunk(delta, finish = null) {
   return {id: "c", object: "chat.completion.chunk", created: 1, model: "mock-1", choices: [{index: 0, delta, finish_reason: finish}]};
 }
 const call = (name, args) => ({name, args});
-const guardedCommand = () => call("exec", {command: `touch ${marker}`});
+const guardedCommand = () => call("exec", {command: (policy.command ?? "touch MARKER").replace("MARKER", marker)});
 function script(messages) {
   const system = messages.filter((message) => message.role === "system" || message.role === "developer").map(contentOf).join("\n");
   const users = messages.map((message, index) => ({message, index})).filter(({message}) => message.role === "user" && !contentOf(message).startsWith("[{\"type\":\"text\",\"text\":\"OpenClaw runtime context"));
