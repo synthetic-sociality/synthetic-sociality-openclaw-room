@@ -22,6 +22,11 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 26.3.0
+      - name: Install the pinned host for the real-gateway tests
+        shell: bash
+        run: |
+          npm install --no-save --no-package-lock --ignore-scripts "openclaw@$(node -p "require('./package.json').peerDependencies.openclaw")"
+          echo "OPENCLAW_HOST_ROOT=$PWD/node_modules/openclaw" >> "$GITHUB_ENV"
       - run: npm test
       - run: npm run check
       - run: npm pack --dry-run

@@ -1,21 +1,17 @@
 // ISSUE-163, OpenClaw translation: a command that needs private approval in a Room
-// session ends denied within seconds. Nobody can answer in a Room, so the connector
-// answers by the approval id of the tool result. The prompt is never posted and the
-// command is never approved.
+// session is refused at once with an ordinary tool error, so the model's reply stays
+// in its turn. No request opens, so no prompt, no follow-up run and nothing to run
+// later. Where the owner configured a private target the request stays open, because
+// a person can answer there. Approval text never reaches a Room.
 //
-// OpenClaw's path is not Hermes's. Exec answers "approval pending" at once and the
-// host keeps the request open for 30 minutes in the background, while it drops the
-// model's text in that run. On 0.2.74 the turn therefore ended without a reply, and
-// the host's follow-up reached the Room when the request expired; under
-// askFallback=full the command ran then, approved by nobody.
-//
-// The first tests use the SDK double; the last run a real gateway with the real exec
-// tool (test/support/host-approval-turn.mjs).
+// The first tests use doubles; the rest run a real gateway with the real exec tool
+// (test/support/host-approval-turn.mjs), which needs OPENCLAW_HOST_ROOT: without the
+// pinned host they fail, they do not skip.
 import assert from "node:assert/strict";
-import test from "node:test";
+import {describe, test} from "node:test";
 import {execFile} from "node:child_process";
 import {readFileSync} from "node:fs";
-import {createRequire, registerHooks} from "node:module";
+import {registerHooks} from "node:module";
 import {mkdtemp} from "node:fs/promises";
 import {tmpdir} from "node:os";
 import {dirname, join} from "node:path";
@@ -29,7 +25,6 @@ const mocks = {
   "openclaw/plugin-sdk/channel-core": "export const defineChannelPluginEntry = (entry) => entry;",
   "openclaw/plugin-sdk/channel-message": "export const defineChannelMessageAdapter = (adapter) => adapter;",
   "openclaw/plugin-sdk/channel-inbound": "export const buildChannelInboundEventContext = (context) => context;",
-  "openclaw/plugin-sdk/approval-gateway-runtime": "export const resolveApprovalOverGateway = (params) => globalThis.room163Resolve(params);",
 };
 registerHooks({
   resolve(specifier, context, nextResolve) {
@@ -39,61 +34,35 @@ registerHooks({
 });
 
 process.env.HOME = await mkdtemp(join(tmpdir(), "openclaw-room-163-home-"));
-const {createRoomChannel, roomApprovalDeny} = await import("../src/channel.js");
+const {createRoomChannel} = await import("../src/channel.js");
+const {isPrivateApprovalText} = await import("../src/exec-approval-policy.js");
 
-const APPROVAL_ID = "11111111-2222-4333-8444-555555555555";
-const ROOM_SESSION = "agent:main:synthetic-sociality-room:group:room-1:epoch:epoch-1";
-const pendingResult = {content: [{type: "text", text: "Approval required"}], details: {status: "approval-pending", approvalId: APPROVAL_ID, approvalSlug: "11111111", command: "touch /secret/path"}};
-
-function resolver(behaviour = async () => {}) {
-  const seen = [];
-  globalThis.room163Resolve = (params) => { seen.push(params); return behaviour(params); };
-  return seen;
-}
-function hookApi() {
-  const logs = {info: [], warn: []};
-  const config = {gateway: {mode: "local"}};
-  return {logs, config, api: {
-    config: {stale: true},
-    runtime: {config: {current: () => config}},
-    logger: {info: (message) => logs.info.push(message), warn: (message) => logs.warn.push(message)},
-  }};
-}
-
-test("a pending approval in a Room session is denied by its id, and only denied", async () => {
-  const seen = resolver();
-  const {api, config, logs} = hookApi();
-  await roomApprovalDeny(api)({toolName: "exec", result: pendingResult}, {sessionKey: ROOM_SESSION});
-  assert.equal(seen.length, 1);
-  assert.equal(seen[0].approvalId, APPROVAL_ID);
-  assert.equal(seen[0].decision, "deny");
-  assert.equal(seen[0].cfg, config);
-  assert.deepEqual(logs.info, ["Room private approval denied"]);
-});
-
-test("a deny that fails stays private and throws nothing into the host", async () => {
-  const seen = resolver(async () => { throw new Error("gateway closed touch /secret/path"); });
-  const {api, logs} = hookApi();
-  await roomApprovalDeny(api)({toolName: "exec", result: pendingResult}, {sessionKey: ROOM_SESSION});
-  assert.deepEqual(seen.map((params) => params.decision), ["deny"]);
-  assert.equal(logs.warn.length, 1);
-  assert.doesNotMatch(logs.warn[0], /secret/);
-});
-
-test("other sessions and other results deny nothing", async () => {
-  const seen = resolver();
-  const {api} = hookApi();
-  const hook = roomApprovalDeny(api);
-  await hook({toolName: "exec", result: pendingResult}, {sessionKey: "agent:main:telegram:direct:owner"});
-  await hook({toolName: "exec", result: pendingResult}, {});
-  await hook({toolName: "exec", result: {details: {status: "completed", exitCode: 0}}}, {sessionKey: ROOM_SESSION});
-  await hook({toolName: "exec", result: {details: {status: "approval-unavailable", reason: "no-approval-route"}}}, {sessionKey: ROOM_SESSION});
-  await hook({toolName: "exec"}, {sessionKey: ROOM_SESSION});
-  assert.deepEqual(seen, []);
+test("the approval text rule is the same as Hermes's, plus this host's own sentences", () => {
+  // tests/test_issue163_room_auto_deny.py and the Hermes review's probe.
+  for (const text of [
+    "⚠️ Dangerous command requires approval. Reply /approve or /deny.",
+    "If approval is required, I cannot run it here.",
+    "Hermes flagged a dangerous command; I stopped.",
+    "Approval required (id 641e170b, full 641e170b-f3d7).",
+    "reply `/approve abc allow-once`",
+    "🔒 Exec approval required\nID: 641e170b",
+    "Command did not run: approval timed out.",
+    "Command did not run: approval was denied.",
+    "Command did not run: approval is required.",
+    "Command did not run: approval request failed.",
+    "Command did not run.",
+    "I tried. Exec denied (gateway id=641e170b, user-denied): touch /tmp/x",
+  ]) assert.equal(isPrivateApprovalText(text), true, text);
+  for (const text of [
+    "The command was blocked, so I answer from memory.",
+    "This command needs approval, which I cannot get here.",
+    "The approval of the budget was denied.",
+    "",
+  ]) assert.equal(isPrivateApprovalText(text), false, text);
 });
 
 async function runTurn(steps) {
-  const calls = {post: [], settled: [], skipped: [], ack: [], results: []};
+  const calls = {post: [], settled: [], skipped: [], ack: [], results: [], warn: [], sent: []};
   const event = {
     id: "evt-1", sourceEventId: "evt-1", respondsToId: "evt-1", roomId: "room-1", epochId: "epoch-1",
     conversationId: "room-1:epoch:1", senderId: "human-1", senderName: "Owner", senderKind: "human",
@@ -119,11 +88,13 @@ async function runTurn(steps) {
     cfg: ISOLATED_HOST_CONFIG,
     getStatus: () => status,
     setStatus: (next) => { status = next; },
-    log: {info: () => {}, warn: () => {}, error: () => {}},
+    log: {info: () => {}, warn: (message) => calls.warn.push(message), error: () => {}},
     channelRuntime: {
       inbound: {run: async ({raw, adapter}) => {
         const turn = adapter.resolveTurn(adapter.ingest(raw));
         for (const [payload, info] of steps) calls.results.push(await turn.delivery.deliver(payload, info));
+        // While the account runs: what an outbound send of the host does.
+        for (const text of (steps.outbound ?? [])) calls.sent.push(await channel.plugin.message.send.text({accountId: "default", to: "room-1", text, deliveryQueueId: "q1"}));
       }},
       routing: {resolveAgentRoute: () => ({agentId: "main", accountId: "default", sessionKey: "session", mainSessionKey: "main"})},
       session: {resolveStorePath: () => "/tmp/session-store", recordInboundSession: async () => {}},
@@ -136,75 +107,203 @@ async function runTurn(steps) {
 test("the host's approval prompt is not posted, in any delivery kind, and the turn says why", async () => {
   const prompt = {
     text: "Approval required.\n\nRun:\n\n```txt\n/approve 11111111 allow-once\n```",
-    channelData: {execApproval: {approvalId: APPROVAL_ID, approvalSlug: "11111111", approvalKind: "exec"}},
+    channelData: {execApproval: {approvalId: "11111111-2222", approvalSlug: "11111111", approvalKind: "exec"}},
   };
   for (const kind of ["tool", "final"]) {
     const calls = await runTurn([[prompt, {kind}]]);
     assert.deepEqual(calls.results, [{visibleReplySent: false}]);
     assert.deepEqual(calls.post, []);
-    // The host dropped the model's text: this is not a model that chose silence.
     assert.deepEqual(calls.skipped, [["evt-1", "approval_required"]]);
     assert.deepEqual(calls.settled, ["pass"]);
     assert.deepEqual(calls.ack, ["evt-1"]);
   }
 });
 
-test("only the host's metadata marks a prompt: the same words from the model are posted", async () => {
-  const text = "Approval required: reply /approve abc allow-once or /deny.";
-  const calls = await runTurn([[{text}, {kind: "final"}]]);
-  assert.deepEqual(calls.post, [text]);
-  assert.deepEqual(calls.skipped, []);
+test("a reply with approval text is withheld, the turn closes, and a clean later payload is the reply", async () => {
+  const withheld = await runTurn([[{text: "Approval required: reply /approve abc allow-once."}, {kind: "final"}]]);
+  assert.deepEqual(withheld.post, []);
+  assert.deepEqual(withheld.skipped, [["evt-1", "approval_text_withheld"]]);
+  assert.deepEqual(withheld.settled, ["pass"]);
+  assert.deepEqual(withheld.ack, ["evt-1"]);
+  const clean = await runTurn([[{text: "If approval is required, I stop."}, {kind: "block"}], [{text: "I answer from memory."}, {kind: "final"}]]);
+  assert.deepEqual(clean.post, ["I answer from memory."]);
+  assert.deepEqual(clean.skipped, []);
 });
 
-function installedHost() {
-  const pinned = packageJson.peerDependencies.openclaw;
-  const candidates = [process.env.OPENCLAW_HOST_ROOT];
-  try { candidates.push(dirname(createRequire(join(root, "package.json")).resolve("openclaw/package.json"))); } catch {}
-  for (const candidate of candidates.filter(Boolean)) {
-    try {
-      if (JSON.parse(readFileSync(join(candidate, "package.json"), "utf8")).version === pinned) return candidate;
-    } catch {}
-  }
-  return null;
+test("an outbound send with approval text is counted as sent and never posted", async () => {
+  const steps = [[{text: "A reply."}, {kind: "final"}]];
+  steps.outbound = ["Command did not run: approval was denied.", "🔒 Exec approval required\nID: 1", "A plain message."];
+  const calls = await runTurn(steps);
+  assert.deepEqual(calls.post, ["A reply.", "A plain message."]);
+  assert.equal(calls.sent[0].messageId, "approval_text_withheld");
+  assert.equal(calls.sent[1].messageId, "approval_text_withheld");
+  assert.deepEqual(calls.sent[0].receipt.platformMessageIds, ["approval_text_withheld"]);
+  assert.equal(calls.warn.length, 2);
+  assert.doesNotMatch(calls.warn.join("\n"), /did not run|approval required/i);
+});
+
+test("the host's approval forwarding never takes a Room as its target", () => {
+  const {plugin} = createRoomChannel({makeClient: () => null});
+  assert.equal(plugin.approvalCapability.delivery.shouldSuppressForwardingFallback({target: {channel: "synthetic-sociality-room", to: "room-1"}}), true);
+  // Only the delivery adapter: no native route, and the turn's own surface state stays the host's.
+  assert.deepEqual(Object.keys(plugin.approvalCapability), ["delivery"]);
+});
+
+const PINNED_HOST = packageJson.peerDependencies.openclaw;
+function hostRoot() {
+  const candidate = process.env.OPENCLAW_HOST_ROOT;
+  assert.ok(candidate, `OPENCLAW_HOST_ROOT must name OpenClaw ${PINNED_HOST}: these tests prove the fix on the real host and do not skip`);
+  assert.equal(JSON.parse(readFileSync(join(candidate, "package.json"), "utf8")).version, PINNED_HOST);
+  return candidate;
 }
 
 async function realTurn(caseName) {
-  const {stdout} = await promisify(execFile)(process.execPath, [join(root, "test/support/host-approval-turn.mjs"), installedHost(), root, caseName], {
+  const {stdout} = await promisify(execFile)(process.execPath, [join(root, "test/support/host-approval-turn.mjs"), hostRoot(), root, caseName], {
     timeout: 120_000, maxBuffer: 1 << 20,
   });
   return JSON.parse(stdout.trim().split("\n").at(-1));
 }
 
-function assertDeniedAtOnce(report, denials = 1) {
+const REFUSED = "Refused in this Room session";
+function assertRefusedInTurn(report, {replySecondsBelow = 10} = {}) {
   const detail = JSON.stringify(report);
-  // The host's own result reached the model: "approval pending", not a double.
-  assert.ok(report.modelRequests.some((item) => item.toolResult?.startsWith("Approval required")), detail);
   assert.equal(report.commandRan, false, detail);
-  assert.equal(report.denials, denials, detail);
-  const followUp = report.modelRequests.find((item) => item.followUp);
-  assert.ok(followUp, `no follow-up after the private deny: ${detail}`);
-  assert.match(followUp.followUpText, /Exec denied \(gateway id=[0-9a-f-]+, user-denied\)/, detail);
-  assert.ok(followUp.second < 10, `denied after ${followUp.second} s: ${detail}`);
-  // Only the model's own reply reaches the Room: no control text.
-  assert.deepEqual([...new Set(report.posts.map((post) => post.text))], ["FOLLOW-UP REPLY"], detail);
-  assert.deepEqual(report.turn.map((item) => [item.kind, item.action ?? item.reason ?? ""]),
-    [["settle", "pass"], ["skipped", "approval_required"], ["ack", ""]], detail);
-  assert.ok(report.turn.at(-1).second < 10, detail);
+  assert.ok(report.refusals >= 1, detail);
+  assert.ok(report.modelRequests.some((item) => item.toolResult?.includes(REFUSED)), detail);
+  // No request opened: the model never saw its text and the host starts no follow-up.
+  assert.ok(!report.modelRequests.some((item) => item.toolResult?.includes("Approval required")), detail);
+  assert.equal(report.followUps, 0, detail);
+  // One reply, the model's own, bound to its turn, not a literal outbound post.
+  assert.deepEqual(report.posts.map(({text, literal, sourceEventId}) => ({text, literal, sourceEventId})),
+    [{text: "REPLY AFTER THE TOOL RESULT", literal: false, sourceEventId: "evt-5"}], detail);
+  assert.ok(report.posts[0].second < replySecondsBelow, detail);
+  assert.deepEqual(report.turn.map((item) => item.kind), ["ack"], detail);
 }
 
-const hostTest = (name, run) => test(`real gateway: ${name}`, async (t) => {
-  if (!installedHost()) return t.skip(`OpenClaw ${packageJson.peerDependencies.openclaw} is not installed`);
-  await run();
-});
+describe("real gateway", {concurrency: 4}, () => {
+  test("default policy: the command runs and nothing is refused", async () => {
+    const report = await realTurn("default-policy");
+    const detail = JSON.stringify(report);
+    assert.equal(report.commandRan, true, detail);
+    assert.equal(report.refusals, 0, detail);
+    assert.deepEqual(report.posts.map((post) => [post.text, post.sourceEventId]), [["REPLY AFTER THE TOOL RESULT", "evt-5"]], detail);
+  });
 
-hostTest("a command needing approval in a Room turn ends denied within seconds", async () => {
-  assertDeniedAtOnce(await realTurn("ask-always"));
-});
+  test("a command needing approval is refused at once and the reply stays in the turn", async () => {
+    assertRefusedInTurn(await realTurn("ask-always"));
+  });
 
-hostTest("a second guarded command in the host's follow-up run ends denied too", async () => {
-  assertDeniedAtOnce(await realTurn("follow-up-reruns"), 2);
-});
+  test("an allowlisted command runs under ask=on-miss, and a miss is refused", async () => {
+    const allowed = await realTurn("on-miss-allowlisted");
+    const detail = JSON.stringify(allowed);
+    assert.equal(allowed.commandRan, true, detail);
+    assert.equal(allowed.refusals, 0, detail);
+    assert.equal(allowed.followUps, 0, detail);
+    assert.deepEqual(allowed.posts.map((post) => post.sourceEventId), ["evt-5"], detail);
+    assertRefusedInTurn(await realTurn("on-miss-miss"));
+  });
 
-hostTest("askFallback=full never runs it, past the host's approval expiry", async () => {
-  assertDeniedAtOnce(await realTurn("fallback-full-expiry"));
+  test("askFallback=full never runs it, past the host's approval expiry", async () => {
+    assertRefusedInTurn(await realTurn("fallback-full-expiry"));
+  });
+
+  test("an operator's /exec override on the Room session counts: refused, never run at expiry", async () => {
+    assertRefusedInTurn(await realTurn("session-override-ask"));
+  });
+
+  test("a stuck model: nothing reaches the Room, no request, no follow-up", async () => {
+    const report = await realTurn("stuck-model");
+    const detail = JSON.stringify(report);
+    assert.ok(report.refusals >= 5, detail);
+    assert.equal(report.commandRan, false, detail);
+    assert.equal(report.followUps, 0, detail);
+    assert.deepEqual(report.posts, [], detail);
+  });
+
+  test("a slow model: one reply bound to its turn, no host sentence while it thinks", async () => {
+    assertRefusedInTurn(await realTurn("slow-model"), {replySecondsBelow: 20});
+  });
+
+  test("a provider error: no approval text and no follow-up, the turn closes", async () => {
+    const report = await realTurn("provider-error");
+    const detail = JSON.stringify(report);
+    assert.equal(report.commandRan, false, detail);
+    assert.equal(report.followUps, 0, detail);
+    assert.deepEqual(report.posts, [], detail);
+    assert.deepEqual(report.turn.map((item) => item.kind).at(-1), "ack", detail);
+  });
+
+  test("a subagent spawned in the Room turn is refused too, under askFallback=full", async () => {
+    const report = await realTurn("subagent");
+    const detail = JSON.stringify(report);
+    assert.ok(report.modelRequests.some((item) => item.subagent && item.toolResult?.includes(REFUSED)), detail);
+    assert.equal(report.commandRan, false, detail);
+    assert.equal(report.followUps, 0, detail);
+    assert.ok(!report.posts.some((post) => isPrivateApprovalText(post.text)), detail);
+  });
+
+  test("session forwarding: nothing reaches the Room but the model's reply", async () => {
+    assertRefusedInTurn(await realTurn("forward-session"));
+  });
+
+  test("forwarding that reaches no private person is no private target: refused", async () => {
+    for (const caseName of ["target-filtered-out", "target-is-a-room"]) {
+      const report = await realTurn(caseName);
+      assertRefusedInTurn(report);
+      assert.deepEqual(report.desk, [], JSON.stringify(report));
+    }
+  });
+
+  test("a private target: the request stays open and the prompt goes only there", async () => {
+    const report = await realTurn("private-target-open");
+    const detail = JSON.stringify(report);
+    assert.equal(report.refusals, 0, detail);
+    assert.equal(report.commandRan, false, detail);
+    assert.equal(report.followUps, 0, detail);
+    assert.deepEqual(report.posts, [], detail);
+    assert.equal(report.desk.length, 1, detail);
+    assert.match(report.desk[0].text, /Exec approval required/, detail);
+    assert.deepEqual(report.turn.map((item) => [item.kind, item.reason ?? ""]).at(1), ["skipped", "approval_required"], detail);
+  });
+
+  test("a private target: the person's yes runs it, and the model's reply reaches the Room", async () => {
+    const report = await realTurn("private-target-answered");
+    const detail = JSON.stringify(report);
+    assert.deepEqual(report.deskErrors, [], detail);
+    assert.equal(report.commandRan, true, detail);
+    assert.deepEqual(report.posts.map((post) => post.text), ["FOLLOW-UP REPLY"], detail);
+  });
+
+  test("a private target: the person's no with a failing follow-up posts no host sentence", async () => {
+    const report = await realTurn("private-target-denied-follow-up-fails");
+    const detail = JSON.stringify(report);
+    assert.deepEqual(report.deskErrors, [], detail);
+    assert.equal(report.commandRan, false, detail);
+    assert.deepEqual(report.posts, [], detail);
+    assert.ok(report.withheld >= 1, detail);
+  });
+
+  test("a private target under askFallback=full: refused, because expiry would run it", async () => {
+    const report = await realTurn("private-target-fallback-full");
+    assertRefusedInTurn(report);
+    assert.deepEqual(report.desk, [], JSON.stringify(report));
+  });
+
+  test("a private target and a stuck model: one request, nothing in the Room", async () => {
+    const report = await realTurn("private-target-stuck");
+    const detail = JSON.stringify(report);
+    assert.equal(report.desk.length, 1, detail);
+    assert.ok(report.refusals >= 5, detail);
+    assert.equal(report.commandRan, false, detail);
+    assert.deepEqual(report.posts, [], detail);
+  });
+
+  test("the model's reply with approval text is withheld and the turn closes", async () => {
+    const report = await realTurn("reply-echo");
+    const detail = JSON.stringify(report);
+    assert.deepEqual(report.posts, [], detail);
+    assert.ok(report.withheld >= 1, detail);
+    assert.deepEqual(report.turn.map((item) => [item.kind, item.action ?? item.reason ?? ""]),
+      [["settle", "pass"], ["skipped", "approval_text_withheld"], ["ack", ""]], detail);
+  });
 });

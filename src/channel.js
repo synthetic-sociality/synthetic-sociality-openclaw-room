@@ -13,6 +13,7 @@ import {claimRuntimeOwnership} from "./account.js";
 import {resolveRoomAccount as resolveAccount, resolvedRoomAccounts} from "./account-discovery.js";
 import {looksLikeRoomId, normalizeRoomTarget, resolveConfiguredRoomTarget} from "./target.js";
 import {outboundIdempotencyKey} from "./outbound.js";
+import {isPrivateApprovalText, roomExecApprovalPolicy} from "./exec-approval-policy.js";
 import {roomErrorDiagnostic} from "./room-client.js";
 import {
   DEFAULT_EXECUTION_FAILURE,
@@ -29,6 +30,7 @@ import {
 } from "./reply-policy.js";
 
 const ID = "synthetic-sociality-room";
+const APPROVAL_TEXT_WITHHELD = "approval_text_withheld";
 const GENERIC_OPENCLAW_OPERATIONAL_FALLBACK = "⚠️ Something went wrong while processing your request. Please try again, or use /new to start a fresh session.";
 const COMPACTION_OPENCLAW_OPERATIONAL_FALLBACK = "⚠️ Auto-compaction could not recover this turn. I kept this conversation mapped to the current session. Please try again, use /compact, or use /new to start a fresh session.\n\nTo prevent this, increase your compaction buffer by setting `agents.defaults.compaction.reserveTokensFloor` to 20000 or higher in your config.";
 const OPENCLAW_OPERATIONAL_FALLBACKS = new Set([
@@ -48,39 +50,6 @@ let hostReplyPayloadTask = null;
 function hostReplyPayload() {
   hostReplyPayloadTask ??= import("openclaw/plugin-sdk/reply-payload").catch(() => ({}));
   return hostReplyPayloadTask;
-}
-
-// ISSUE-163: nobody can answer a private approval in a Room session. On OpenClaw
-// 2026.7.1-2 exec answers "approval pending" at once and keeps the request open for
-// 30 minutes (bash-tools-DHyGpWCr.js:1299-1389; a Room is no native approval
-// channel), while the host drops the model's text in that run
-// (selection-JInn13lc.js:1626, payloads-1r4oLFNi.js:333). The deny goes by the
-// tool result's approval id through the host's own approval runtime; the host's
-// follow-up then gives the model the denial. A failing deny leaves the request to
-// the host's expiry and touches neither the turn nor the Room.
-let hostApprovalGatewayTask = null;
-function hostApprovalGateway() {
-  hostApprovalGatewayTask ??= import("openclaw/plugin-sdk/approval-gateway-runtime").catch(() => ({}));
-  return hostApprovalGatewayTask;
-}
-
-export function roomApprovalDeny(api) {
-  return async (event, ctx) => {
-    const details = event?.result?.details;
-    if (details?.status !== "approval-pending" || String(ctx?.sessionKey ?? "").split(":")[2] !== ID) return;
-    try {
-      const {resolveApprovalOverGateway} = await hostApprovalGateway();
-      await resolveApprovalOverGateway({
-        cfg: api?.runtime?.config?.current?.() ?? api?.config,
-        approvalId: details.approvalId,
-        decision: "deny",
-        clientDisplayName: "Room connector policy",
-      });
-      api?.logger?.info?.("Room private approval denied");
-    } catch (error) {
-      api?.logger?.warn?.(`Room private approval deny failed; the host's expiry stays in force${roomErrorDiagnostic(error)}`);
-    }
-  };
 }
 
 // Delivery contract P1a-6: payloads the host generates itself are never a Room
@@ -224,6 +193,12 @@ export function createRoomChannel({makeClient}) {
         const accountId = ctx.accountId ?? "default";
         const entry = live.get(accountId);
         if (!entry) throw new Error(`Room account ${accountId} is not running`);
+        // ISSUE-163: approval text never reaches a Room. The host counts this as
+        // sent, so it neither retries nor falls back to another text.
+        if (isPrivateApprovalText(ctx.text)) {
+          entry.log?.warn?.(`[${accountId}] Room outbound text withheld: private approval text`);
+          return {messageId: APPROVAL_TEXT_WITHHELD, receipt: receipt(APPROVAL_TEXT_WITHHELD, Date.now())};
+        }
         const sent = await entry.client.postAndFinish({
           roomId: ctx.to,
           text: ctx.text,
@@ -252,6 +227,9 @@ export function createRoomChannel({makeClient}) {
       showInSetup: true,
     },
     capabilities: {chatTypes: ["group"], reply: true, media: false, reactions: false, blockStreaming: true},
+    // ISSUE-163: the host's approval forwarding never goes to a Room target (host
+    // server-aux-handlers-BfM3vWwc.js:85-94); other targets keep their prompt.
+    approvalCapability: {delivery: {shouldSuppressForwardingFallback: () => true}},
     messaging: {
       targetPrefixes: [ID, "room"],
       normalizeTarget: normalizeRoomTarget,
@@ -333,7 +311,7 @@ export function createRoomChannel({makeClient}) {
             peer: {kind: "group", id: conversationId}, parentPeer: {kind: "group", id: roomId},
           })?.agentId;
           const session = await client.initialize(ctx.abortSignal);
-          live.set(ctx.accountId, {token: ownership.token, client, abortSignal: ctx.abortSignal});
+          live.set(ctx.accountId, {token: ownership.token, client, abortSignal: ctx.abortSignal, log: ctx.log});
           ctx.setStatus({...ctx.getStatus(), running: true, connected: true, lastConnectedAt: Date.now(), lastError: null});
           ctx.log?.info?.(`[${ctx.accountId}] Room connection signal established (${session.sessionId})`);
           for await (const event of client.assignedTurns(ctx.abortSignal)) {
@@ -449,7 +427,8 @@ export function createRoomChannel({makeClient}) {
                       deliver: async (payload, info) => {
                         const notice = await hostNoticeKind(payload, info);
                         if (notice) {
-                          // The host drops the model's text in this run: not a model that chose silence.
+                          // Only at a private target (ISSUE-163): the host drops the model's text
+                          // in this run, and this is not a model that chose silence.
                           if (notice === "approval_prompt") skipReason = "approval_required";
                           ctx.log?.info?.(`[${ctx.accountId}] Room host notice not posted kind=${notice} delivery=${info?.kind ?? "-"} source=${event.sourceEventId}`);
                           return {visibleReplySent: false};
@@ -461,6 +440,12 @@ export function createRoomChannel({makeClient}) {
                         }
                         const text = payload.text?.trim();
                         if (!text) return {visibleReplySent: false};
+                        // ISSUE-163: the same rule as Hermes; the turn closes as a recorded skip.
+                        if (isPrivateApprovalText(text)) {
+                          skipReason ||= APPROVAL_TEXT_WITHHELD;
+                          ctx.log?.warn?.(`[${ctx.accountId}] Room reply withheld: private approval text source=${event.sourceEventId}`);
+                          return {visibleReplySent: false};
+                        }
                         if (replyText !== null) {
                           if (text === replyText && replySent) {
                             return {messageIds: [replySent.eventId], receipt: receipt(replySent.eventId, replySent.sentAt), visibleReplySent: true};
@@ -597,9 +582,10 @@ export function createRoomChannel({makeClient}) {
       if (gatewayLoad) roomLocalStatus(api?.logger, api?.config).setLoaded(true);
       // Contract P2c-1: fence the store in every session, and scrub results.
       if (typeof api?.on === "function") {
-        api.on("before_tool_call", roomToolCallPolicy(api, {noteWebRead: gatewayLoad}), {priority: 1000});
+        const fence = roomToolCallPolicy(api, {noteWebRead: gatewayLoad});
+        const approvals = roomExecApprovalPolicy(api);
+        api.on("before_tool_call", (event, ctx) => fence(event, ctx) ?? approvals(event, ctx), {priority: 1000});
         api.on("tool_result_persist", roomToolResultScrub);
-        api.on("after_tool_call", roomApprovalDeny(api));
         if (gatewayLoad) api.on("gateway_stop", () => { roomLocalStatus(api?.logger, api?.runtime?.config?.current?.() ?? api?.config).setLoaded(false); });
       } else {
         api?.logger?.warn?.("Room connector: this OpenClaw host offers no tool hooks; the start gate still applies");
