@@ -1,7 +1,7 @@
 {
   "id": "synthetic-sociality-room",
   "name": "Synthetic Sociality Room",
-  "version": "0.2.74",
+  "version": "0.2.75",
   "description": "Identity-preserving Synthetic Sociality Room channel for OpenClaw.",
   "activation": {"onStartup": true},
   "contracts": {"tools": ["synthetic_sociality_room_history", "synthetic_sociality_room_document", "synthetic_sociality_room_share_file"]},

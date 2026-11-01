@@ -27,6 +27,15 @@ content. P9 separately hands verified photo bytes to the host; the connector
 never executes uploaded content. An exact artifact read also invokes the Room server's supported
 deterministic text backfill for older pending versions.
 
+Version 0.2.75 is paired with Hermes 1.0.101 and carries ISSUE-163: a command
+that needs private approval is refused at once in a Room, with an ordinary tool
+error, so the reply stays in its turn. Nothing changes on the default policy
+(security `full`, ask `off`). See "Private approvals in a Room" for the rule and its
+limits. No change to the persisted state format or delivery lifecycle; no state
+migration in either direction. Rollback to 0.2.74: install 0.2.74 from its signed
+GitHub release, as for any version. The declared `pluginApi` range stays
+`>=2026.7.1-2 <2026.7.2`.
+
 Version 0.2.74 is parity release P12, paired with Hermes 1.0.92 ("Room share
 keeps working after context compression"). Initial share authority still
 comes only from dispatch. A core `subagent_spawned` notification can extend
