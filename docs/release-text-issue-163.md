@@ -25,7 +25,8 @@ this host's own sentences. A reply that matches is dropped whole, even an ordina
 sentence, and only a log line remains.
 
 **Limits:**
-- A binary found only on the login-shell PATH is refused in allowlist mode. A name the
+- A binary the host finds on its login-shell PATH, alone or before the daemon's copy, is
+  refused in allowlist mode, also under ask `off`, although the host would run it. A name the
   hook and the host resolve differently can still open a request.
 - `strictInlineEval` also refuses `python script.py` or `find . -name x`, which name
   such a program without its eval flag.

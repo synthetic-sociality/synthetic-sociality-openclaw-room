@@ -885,7 +885,7 @@ agent, a session's `/exec` override, `exec-approvals.json`) has:**
 - ask `always`: every command.
 - security `allowlist`, under ask `on-miss` or `off`:
   - a command the allowlist does not satisfy. Under ask `off` the host would deny it
-    anyway;
+    anyway, apart from the login-shell PATH case below;
   - an allowlisted command the host cannot enforce: a shell wrapper (`bash -c`,
     `sh -c`, `zsh -c`), an unquoted expansion in its arguments (`*`, `?`, `[`, `{`, a
     leading `~`), or a heredoc.
@@ -912,14 +912,16 @@ remains, the turn closes as skipped `approval_text_withheld`, and an outbound se
 gets a success receipt.
 
 **Limits:**
-- The host's login-shell PATH is not available to a plugin. A binary found only there
-  is refused in allowlist mode. A name the hook resolves to an allowlisted binary and
+- The host's login-shell PATH is not available to a plugin. A binary the host finds there,
+  alone or before the daemon's copy, is refused in allowlist mode, also under ask `off`,
+  although the host would run it. A name the hook resolves to an allowlisted binary and
   the host resolves to another one still opens a request. `tools.exec.pathPrepend` is
   applied.
 - `strictInlineEval`: the host's detector is not available to a plugin, so naming
   `python`, `node`, `perl`, `ruby`, `php`, `lua`, `sed`, `awk`, `find`, `xargs`, `make`
   and the like counts as a hit, even without the eval flag. Other commands take the
-  normal decision.
+  normal decision. A program named inside one argument, as in `env -S 'node -e 1'`, is
+  not seen: the host then asks, and the command cannot run unapproved.
 - Whether a satisfied allowlist can be enforced is not available to a plugin either.
   The hook reads the host's own plan with the builder's refusal reasons, and
   `test/support/host-exec-differential.mjs` holds it to the host's real exec tool on
