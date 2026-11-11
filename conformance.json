@@ -3,7 +3,7 @@
   "contract": "synthetic-sociality-room-delivery-lifecycle-v1",
   "contractDocument": "docs/delivery-lifecycle-contract-v1.md",
   "adapter": "synthetic-sociality-room",
-  "adapterVersion": "0.2.75",
+  "adapterVersion": "0.2.78",
   "platform": "OpenClaw",
   "roomProtocol": "external-agent-connector-v1",
   "verifiedFeatures": {
@@ -1537,5 +1537,13 @@
     "P12-08 foreign lineage cannot move authority between Rooms",
     "P12-09 unresolved dispatch and historical parent grant no authority",
     "P12-10 canonical post sealing refuses sharing and new lineage"
+  ],
+  "parityP16Contract": "docs/delivery-lifecycle-contract-v1.md#p16--one-live-binding-per-room-2026-11-11",
+  "parityP16Cases": [
+    "P16-01 expiry of one binding keeps sibling receive and send on one live binding",
+    "P16-02 revocation of one binding keeps sibling receive and send on one live binding",
+    "P16-03 renewal of one binding keeps one live binding per Room",
+    "P16-04 a stopped binding keeps its reason and posts nothing",
+    "P16-05 a persisted revocation wins over a later expiry"
   ]
 }

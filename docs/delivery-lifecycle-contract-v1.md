@@ -1215,3 +1215,37 @@ These local checks do not replace live host acceptance or independent review.
 - P12-08 foreign lineage cannot move authority between Rooms
 - P12-09 unresolved dispatch and historical parent grant no authority
 - P12-10 canonical post sealing refuses sharing and new lineage
+
+## P16 — One live binding per Room (2026-11-11)
+
+A connector serves several Room bindings in one installation. Each binding has
+exactly one live state object, and every active receive path (listener,
+heartbeat, enrollment watcher) and send path (reply, attempt authority,
+completion) of that Room uses that same object.
+
+- P16-1 Credential expiry or revocation of one binding changes only that
+  binding, in place. It never reloads or replaces the state of any other
+  binding, so a sibling Room's receive and send paths stay attached to the same
+  object and keep their delivery authority.
+- P16-2 A credential renewal of one binding applies the renewed values to that
+  binding's live object (or starts its listener with the object the send path
+  uses). It never leaves a listener and the send path on different objects.
+- P16-3 Controls are unchanged: the expired or revoked binding stays stopped
+  with its reason (`credential_expired`, `credential_revoked`) and posts
+  nothing; a persisted revocation still wins over a later expiry; cursors,
+  journals and quarantined deliveries are not touched.
+
+Seen live on 10 and 11 Nov 2026 (Hermes 1.0.101): after one Room credential
+expired, every other Room of the agent refused its next reply with
+`attempt_authority_missing` until a gateway restart. Corrected in Hermes
+1.0.103. OpenClaw runs one runtime and one state object per Room account and
+already satisfies P16; OpenClaw 0.2.78 adds the clause and its conformance
+tests without a runtime change. No persisted state migration.
+
+Both conformance files pin `parityP16Contract` and these identical case names:
+
+- P16-01 expiry of one binding keeps sibling receive and send on one live binding
+- P16-02 revocation of one binding keeps sibling receive and send on one live binding
+- P16-03 renewal of one binding keeps one live binding per Room
+- P16-04 a stopped binding keeps its reason and posts nothing
+- P16-05 a persisted revocation wins over a later expiry

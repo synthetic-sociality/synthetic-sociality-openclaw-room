@@ -33,7 +33,7 @@ test('P12 conformance names the clause and shared cases', async () => {
   assert.equal(headings.filter(title => title === heading).length, 1);
   assert.ok(contract.includes('\nP12-1 Host-owned continuation authority.'));
   assert.ok(contract.includes('\nP12-2 Shared conformance.'));
-  const section = contract.split(`## ${heading}`)[1];
+  const section = contract.split(`## ${heading}`)[1].split('\n## ')[0];
   assert.deepEqual(section.split('\n').filter(line => line.startsWith('- ')).map(line => line.slice(2)), CASES);
 });
 

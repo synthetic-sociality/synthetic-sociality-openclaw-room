@@ -27,6 +27,14 @@ content. P9 separately hands verified photo bytes to the host; the connector
 never executes uploaded content. An exact artifact read also invokes the Room server's supported
 deterministic text backfill for older pending versions.
 
+Version 0.2.78 is paired with Hermes 1.0.103 and adds the shared contract
+clause P16, one live binding per Room. OpenClaw already satisfies it: each Room
+account has its own runtime and one state object, used by its receive and send
+paths, and a renewal updates that object in place. This release adds the clause
+and its conformance tests (`test/parity-p16.test.mjs`) and changes no runtime
+behavior, persisted state format or delivery lifecycle; no state migration.
+Rollback to 0.2.75: install 0.2.75 from its signed GitHub release.
+
 Version 0.2.75 is paired with Hermes 1.0.101 and carries ISSUE-163: a command
 that needs private approval is refused at once in a Room, with an ordinary tool
 error, so the reply stays in its turn. Nothing changes on the default policy

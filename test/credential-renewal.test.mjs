@@ -336,3 +336,45 @@ test("enabled expired native account keeps renewal-only discovery alive and hot-
     assert.equal(runtime.state.clientInstanceId, "instance-1");
   } finally { await runtime.close(); }
 });
+
+test("P16-03 renewal of one binding keeps one live binding per Room", async () => {
+  // Shared clause P16 (Hermes 1.0.103): renewal updates the runtime's one live
+  // state object in place; receive (registration) and send use that object.
+  const f = await fixture();
+  let offered = false;
+  const seen = [];
+  let runtime;
+  const fetchImpl = async (url, init) => {
+    const path = new URL(url).pathname;
+    const session = {...f.state, credential: init.headers.Authorization?.slice(7)};
+    const body = init.body && JSON.parse(init.body);
+    let response, status = 200;
+    if (path.endsWith("/credential-renewal-intent")) response = {request: offered ? f.request : null};
+    else if (path.endsWith("/credential-renewal-requests")) { response = await f.client.requestCredentialRenewal(session, body); status = 201; }
+    else if (path.endsWith("/redeem")) response = await f.client.redeemCredentialRenewal(session, "grant-1", body);
+    else if (path.endsWith("/verify")) response = await f.client.verifyCredentialRenewal(session);
+    else if (path.endsWith("/confirm")) { response = await f.client.confirmCredentialRenewal(session); offered = false; }
+    else if (path.endsWith("/state")) response = await f.client.roomState(session);
+    else if (path.endsWith("/connector/sessions")) {
+      seen.push({state: runtime.state, client: runtime.client, credential: session.credential});
+      if (session.credential === "expired-base") { response = {code: "credential_expired"}; status = 401; }
+      else response = {sessionId: "fresh-session", heartbeatIntervalSeconds: 15, capabilities: []};
+    } else if (path.endsWith("/activity")) response = {acceptedStreamSeq: body.streamSeq};
+    else throw new Error("Unexpected route");
+    return new Response(JSON.stringify(response), {status});
+  };
+  runtime = new OpenClawRoomRuntime({stateFile: f.stateFile, enabled: true}, {
+    fetchImpl, waitForRenewal: true, renewalWait: async () => { offered = true; },
+  });
+  try {
+    await runtime.initialize();
+    assert.equal(seen.length, 2);
+    assert.notEqual(seen[0].credential, seen[1].credential);
+    for (const contact of seen) {
+      assert.equal(contact.state, runtime.state);
+      assert.equal(contact.client, runtime.client);
+    }
+    assert.equal(runtime.client.credential, runtime.state.credential);
+    assert.equal(seen[1].credential, runtime.state.credential);
+  } finally { await runtime.close(); }
+});
