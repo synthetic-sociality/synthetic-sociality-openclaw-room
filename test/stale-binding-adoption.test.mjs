@@ -22,7 +22,7 @@ const STORED = {
   clientInstanceId: "client-1", cursor: 12,
 };
 
-async function claim(stored, {liveRuntime = false} = {}) {
+async function claim(stored, {liveRuntime = false, listing = [{invitationId: "invite-9", roomId: "room-2"}]} = {}) {
   const directory = await mkdtemp(join(tmpdir(), "openclaw-room-readmission-"));
   const sourceFile = join(directory, "default.json");
   const staleFile = join(directory, "member-2.json");
@@ -31,6 +31,7 @@ async function claim(stored, {liveRuntime = false} = {}) {
   const sourceBefore = await readFile(sourceFile);
   const before = await readFile(staleFile);
   const activations = [];
+  const claims = [];
   const runtime = new OpenClawRoomRuntime(
     {accountId: "default", stateFile: sourceFile, baseUrl: SOURCE.baseUrl},
     {activateEnrollment: async (activation) => { activations.push({activation, persisted: await loadState(activation.stateFile)}); }},
@@ -38,8 +39,8 @@ async function claim(stored, {liveRuntime = false} = {}) {
   runtime.state = {...SOURCE};
   resetEnrollmentLineages();
   runtime.client = {
-    connectorEnrollments: async () => [{invitationId: "invite-9"}],
-    claimConnectorEnrollment: async () => ({
+    connectorEnrollments: async () => listing.map((item) => ({...item})),
+    claimConnectorEnrollment: async (_state, invitationId) => (claims.push(invitationId), {
       roomId: "room-2", membershipId: "member-2", credential: "secret-fresh",
       credentialExpiresAt: "2026-12-12T00:00:00Z", identityVersion: 3, headSeq: 40,
     }),
@@ -52,7 +53,7 @@ async function claim(stored, {liveRuntime = false} = {}) {
   }
   try {
     const activated = await runtime.acceptConnectorEnrollments();
-    return {activated, activations, staleFile, before, closed,
+    return {activated, activations, staleFile, before, closed, claims,
       sourceUnchanged: Buffer.compare(sourceBefore, await readFile(sourceFile)) === 0};
   } finally {
     if (old) connectorControl.runtimes.delete(old);
@@ -107,5 +108,42 @@ test("a stale account that holds evidence keeps its state file", async () => {
     }
     assert.deepEqual(result.activations, []);
     assert.equal(Buffer.compare(result.before, await readFile(result.staleFile)), 0);
+  }
+});
+
+// OP-12 R5 B-F009/B-F010: the listed Room decides before the claim, so an ineligible account never consumes the
+// invitation (the server membership stays removed) and its state file stays byte for byte.
+async function assertNotClaimed(stored, options) {
+  const result = await claim(stored, options);
+  assert.deepEqual(result.claims, [], "the enrollment must not be claimed");
+  assert.deepEqual(result.activations, []);
+  assert.equal(Buffer.compare(result.before, await readFile(result.staleFile)), 0);
+}
+
+test("B-F009 a stale account holding debt is never claimed", async () => {
+  const intents = {"v1-9": {version: 1, status: "selected", messagePayloadDialect: "v1", identity: {roomId: "room-2", body: "x", sourceEventId: "v1-9"}}};
+  await assertNotClaimed({...STORED, revoked: true, deliveryIntents: intents});
+});
+
+test("B-F009 an active account is never claimed", async () => {
+  await assertNotClaimed({...STORED});
+});
+
+test("B-F009 a listing without a valid roomId is never claimed", async () => {
+  for (const listing of [[{invitationId: "invite-9"}], [{invitationId: "invite-9", roomId: ""}], [{invitationId: "invite-9", roomId: 7}]]) {
+    await assertNotClaimed({...STORED, revoked: true}, {listing});
+  }
+});
+
+test("B-F010 failed terminal evidence is evidence; settled evidence and an expired credential still adopt", async () => {
+  await assertNotClaimed({...STORED, revoked: true, terminalEvidence: {9: {status: "failed", sourceSeq: 9, sourceEventId: "evt-9", reason: "model_error"}}});
+  for (const stored of [
+    {...STORED, revoked: true, terminalEvidence: {9: {status: "posted", sourceSeq: 9, sourceEventId: "evt-9", canonicalEventId: "ev-9"}}},
+    {...STORED, credentialExpiresAt: "2026-01-01T00:00:00Z"},
+  ]) {
+    const result = await claim(stored);
+    assert.deepEqual(result.claims, ["invite-9"]);
+    assert.equal((await loadState(result.staleFile)).credential, "secret-fresh");
+    assert.equal(result.activations.length, 1);
   }
 });
