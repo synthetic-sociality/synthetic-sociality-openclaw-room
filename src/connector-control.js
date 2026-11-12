@@ -12,6 +12,7 @@
 import {spawn} from "node:child_process";
 import {randomBytes} from "node:crypto";
 import {closeSync, fsyncSync, openSync, readFileSync, writeSync} from "node:fs";
+import {readFile} from "node:fs/promises";
 import {basename, dirname, join, resolve} from "node:path";
 import {isDeepStrictEqual} from "node:util";
 import {loadState} from "./state.js";
@@ -22,8 +23,17 @@ export const CONTROL_CAPABILITY = "connector.control.v1";
 // OpenClaw 2026.7.1-2: `openclaw gateway restart --safe` asks the running
 // gateway (RPC gateway.restart.request) for a restart after its active work
 // drains (register-service-commands-CPkm3CFI.js:72, lifecycle-yIOsvBfe.js:209-235,
-// restart-DJLfBy-X.js:96-139). Fixed argv; nothing from a Room payload.
-export const RESTART_ARGV = Object.freeze(["gateway", "restart", "--safe"]);
+// restart-DJLfBy-X.js:96-139). With --json it prints {ok, result, message,
+// preflight, restart, warnings} (lifecycle-yIOsvBfe.js:221-229), result one of
+// scheduled, deferred, coalesced (restart-DJLfBy-X.js:107); a failure throws,
+// so the CLI exits non-zero. Fixed argv; nothing from a Room payload.
+export const RESTART_ARGV = Object.freeze(["gateway", "restart", "--safe", "--json"]);
+// R2-8: a request the host accepted (a restart is armed).
+export const ACCEPTED_RESTART_STATUSES = Object.freeze(["scheduled", "deferred", "coalesced"]);
+// R2-1: the process-wide controller (registry, fence, seen ids, receipt
+// owner, incarnation) lives on globalThis; a re-imported module shares it.
+export const CONTROL_HOLDER = Symbol.for("synthetic-sociality-room.connector-control.v1");
+const STDOUT_LIMIT = 64 * 1024;
 const INSTALLATION_ID = /^openclaw-inst-[0-9a-f]{32}$/;
 const COMMAND_ID = /^[A-Za-z0-9_.:-]{1,128}$/;
 const ACTIONS = new Set(["reconnect", "restart"]);
@@ -39,7 +49,6 @@ const DEFAULTS = Object.freeze({
   reconnectWaitMs: 90_000,
   drainWaitMs: 30_000,
   supervisorTimeoutMs: 60_000,
-  restartGraceMs: 240_000,
   requestTimeoutMs: 15_000,
 });
 
@@ -73,7 +82,10 @@ export function roomStateDirectory(stateFile) {
   return basename(directory) === "accounts" ? dirname(directory) : directory;
 }
 
-const installationIds = new Map();
+// R2-7: one opaque token per plugin load in a process: random value plus pid.
+export function newIncarnation() {
+  return `oc-${process.pid}-${randomBytes(12).toString("hex")}`;
+}
 
 function readInstallationId(path) {
   const value = JSON.parse(readFileSync(path, "utf8"))?.installationId;
@@ -88,6 +100,7 @@ function readInstallationId(path) {
 export function installationIdFor(directory) {
   if (!directory) return "";
   const key = resolve(directory);
+  const installationIds = connectorControl.installationIds;
   if (installationIds.has(key)) return installationIds.get(key);
   const path = join(key, "installation.json");
   let id = "";
@@ -153,6 +166,43 @@ export function bindingInventory(account, state) {
   };
 }
 
+// R2-2: stored work of a binding no listener runs (disabled, revoked but
+// stored, or enabled and not running): a renewal journal or an unfinished
+// delivery intent.
+export function storedWorkInProgress(state) {
+  return Boolean(state?.credentialRotation)
+    || Object.values(state?.deliveryIntents ?? {}).some(deliveryIntentUnfinished);
+}
+
+// The origin (scheme://host[:port]) of a Room base URL, or "".
+export function roomOrigin(baseUrl) {
+  try {
+    const origin = new URL(String(baseUrl)).origin;
+    return origin === "null" ? "" : origin;
+  } catch {
+    return "";
+  }
+}
+
+// R2-8: the host CLI's --json answer; null when there is none.
+export function parseHostAnswer(text) {
+  const raw = String(text ?? "").trim();
+  if (!raw) return null;
+  const candidates = [raw];
+  const start = raw.search(/^\{/m);
+  const end = raw.lastIndexOf("}");
+  if (start > 0 && end > start) candidates.push(raw.slice(start, end + 1));
+  for (const candidate of candidates) {
+    try {
+      const value = JSON.parse(candidate);
+      if (value && typeof value === "object" && !Array.isArray(value)) return value;
+    } catch {
+      // not JSON
+    }
+  }
+  return null;
+}
+
 export function inventoryCounts(bindings) {
   const enabled = bindings.filter((binding) => binding.enabled).length;
   return {bindings: bindings.length, enabled, disabled: bindings.length - enabled};
@@ -182,9 +232,11 @@ const answerCode = (error) => (error instanceof RoomAPIError ? error.refusalCode
 class ConnectorControl {
   constructor() {
     this.generation = 0;
+    this.scopeKnown = true;
     this.clear();
   }
 
+  // A fresh process state (constructor; tests simulate a new process).
   clear() {
     this.generation += 1;
     this.options = {...DEFAULTS};
@@ -193,10 +245,23 @@ class ConnectorControl {
     this.fence = null;
     this.run = null;
     this.queued = null;
-    this.drained = new Set();
-    this.restartWait = null;
+    this.acceptedRestart = null;
     this.after = null; // {commandId, task}
     this.reportingAfter = false;
+    this.installationIds = new Map();
+    this.incarnation = newIncarnation();
+  }
+
+  // R2-7: the host closed this gateway (gateway_stop runs on every close,
+  // the in-process restart included: server.impl-qYPVZMND.js:2817-2822).
+  // Whatever starts after it is the next incarnation; a restart this
+  // incarnation armed has happened, so its fence ends with it.
+  gatewayStopped() {
+    this.incarnation = newIncarnation();
+    const accepted = this.acceptedRestart;
+    this.acceptedRestart = null;
+    accepted?.resolve();
+    this.liftFence();
   }
 
   configure(options = {}) {
@@ -229,9 +294,6 @@ class ConnectorControl {
 
   attach(runtime) {
     this.runtimes.add(runtime);
-    // P17-6: a runtime that started after the supervisor request belongs to
-    // the restarted gateway (the host's in-process restart keeps the pid).
-    if (this.restartWait && !this.drained.has(runtime)) this.restartWait.resolve(true);
   }
 
   detach(runtime) {
@@ -273,7 +335,7 @@ class ConnectorControl {
     const receipt = this.receipt(runtime);
     if (receipt?.commandId === command.commandId) {
       // P17-7: a restart this installation already ran; report, never re-run.
-      if (receipt.phase === "restarting") this.reportAfterRestart(runtime).catch(() => {});
+      this.reportAfterRestart(runtime).catch(() => {});
       return;
     }
     if (this.seen.has(command.commandId) || command.state !== "requested") return;
@@ -297,14 +359,87 @@ class ConnectorControl {
       });
   }
 
-  workInProgress() {
-    return [...this.runtimes].some((runtime) => {
+  listedAccounts() {
+    try {
+      return this.options.accounts?.() ?? [];
+    } catch {
+      return null;
+    }
+  }
+
+  // R2-2: the guard over the whole process: every running binding's live
+  // work, and every other stored binding (disabled, revoked but stored,
+  // enabled and not running) read from its state file. null, or the code.
+  async guard() {
+    if (!this.scopeKnown) return "connector_scope_unknown";
+    const live = this.liveRuntimes();
+    for (const runtime of [...this.runtimes]) {
       try {
-        return runtime.controlWorkInProgress?.() === true;
+        if (runtime.controlWorkInProgress?.() === true) return "work_in_progress";
       } catch {
-        return true;
+        return "work_in_progress";
       }
-    });
+    }
+    const listed = this.listedAccounts();
+    if (listed === null) return "connector_scope_unknown";
+    const running = new Set(live.map((runtime) => resolve(String(runtime.account.stateFile))));
+    const seenFiles = new Set();
+    for (const account of [...listed, ...[...this.runtimes].map((runtime) => runtime.account)]) {
+      if (!account?.stateFile) continue;
+      const file = resolve(String(account.stateFile));
+      if (running.has(file) || seenFiles.has(file)) continue;
+      seenFiles.add(file);
+      const stored = await readStored(file);
+      if (stored === undefined) continue; // never joined: no binding
+      if (stored === null) return "connector_scope_unknown";
+      if (storedWorkInProgress(stored)) return "work_in_progress";
+    }
+    return null;
+  }
+
+  // R2-3: every stored binding of the process (running: its live object).
+  async storedBindings() {
+    const bindings = [];
+    const files = new Set();
+    const live = this.liveRuntimes();
+    for (const account of [...(this.listedAccounts() ?? []), ...live.map((runtime) => runtime.account)]) {
+      if (!account?.stateFile) continue;
+      const file = resolve(String(account.stateFile));
+      if (files.has(file)) continue;
+      files.add(file);
+      const runtime = live.find((item) => resolve(String(item.account.stateFile)) === file);
+      const state = runtime?.state ?? await readStored(file);
+      if (!state) continue;
+      bindings.push({membershipId: String(state.membershipId ?? ""), origin: roomOrigin(state.baseUrl),
+        enabled: account.enabled !== false && state.enabled !== false && state.revoked !== true});
+    }
+    return bindings;
+  }
+
+  // R2-3: after a registration the Room granted connector.control.v1.
+  async declare(runtime, installationId) {
+    const sessionId = runtime.connectorSession?.sessionId;
+    if (!sessionId || !installationId || !runtime.client?.declareConnectorInstallation) return;
+    try {
+      const bindings = await this.storedBindings();
+      const own = roomOrigin(runtime.state?.baseUrl);
+      const memberships = [...new Set(bindings.filter((item) => item.origin && item.origin === own && item.membershipId)
+        .map((item) => item.membershipId))].sort();
+      const origins = new Map();
+      for (const item of bindings) {
+        if (!item.origin) continue;
+        const entry = origins.get(item.origin) ?? {origin: item.origin, bindings: 0, enabled: 0};
+        entry.bindings += 1;
+        if (item.enabled) entry.enabled += 1;
+        origins.set(item.origin, entry);
+      }
+      const body = {installationId, incarnation: runtime.incarnation, memberships,
+        origins: [...origins.values()].sort((a, b) => (a.origin < b.origin ? -1 : a.origin > b.origin ? 1 : 0))};
+      await runtime.client.declareConnectorInstallation(runtime.state, sessionId, body, this.timeoutSignal());
+    } catch (error) {
+      // 404/409 or an unreachable Room: never fatal.
+      runtime.logger?.info?.(`Room connector installation declaration not accepted code=${answerCode(error)}`);
+    }
   }
 
   async report(runtime, sessionId, commandId, body) {
@@ -338,11 +473,13 @@ class ConnectorControl {
       if (this.generation !== generation) return;
       const base = {commandId: command.commandId, action: command.action, requestedAt: command.requestedAt, claimedAt: now()};
       this.writeReceipt(runtime, {...base, phase: "claimed"});
-      // P17-3: installation-wide guard; refuse at once, no waiting.
-      if (this.workInProgress()) {
-        this.writeReceipt(runtime, {...base, phase: "refused", code: "work_in_progress", completedAt: now()});
+      // P17-3, R2-2: process-wide guard; refuse at once, no waiting.
+      const refusal = await this.guard();
+      if (this.generation !== generation) return;
+      if (refusal) {
+        this.writeReceipt(runtime, {...base, phase: "refused", code: refusal, completedAt: now()});
         this.liftFence();
-        await this.report(runtime, sessionId, command.commandId, {phase: "refused", code: "work_in_progress"});
+        await this.report(runtime, sessionId, command.commandId, {phase: "refused", code: refusal});
         return;
       }
       if (command.action === "reconnect") await this.reconnect(runtime, sessionId, base, generation);
@@ -435,24 +572,45 @@ class ConnectorControl {
     await this.report(runtime, sessionId, base.commandId, body);
   }
 
-  // P17-6: the supported lifecycle only: the resolved `openclaw` binary with a
-  // fixed argv, never a shell. Resolves with the exit code; rejects on a
-  // spawn error or when it does not finish in time.
+  // P17-6, R2-8: the supported lifecycle only: the resolved `openclaw`
+  // binary with a fixed argv, never a shell. The outcome: accepted (the host
+  // answered scheduled, deferred or coalesced), rejected (an explicit error
+  // answer, a non-zero exit without an accepted status, a spawn error) or
+  // unconfirmed (the CLI hung and was killed, or exited 0 without a status).
   requestSupervisor() {
     const binary = this.options.binary || resolveOpenClawBinary();
-    return new Promise((resolveExit, reject) => {
+    return new Promise((resolveOutcome) => {
       let child;
+      let settled = false;
+      const done = (outcome) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolveOutcome(outcome);
+      };
+      const timer = setTimeout(() => {
+        try { child?.kill("SIGKILL"); } catch {}
+        done({kind: "unconfirmed", reason: "timeout"});
+      }, this.options.supervisorTimeoutMs);
+      timer.unref?.();
       try {
-        child = this.options.spawner(binary, [...RESTART_ARGV], {detached: true, stdio: "ignore", env: process.env, shell: false, windowsHide: true});
-      } catch (error) {
-        reject(error);
+        child = this.options.spawner(binary, [...RESTART_ARGV], {detached: true, stdio: ["ignore", "pipe", "ignore"], env: process.env, shell: false, windowsHide: true});
+      } catch {
+        done({kind: "rejected", reason: "spawn_error"});
         return;
       }
-      const timer = setTimeout(() => reject(new Error("supervisor request timed out")), this.options.supervisorTimeoutMs);
-      timer.unref?.();
-      child.once("error", (error) => { clearTimeout(timer); reject(error); });
-      child.once("exit", (code) => { clearTimeout(timer); resolveExit(Number.isInteger(code) ? code : 1); });
-      child.unref?.();
+      let stdout = "";
+      child.stdout?.setEncoding?.("utf8");
+      child.stdout?.on?.("data", (chunk) => { if (stdout.length < STDOUT_LIMIT) stdout += String(chunk).slice(0, STDOUT_LIMIT - stdout.length); });
+      child.once("error", () => done({kind: "rejected", reason: "spawn_error"}));
+      child.once("close", (code) => {
+        const answer = parseHostAnswer(stdout);
+        const status = typeof answer?.result === "string" ? answer.result : "";
+        if (answer?.ok !== false && ACCEPTED_RESTART_STATUSES.includes(status)) done({kind: "accepted", status});
+        else if (answer && (answer.ok === false || answer.error !== undefined)) done({kind: "rejected", reason: "host_error"});
+        else if (code !== 0) done({kind: "rejected", reason: "exit_code"});
+        else done({kind: "unconfirmed", reason: "no_status"});
+      });
     });
   }
 
@@ -461,43 +619,36 @@ class ConnectorControl {
     const runtimes = this.liveRuntimes();
     const before = await this.inventory(runtimes, new Map());
     const startedAt = now();
-    // The receipt is durable before the supervisor is asked.
-    const persisted = this.writeReceipt(runtime, {...base, phase: "restarting", startedAt, pid: process.pid, before});
+    // R2-7: the receipt holds the claim incarnation; it is durable before
+    // the supervisor is asked.
+    const receipt = {...base, phase: "restarting", startedAt, pid: process.pid, incarnation: this.incarnation, before};
+    const persisted = this.writeReceipt(runtime, receipt);
     // Clean drain: the listeners stop as on a disconnect; the fence is held.
     await Promise.all(runtimes.map((item) => item.suspendForControl(this.options.drainWaitMs)));
-    this.drained = new Set(this.runtimes);
-    let failed = !persisted;
-    if (!failed) {
-      try {
-        failed = (await this.requestSupervisor()) !== 0;
-      } catch {
-        failed = true;
-      }
-    }
+    const outcome = persisted ? await this.requestSupervisor() : {kind: "rejected", reason: "receipt_unwritten"};
     if (this.generation !== generation) return;
-    if (!failed) {
-      // The gateway restarts after its own active-work deferral: a new
-      // process (or, in the host's fallback, new runtimes in this one)
-      // reports completion. Not restarted in time: the request failed.
-      this.restartWait = deferred();
-      const observed = await Promise.race([this.restartWait.promise, delay(this.options.restartGraceMs).then(() => false)]);
-      this.restartWait = null;
-      if (observed !== false || this.generation !== generation) return;
-      // The host stopped every drained runtime: its restart is under way
-      // (a re-imported plugin reports from the new runtimes).
-      if (runtimes.length && runtimes.every((item) => item.closed)) return;
-      failed = true;
+    if (outcome.kind !== "rejected") {
+      // R2-8: accepted, or possibly armed: keep the fence, the drained
+      // listeners and the receipt; nothing is reported here. Completion is
+      // the next incarnation's (P17-7); a server deadline ends it otherwise.
+      if (outcome.kind === "accepted") this.writeReceipt(runtime, {...receipt, hostStatus: outcome.status, acceptedAt: now()});
+      else {
+        runtime.logger?.warn?.(`Room connector restart unconfirmed (${outcome.reason}); the fence stays until the gateway restarts`);
+        this.writeReceipt(runtime, {...receipt, phase: "restart_unconfirmed", unconfirmedAt: now()});
+      }
+      this.acceptedRestart = deferred();
+      await this.acceptedRestart.promise;
+      return;
     }
-    runtime.logger?.warn?.("Room connector restart unavailable: supervisor_unavailable; reconnecting instead");
+    runtime.logger?.warn?.(`Room connector restart unavailable (${outcome.reason}): supervisor_unavailable; reconnecting instead`);
     this.writeReceipt(runtime, {...base, phase: "failed", code: "supervisor_unavailable", startedAt, completedAt: now(), pid: process.pid,
-      before: {counts: before.counts}});
+      incarnation: this.incarnation, before: {counts: before.counts}});
     const first = await this.report(runtime, sessionId, base.commandId, {phase: "failed", code: "supervisor_unavailable"});
     // Service is restored by a reconnect (no separate report).
-    this.drained = new Set();
-    const outcome = await this.reconnectAll(runtimes, {suspended: true});
+    const restored = await this.reconnectAll(runtimes, {suspended: true});
     if (this.generation !== generation) return;
     this.liftFence();
-    await this.waitRegistered(runtimes, outcome.since);
+    await this.waitRegistered(runtimes, restored.since);
     // The Room accepts a restart failure only after a re-registration.
     if (!first.ok && first.code === "control_transition_invalid" && !runtime.closed && runtime.connectorSession?.sessionId) {
       await this.report(runtime, runtime.connectorSession.sessionId, base.commandId, {phase: "failed", code: "supervisor_unavailable"});
@@ -508,7 +659,7 @@ class ConnectorControl {
   // inventory is computed from the state files, once.
   async beforeStart(runtime) {
     const receipt = this.receipt(runtime);
-    if (receipt?.phase !== "restarting" || !receipt.before || this.drained.has(runtime)) return;
+    if (!this.completesRestart(runtime, receipt)) return;
     if (this.after?.commandId !== receipt.commandId) {
       this.after = {commandId: receipt.commandId, task: this.inventory([], new Map())};
     }
@@ -516,17 +667,27 @@ class ConnectorControl {
   }
 
   registered(runtime) {
-    const receipt = this.receipt(runtime);
-    if (receipt?.phase !== "restarting" || this.drained.has(runtime)) return;
+    if (!this.completesRestart(runtime, this.receipt(runtime))) return;
     this.reportAfterRestart(runtime).catch(() => {});
+  }
+
+  // R2-7: only a different incarnation completes a restart; a presence
+  // fallback, a channel restart or a re-attached account of the claiming
+  // incarnation never does (and never resumes the drained listeners).
+  completesRestart(runtime, receipt) {
+    if (!receipt?.before || !["restarting", "restart_unconfirmed"].includes(receipt.phase)) return false;
+    const incarnation = typeof runtime?.incarnation === "string" ? runtime.incarnation : "";
+    return typeof receipt.incarnation === "string" && receipt.incarnation
+      ? Boolean(incarnation) && receipt.incarnation !== incarnation
+      : receipt.pid !== process.pid;
   }
 
   // P17-7: on the first authenticated registration of a snapshot binding of
   // the restarted gateway: completed (match) or failed / inventory_mismatch.
   async reportAfterRestart(runtime) {
-    if (this.reportingAfter || this.drained.has(runtime)) return;
+    if (this.reportingAfter) return;
     const receipt = this.receipt(runtime);
-    if (receipt?.phase !== "restarting" || !receipt.before) return;
+    if (!this.completesRestart(runtime, receipt)) return;
     const snapshot = (receipt.before.bindings ?? []).some((binding) => binding.roomId === runtime.state?.roomId
       && binding.membershipId === runtime.state?.membershipId);
     const sessionId = runtime.connectorSession?.sessionId;
@@ -552,7 +713,40 @@ class ConnectorControl {
   }
 }
 
-export const connectorControl = new ConnectorControl();
+// undefined: no state file (never joined); null: unreadable; else the
+// stored JSON as written (read only, never validated into or written back).
+async function readStored(file) {
+  let text;
+  try {
+    text = await readFile(file, "utf8");
+  } catch (error) {
+    return error?.code === "ENOENT" ? undefined : null;
+  }
+  try {
+    const value = JSON.parse(text);
+    return value && typeof value === "object" && !Array.isArray(value) ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+function processController() {
+  try {
+    if (!globalThis[CONTROL_HOLDER]) {
+      Object.defineProperty(globalThis, CONTROL_HOLDER, {value: new ConnectorControl(), configurable: false, enumerable: false, writable: false});
+    }
+    const holder = globalThis[CONTROL_HOLDER];
+    if (holder && typeof holder.offer === "function") return holder;
+  } catch {
+    // fall through
+  }
+  // R2-1: no process-global holder: control refuses with connector_scope_unknown.
+  const isolated = new ConnectorControl();
+  isolated.scopeKnown = false;
+  return isolated;
+}
+
+export const connectorControl = processController();
 
 export function configureConnectorControl(options) {
   connectorControl.configure(options);
@@ -560,9 +754,8 @@ export function configureConnectorControl(options) {
 
 export const connectorControlTest = {
   reset: async () => {
-    connectorControl.restartWait?.resolve("cancelled");
+    connectorControl.acceptedRestart?.resolve();
     connectorControl.liftFence();
     connectorControl.clear();
-    installationIds.clear();
   },
 };

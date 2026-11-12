@@ -617,6 +617,8 @@ export class OpenClawRoomRuntime {
     // Contract P17: a native account runtime executes owner connector
     // control; a presence fallback only when no native runtime runs.
     this.controlRole = controlRole === "fallback" ? "fallback" : "native";
+    // R2-7: the plugin load (gateway incarnation) this runtime belongs to.
+    this.incarnation = connectorControl.incarnation;
     this.listenerAbort = new AbortController();
     this.controlPause = null;
     this.readerRunning = false;
@@ -826,6 +828,11 @@ export class OpenClawRoomRuntime {
     if (!this.closed) {
       try {
         connectorControl.attach(this);
+        // R2-3: the installation declaration, only when the Room granted control.
+        const granted = this.connectorSession?.capabilities;
+        if (installationId && Array.isArray(granted) && granted.includes(CONTROL_CAPABILITY)) {
+          connectorControl.declare(this, installationId).catch(() => {});
+        }
         this.noteConnectorControl(this.connectorSession?.connectorControl);
         connectorControl.registered(this);
       } catch {

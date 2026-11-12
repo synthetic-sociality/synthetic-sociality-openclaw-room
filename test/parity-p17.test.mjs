@@ -86,4 +86,13 @@ test("P17 host pin: the OpenClaw peer offers gateway restart --safe with active-
     const deferral = (await read("restart-")).filter(([, text]) => text.includes('"gateway.restart.request": async')
       && /status: restart\.coalesced \? "coalesced" : skipDeferral \|\| preflight\.safe \? "scheduled" : "deferred"/.test(text));
     assert.equal(deferral.length, 1, "safe restart defers for in-flight work");
+    // R2-8: --json prints the status the connector parses (lifecycle-*.js).
+    const json = (await read("lifecycle-")).filter(([, text]) => /const payload = \{\s*ok: true,\s*result: result\.status,/.test(text)
+      && text.includes("if (opts.json) defaultRuntime.log(JSON.stringify(payload, null, 2));"));
+    assert.equal(json.length, 1, "--json answer carries ok and result");
+    // R2-7: every gateway close runs the gateway_stop hooks, an in-process
+    // restart included (server.impl-*.js close handler).
+    const close = (await read("server.impl-")).filter(([, text]) =>
+      /return \{ close: async \(optsLocal\) => \{[\s\S]{0,400}runGlobalGatewayStopSafely\(\{/.test(text));
+    assert.equal(close.length, 1, "gateway close runs gateway_stop");
   });

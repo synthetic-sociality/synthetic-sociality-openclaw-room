@@ -589,7 +589,13 @@ export function createRoomChannel({makeClient}) {
         const approvals = roomExecApprovalPolicy(api);
         api.on("before_tool_call", (event, ctx) => fence(event, ctx) ?? approvals(event, ctx), {priority: 1000});
         api.on("tool_result_persist", roomToolResultScrub);
-        if (gatewayLoad) api.on("gateway_stop", () => { roomLocalStatus(api?.logger, api?.runtime?.config?.current?.() ?? api?.config).setLoaded(false); });
+        if (gatewayLoad) {
+          api.on("gateway_stop", () => {
+            // R2-7: the next gateway start in this process is a new incarnation.
+            try { connectorControl.gatewayStopped(); } catch {}
+            roomLocalStatus(api?.logger, api?.runtime?.config?.current?.() ?? api?.config).setLoaded(false);
+          });
+        }
       } else {
         api?.logger?.warn?.("Room connector: this OpenClaw host offers no tool hooks; the start gate still applies");
       }

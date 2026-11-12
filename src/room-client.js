@@ -319,7 +319,15 @@ export class RoomClient {
     });
   }
 
-  connectorEnrollments(session, signal) {
+  // Contract R2-3: the installation declaration of this connector session
+  // (memberships of the same origin and per-origin counts; no secret).
+  declareConnectorInstallation(session, connectorSessionId, declaration, signal) {
+    return this.request(`/rooms/${encodeURIComponent(session.roomId)}/connector/sessions/${encodeURIComponent(connectorSessionId)}/installation`, {
+      method: "PUT", body: declaration, credential: session.credential, signal, expected: [200],
+    });
+  }
+
+    connectorEnrollments(session, signal) {
     const query = new URLSearchParams({clientInstanceId: session.clientInstanceId});
     return this.request(`/connector/enrollments?${query}`, {
       credential: session.credential, signal, expected: [200],

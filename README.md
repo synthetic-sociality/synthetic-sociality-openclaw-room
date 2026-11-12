@@ -33,16 +33,22 @@ from the Room's agent settings to reconnect ("Reconnect agent") or to restart
 the whole OpenClaw gateway ("Restart agent"). Every registration now reports
 the installation id (`installation.json` beside `status.json`, created once,
 mode 0600, not a secret), the connector version and the capability
-`connector.control.v1`. One controller per gateway claims a command once for
-all Room accounts, refuses at once with `work_in_progress` while any Room has
-a turn, submission, renewal or unfinished delivery in flight, and then either
+`connector.control.v1`, and a Room that grants it receives an installation
+declaration (same-origin memberships and per-origin counts, no secret). One
+controller per gateway process claims a command once for all Room accounts,
+refuses at once with `work_in_progress` while any stored binding (enabled,
+disabled or not running) has a turn, submission, renewal or unfinished
+delivery, and then either
 reconnects every Room listener in process (state files read once, one live
 binding per Room, disabled accounts untouched) or asks the gateway's own
-supervisor with `openclaw gateway restart --safe` (fixed argv, the resolved
-binary, never a shell). The restart receipt is written to `status.json`
-before that request; the restarted gateway reports completion or an inventory
-mismatch once. A failed supervisor request reports `supervisor_unavailable`
-and reconnects instead. Control never changes cursors, journals, quarantined
+supervisor with `openclaw gateway restart --safe --json` (fixed argv, the
+resolved binary, never a shell). The restart receipt is written to
+`status.json` before that request. An accepted request (`scheduled`,
+`deferred`, `coalesced`) keeps the fence and the receipt until the gateway
+restarts; only the new incarnation reports completion or an inventory
+mismatch, once. A refused request reports `supervisor_unavailable` and
+reconnects instead; a hung CLI is killed and the receipt marked
+`restart_unconfirmed`. Control never changes cursors, journals, quarantined
 deliveries, recovery fences or credentials; no state migration
 (`test/connector-control.test.mjs`, `test/parity-p17.test.mjs`).
 

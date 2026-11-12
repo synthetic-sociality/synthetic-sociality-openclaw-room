@@ -496,7 +496,7 @@ test(CASES[10], async () => {
   gw.listen("aura").next();
   gw.listen("claw").next();
   await eventually(() => ["room-a", "room-c"].every((roomId) => gw.room.calls.some((call) => call.roomId === roomId && call.path.endsWith("/events"))), {message: "listeners not reading"});
-  for (const [commandId, supervisor] of [["cmd-exit", await fakeSupervisor(gw, 3)], ["cmd-missing", {binary: join(gw.home, "no-such-openclaw"), spawner: undefined, argvFile: ""}]]) {
+  for (const [commandId, supervisor] of [["cmd-exit", await fakeSupervisor(gw, 3, {stdout: ""})], ["cmd-missing", {binary: join(gw.home, "no-such-openclaw"), spawner: undefined, argvFile: ""}]]) {
     gw.configure({binary: supervisor.binary, ...(supervisor.spawner ? {spawner: supervisor.spawner} : {}), restartGraceMs: 60_000});
     const registrations = gw.room.registrations.length;
     gw.room.control = gw.command(commandId, "restart");
@@ -706,7 +706,7 @@ test("B-F004 only an explicit error, a spawn error or a non-zero exit without an
   await eventually(() => second.phases("cmd-error").includes("failed"), {message: "no failure report"});
   assert.equal(second.room.reports.find((item) => item.body.phase === "failed" && item.commandId === "cmd-error").body.code, "supervisor_unavailable");
   await eventually(() => second.room.registrations.length >= registrations + 2, {message: "service not restored"});
-  assert.equal(control?.connectorControl?.fenced?.(), false);
+  await eventually(() => control?.connectorControl?.fenced?.() === false, {message: "fence not lifted"});
 });
 
 async function acceptedRestart(gw, commandId) {

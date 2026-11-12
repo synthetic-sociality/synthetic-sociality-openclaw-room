@@ -1280,12 +1280,18 @@ the connector side, identical in both connectors.
 - P17-3 Fence and installation-wide guard. From the claim until the action
   ends or is refused, no new dispatch starts, no new turn attempt is claimed
   and no renewal starts; events stay durable and are processed after the
-  fence lifts. Then the guard runs over every binding of the installation: an
-  active dispatch, an in-flight event, a submission, a pending or
-  nonquiescent renewal (renewal in progress, `credentialRotation` journal) or
-  an unfinished delivery intent (anything but posted, superseded, skipped or
-  plainly quarantined) reports `refused` / `work_in_progress` at once and
-  lifts the fence, without waiting.
+  fence lifts. Then the guard runs over the whole process (the installation
+  is the gateway process) and every stored binding, enabled, disabled,
+  revoked but stored, running or not (OpenClaw: every configured account's
+  state file, read only): an active dispatch, an in-flight event, a
+  submission, a pending or nonquiescent renewal (renewal in progress,
+  `credentialRotation` journal) or an unfinished delivery intent (anything
+  but posted, superseded, skipped or plainly quarantined) reports `refused` /
+  `work_in_progress` at once and lifts the fence, without waiting. An
+  installation that holds fail-closed unfinished intents in a disabled
+  binding refuses both controls until that debt is resolved under its own
+  procedure. A stored binding that cannot be read, or a process without a
+  process-global controller, refuses with `connector_scope_unknown`.
 - P17-4 Inventory. Control reads the stored binding inventory and never
   writes it: per binding the Room id, membership id, base URL, client instance
   id, identity version, enabled, disabled reason, revoked, cursor,
@@ -1311,8 +1317,9 @@ the connector side, identical in both connectors.
   disconnect, fence held); ask the installation's own supervisor through its
   supported lifecycle only. Hermes: the gateway's drain-aware restart
   (SIGUSR1 to its own process, the `hermes gateway restart` path). OpenClaw:
-  `openclaw gateway restart --safe` with the fixed argv `["gateway",
-  "restart", "--safe"]` through the resolved `openclaw` binary, never a shell.
+  `openclaw gateway restart --safe --json` with the fixed argv `["gateway",
+  "restart", "--safe", "--json"]` through the resolved `openclaw` binary,
+  never a shell.
   In OpenClaw 2026.7.1-2 `--safe` is the CLI option of `gateway restart`
   (`dist/register-service-commands-CPkm3CFI.js:72`); it calls the running
   gateway's `gateway.restart.request` (`dist/lifecycle-yIOsvBfe.js:209-235`,
@@ -1320,22 +1327,64 @@ the connector side, identical in both connectors.
   of active queue, reply and task work and answers `deferred` while work is
   active (`dist/restart-DJLfBy-X.js:96-139`); the gateway then restarts as a
   full process with a fresh pid, or in process when respawn is unavailable
-  (`dist/run-CSvF3r1e.js:370-398`). A spawn error, a non-zero exit, or no
-  restart within the grace period reports `failed` /
-  `supervisor_unavailable`, after which a reconnect (P17-5, without its
-  reports) restores service. Tests use a simulated subprocess only, never a
-  real gateway or host restart.
-- P17-7 After a restart. The new gateway reads the receipt, computes the
-  after inventory from the state files before any listener starts, and on
-  the first authenticated registration of a binding in the receipt's
-  snapshot reports `completed` (inventory equal) or `failed` /
-  `inventory_mismatch`, with the counts. The receipt is then marked
+  (`dist/run-CSvF3r1e.js:370-398`). With `--json` the CLI prints `{ok: true,
+  result, message, preflight, restart, warnings}`
+  (`dist/lifecycle-yIOsvBfe.js:221-229`), `result` being `scheduled`,
+  `deferred` or `coalesced` (`dist/restart-DJLfBy-X.js:107`); a failure
+  throws and the CLI exits non-zero. A host deferral is bounded by
+  `gateway.reload.deferralTimeoutMs` (default 300 s) and may then force the
+  restart. Outcomes: `scheduled`, `deferred` or `coalesced` is accepted: the
+  fence, the drained listeners and the `restarting` receipt stay, nothing is
+  reported and no timeout gives up; completion is the next incarnation's
+  (P17-7). An explicit error answer, a non-zero exit without an accepted
+  status, or a spawn error is not accepted: report `failed` /
+  `supervisor_unavailable`, then a reconnect (P17-5, without its reports)
+  restores service. A CLI that does not finish within 60 s is killed and the
+  outcome is unconfirmed (a restart may be armed): the fence stays, the
+  receipt becomes `restart_unconfirmed`, nothing is reported and the Room
+  server's deadline ends the command (`did_not_come_back`); an exit 0 without
+  a status is treated the same way. Hermes keeps the fence and receipt after
+  an accepted SIGUSR1 likewise and marks the receipt `restart_overdue` after
+  the server's window. Tests use a simulated subprocess only, never a real
+  gateway or host restart.
+- P17-7 After a restart. The receipt holds the claiming incarnation (one
+  opaque token per plugin load in a process: a random value plus the pid).
+  Only a different incarnation completes: the new gateway reads the receipt,
+  computes the after inventory from the state files before any listener
+  starts, and on the first authenticated registration of a binding in the
+  receipt's snapshot reports `completed` (inventory equal) or `failed` /
+  `inventory_mismatch`, with the counts. A runtime of the claiming
+  incarnation (a presence fallback, a host channel restart, a re-attached
+  account) never completes and never resumes the drained listeners. The receipt is then marked
   `reported`; a repeated or closed answer marks it reported too. A receipt
   never causes a second restart or claim.
 - P17-8 Control never edits cursors, journals, quarantined deliveries,
   recovery fences or credentials. Control changes no account state file (a
   forced re-registration saves the same content); it writes only
   `status.json` (`connectorControl`) and, once, `installation.json`.
+
+Installation declaration (R2). After a registration in which the Room granted
+`connector.control.v1` (old servers never grant it), the connector sends
+`PUT /rooms/{roomId}/connector/sessions/{sessionId}/installation` with
+`{installationId, incarnation, memberships, origins}`: the membership ids of
+every stored binding of the process whose base URL origin equals this
+binding's origin, and per origin (scheme://host[:port] only) the counts of
+stored and enabled bindings over every configured account. No credential,
+path or query. A 404, 409 or failed contact is not fatal.
+
+OpenClaw process scope and incarnation (R2). The controller (registry of
+account runtimes, fence, seen command ids, receipt owner, incarnation) lives
+on `globalThis` under `Symbol.for("synthetic-sociality-room.connector-control.v1")`,
+so a second evaluation of the plugin module in the same process shares it.
+Node caches an ES module per URL, so a second load of the same entry returns
+the same module; a loader that evaluates it again finds the holder. The
+incarnation therefore does not change on re-import. It changes when the
+process starts and at every `gateway_stop` the host runs: every gateway
+close runs those hooks, the in-process restart included
+(`dist/server.impl-qYPVZMND.js:2810-2822`), so the runtimes the restarted
+gateway starts belong to a new incarnation, and the restart this
+incarnation armed ends its fence there. Presence-fallback runtimes and
+per-account channel restarts keep the token.
 
 The status receipt `connectorControl` is an additional top-level key of the
 P2c-4 status file (readers ignore unknown keys); it holds codes, ids, counts,
