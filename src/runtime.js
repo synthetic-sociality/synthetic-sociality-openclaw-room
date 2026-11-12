@@ -601,6 +601,26 @@ const backgroundSleep = (milliseconds, signal) => new Promise((resolve, reject) 
   signal?.addEventListener("abort", () => { clearTimeout(timer); reject(signal.reason ?? new Error("aborted")); }, {once: true});
 });
 
+// Terminal evidence that carries no open or quarantined work.
+const SETTLED_EVIDENCE = new Set(["posted", "skipped", "superseded", "ignored", "cancelled"]);
+
+/**
+ * Owner 2026-11-12: an account state a re-admission may replace. Stale: revoked, or its credential expired.
+ * Inert: no delivery intent, no credential rotation, and no terminal evidence other than settled outcomes, so
+ * replacing it loses no evidence. Parity with the Hermes connector's _stale_inert_binding.
+ * @param {object} state - A validated account state.
+ * @param {number} [nowMs] - The clock.
+ * @returns {boolean} Whether the stored state may be replaced by the fresh credential.
+ */
+export function staleInertState(state, nowMs = Date.now()) {
+  const expiresAt = Date.parse(state?.credentialExpiresAt ?? "");
+  const stale = state?.revoked === true || (Number.isFinite(expiresAt) && expiresAt <= nowMs);
+  if (!stale) return false;
+  if (state.credentialRotation) return false;
+  if (Object.keys(state.deliveryIntents ?? {}).length > 0) return false;
+  return Object.values(state.terminalEvidence ?? {}).every((evidence) => SETTLED_EVIDENCE.has(evidence?.status));
+}
+
 export class OpenClawRoomRuntime {
   constructor(account, {
     fetchImpl = globalThis.fetch,
@@ -3566,7 +3586,29 @@ export class OpenClawRoomRuntime {
       };
       // The one-time credential reaches durable 0600 state before the
       // configuration hot reload can expose this binding to another runtime.
-      await saveNewState(stateFile, nextState);
+      let held = null;
+      try { held = await loadState(stateFile); } catch (error) { held = error?.code === "ENOENT" ? null : false; }
+      if (held === null) {
+        await saveNewState(stateFile, nextState);
+      } else {
+        // Owner 2026-11-12: the Room re-admitted this membership. Replace only a
+        // stale, inert account: close any live runtime of it first, re-read the
+        // stored state, and keep it byte for byte unless it is still stale and inert.
+        if (!held || !staleInertState(held)) {
+          this.logger?.warn?.(`Room ${roomId} was already bound while its enrollment was claimed`);
+          continue;
+        }
+        for (const other of [...connectorControl.runtimes]) {
+          if (other !== this && !other.closed && other.account?.stateFile === stateFile) await other.close();
+        }
+        const latest = await loadState(stateFile).catch(() => null);
+        if (!latest || !staleInertState(latest)) {
+          this.logger?.warn?.(`Room ${roomId} changed while its re-admission was claimed; kept as stored`);
+          continue;
+        }
+        await saveState(stateFile, nextState);
+        this.logger?.info?.(`Replaced the stale binding of re-admitted Room ${roomId}`);
+      }
       await this.activateEnrollment({accountId, baseUrl: nextState.baseUrl, stateFile});
       activated.push({accountId, roomId, membershipId, stateFile});
       this.logger?.info?.(`Activated owner-approved Room ${roomId}`);

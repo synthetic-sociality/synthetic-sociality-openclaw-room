@@ -95,7 +95,8 @@ test("a stale account that holds evidence keeps its state file", async () => {
   const intents = {"v1-9": {version: 1, status: "selected", messagePayloadDialect: "v1", identity: {roomId: "room-2", body: "x", sourceEventId: "v1-9"}}};
   for (const stored of [
     {...STORED, revoked: true, deliveryIntents: intents},
-    {...STORED, revoked: true, terminalEvidence: {9: {status: "quarantined", sourceEventId: "evt-9"}}},
+    {...STORED, revoked: true, terminalEvidence: {9: {status: "failed", sourceSeq: 9, sourceEventId: "evt-9", reason: "model_error"}}},
+    {...STORED, revoked: true, deliveryIntents: {"v1-9": {...intents["v1-9"], status: "quarantined"}}},
   ]) {
     let result;
     try {
