@@ -49,7 +49,7 @@ test("P17 case names resolve to tests of the connector-control suite", async () 
 
 test("P17 restart asks only the supported OpenClaw lifecycle with a fixed argv", async () => {
   const source = await readFile(new URL("../src/connector-control.js", import.meta.url), "utf8").catch(() => "");
-  assert.match(source, /\["gateway", "restart", "--safe"\]/);
+  assert.match(source, /\["gateway", "restart", "--safe", "--json"\]/);
   assert.doesNotMatch(source, /shell:\s*true/);
   assert.doesNotMatch(source, /\bexec(Sync)?\(/);
 });

@@ -5,7 +5,7 @@
 // goes to a simulated subprocess fixture, a fake `openclaw` executable in a
 // temp directory that records its argv. No test uses a real credential.
 import assert from "node:assert/strict";
-import test, {afterEach} from "node:test";
+import test, {afterEach, mock} from "node:test";
 import {spawn} from "node:child_process";
 import {chmod, mkdir, mkdtemp, readFile, stat, writeFile} from "node:fs/promises";
 import {tmpdir} from "node:os";
@@ -57,6 +57,9 @@ function fakeRoom() {
     claimAnswer: null, // (call) => Response | undefined
     claimGate: null, // a promise a claim waits for
     claimedBy: new Map(),
+    grant: false, // the Room grants connector.control.v1 (R2-3 declaration)
+    declarations: [],
+    declarationAnswer: null,
     events: new Map(),
     wakers: new Set(),
     sessions: 0,
@@ -83,7 +86,12 @@ function fakeRoom() {
       room.sessions += 1;
       const sessionId = `s-${roomId}-${room.sessions}`;
       room.registrations.push({...call, sessionId});
-      return json({sessionId, heartbeatIntervalSeconds: 60, capabilities: ["events.long_poll"], ...controlFor(roomId)});
+      return json({sessionId, heartbeatIntervalSeconds: 60,
+        capabilities: ["events.long_poll", ...(room.grant ? ["connector.control.v1"] : [])], ...controlFor(roomId)});
+    }
+    if (method === "PUT" && /\/connector\/sessions\/[^/]+\/installation$/.test(path)) {
+      room.declarations.push({...call, sessionId: path.split("/")[5]});
+      return room.declarationAnswer?.(call) ?? json({accepted: true});
     }
     if (path.endsWith("/heartbeat")) {
       room.heartbeats.push(call);
@@ -150,7 +158,7 @@ const humanMessage = (roomId, seq) => ({id: `ev-${roomId}-${seq}`, seq, ts: new 
     resolvedRecipientMembershipIds: [`member-${roomId}`]}});
 
 // One gateway: a Room state directory with accounts/<id>.json and status.json.
-async function gateway({disabled = true, fetchRoom = fakeRoom()} = {}) {
+async function gateway({disabled = true, fetchRoom = fakeRoom(), extra = []} = {}) {
   const home = await mkdtemp(join(tmpdir(), "openclaw-room-p17-"));
   const store = join(home, "synthetic-sociality-room");
   await mkdir(join(store, "accounts"), {recursive: true, mode: 0o700});
@@ -166,9 +174,22 @@ async function gateway({disabled = true, fetchRoom = fakeRoom()} = {}) {
     files[accountId] = stateFile;
     accounts.push({accountId, stateFile, baseUrl: BASE, enabled: accountId !== "old", configured: true, agentId: accountId});
   }
+  // Further stored bindings (R2): {accountId, roomId, baseUrl, enabled, running, stored}.
+  for (const item of extra) {
+    const stateFile = join(store, "accounts", `${item.accountId}.json`);
+    const baseUrl = item.baseUrl ?? BASE;
+    const stored = {version: 1, baseUrl, roomId: item.roomId, membershipId: `member-${item.roomId}`,
+      credential: `fixture-credential-${item.roomId}`, clientInstanceId: "client-mac", identityVersion: 2, cursor: 0,
+      ...(item.enabled === false ? {enabled: false} : {}), ...(item.stored ?? {})};
+    // Written as stored on disk (an unfinished intent of any shape counts).
+    await writeFile(stateFile, `${JSON.stringify(stored)}\n`, {mode: 0o600});
+    files[item.accountId] = stateFile;
+    accounts.push({accountId: item.accountId, stateFile, baseUrl, enabled: item.enabled !== false, configured: true,
+      agentId: item.accountId, running: item.running === true});
+  }
   const loads = [];
   const runtimes = {};
-  for (const account of accounts.filter((item) => item.enabled)) {
+  for (const account of accounts.filter((item) => item.enabled && item.running !== false)) {
     runtimes[account.accountId] = new OpenClawRoomRuntime(account, {fetchImpl: fetchRoom.fetchImpl, logger: quiet, status, waitForRenewal: true});
   }
   const gw = {home, store, statusPath, status, accounts, files, loads, runtimes, room: fetchRoom, readers: [], spawned: []};
@@ -202,21 +223,37 @@ async function gateway({disabled = true, fetchRoom = fakeRoom()} = {}) {
   return gw;
 }
 
+// The --json answer of `openclaw gateway restart --safe --json` (host
+// 2026.7.1-2 lifecycle-yIOsvBfe.js:221-229; status restart-DJLfBy-X.js:107).
+const hostAnswer = (result) => JSON.stringify({ok: true, result,
+  message: result === "deferred" ? "safe restart requested; gateway will restart after active work drains" : "safe restart requested; gateway will restart momentarily",
+  preflight: {safe: result !== "deferred", counts: {totalActive: result === "deferred" ? 1 : 0}, blockers: [], summary: "fixture"},
+  restart: {ok: true, pid: 4242, signal: "SIGUSR1", delayMs: 0, reason: "gateway.restart.safe", mode: "emit", coalesced: result === "coalesced"}}, null, 2);
+
 // The simulated supervisor: a fake `openclaw` that records its argv and the
-// status file it saw when it was asked, then exits with `exitCode`.
-async function fakeSupervisor(gw, exitCode = 0) {
+// status file it saw when it was asked, prints `stdout` (by default the host's
+// accepted answer), optionally hangs, then exits with `exitCode`.
+async function fakeSupervisor(gw, exitCode = 0, {stdout = hostAnswer("scheduled"), hangSeconds = 0} = {}) {
   const directory = await mkdtemp(join(tmpdir(), "openclaw-room-p17-supervisor-"));
   const binary = join(directory, "openclaw");
   const argvFile = join(directory, "argv.txt");
   const seenStatus = join(directory, "status-at-request.json");
-  await writeFile(binary, `#!/bin/sh\nprintf '%s\\n' "$@" > '${argvFile}'\ncp '${gw.statusPath}' '${seenStatus}' 2>/dev/null\nexit ${exitCode}\n`, {mode: 0o700});
+  const answer = join(directory, "answer.txt");
+  await writeFile(answer, stdout);
+  await writeFile(binary, `#!/bin/sh\nprintf '%s\\n' "$@" > '${argvFile}'\ncp '${gw.statusPath}' '${seenStatus}' 2>/dev/null\n`
+    + `${hangSeconds ? `sleep ${hangSeconds}\n` : ""}cat '${answer}'\nexit ${exitCode}\n`, {mode: 0o700});
   await chmod(binary, 0o700);
   const calls = [];
+  const children = [];
   const spawner = (command, argv, options) => {
     calls.push({command, argv: [...argv], options: {...options, env: undefined}});
-    return spawn(command, argv, options);
+    const child = spawn(command, argv, options);
+    const record = {child, exited: false, signal: null};
+    child.on("exit", (code, signal) => { record.exited = true; record.code = code; record.signal = signal; });
+    children.push(record);
+    return child;
   };
-  return {directory, binary, argvFile, seenStatus, calls, spawner};
+  return {directory, binary, argvFile, seenStatus, calls, children, spawner};
 }
 
 const fileBytes = async (files) => Object.fromEntries(await Promise.all(Object.entries(files).map(async ([id, path]) => [id, await readFile(path, "utf8")])));
@@ -434,10 +471,10 @@ test(CASES[9], async () => {
   gw.room.control = gw.command("cmd-restart", "restart");
   await gw.runtimes.aura.maintainPresence();
   await eventually(async () => (await readFile(supervisor.argvFile, "utf8").catch(() => "")).length > 0, {message: "supervisor never asked"});
-  assert.deepEqual((await readFile(supervisor.argvFile, "utf8")).trim().split("\n"), ["gateway", "restart", "--safe"]);
+  assert.deepEqual((await readFile(supervisor.argvFile, "utf8")).trim().split("\n"), ["gateway", "restart", "--safe", "--json"]);
   assert.equal(supervisor.calls.length, 1);
   assert.equal(supervisor.calls[0].command, supervisor.binary);
-  assert.deepEqual(supervisor.calls[0].argv, ["gateway", "restart", "--safe"]);
+  assert.deepEqual(supervisor.calls[0].argv, ["gateway", "restart", "--safe", "--json"]);
   assert.ok(!supervisor.calls[0].options.shell);
   assert.deepEqual(gw.phases("cmd-restart"), ["restarting"]);
   // The receipt was in status.json when the supervisor was asked.
@@ -546,4 +583,239 @@ test(CASES[11], async () => {
   } finally {
     await third.close();
   }
+});
+
+// ---- R2 remedies (OP12-R1 findings; CONTRACT-R2.md) ----
+
+const unfinishedIntent = {deliveryIntents: {"ev-stored-1:final": {version: 2, status: "delivery_pending", deliveryState: "delivery_pending"}}};
+const receiptNow = async (gw) => JSON.parse(await readFile(gw.statusPath, "utf8")).connectorControl;
+// Polling that does not depend on (possibly mocked) timers.
+async function spin(check, {timeoutMs = 5_000, message = "condition not reached"} = {}) {
+  const deadline = performance.now() + timeoutMs;
+  for (;;) {
+    const value = await check();
+    if (value) return value;
+    if (performance.now() > deadline) assert.fail(message);
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+}
+
+test("B-F002 a disabled binding with an unfinished intent refuses reconnect and restart", async () => {
+  const gw = await started({extra: [{accountId: "expired", roomId: "room-x", enabled: false, stored: {...unfinishedIntent, revokedReason: "credential_expired"}}]});
+  const supervisor = await fakeSupervisor(gw, 0);
+  gw.configure({binary: supervisor.binary, spawner: supervisor.spawner});
+  await refusedWith(gw, "cmd-disabled-reconnect", "reconnect");
+  await refusedWith(gw, "cmd-disabled-restart", "restart");
+  assert.equal(supervisor.calls.length, 0, "the supervisor is never asked");
+});
+
+test("B-F002 an enabled account that is not running with an unfinished intent refuses control", async () => {
+  const gw = await started({disabled: false, extra: [{accountId: "idle", roomId: "room-i", enabled: true, running: false, stored: unfinishedIntent}]});
+  assert.equal(gw.runtimes.idle, undefined);
+  await refusedWith(gw, "cmd-idle-reconnect", "reconnect");
+  await refusedWith(gw, "cmd-idle-restart", "restart");
+  // The guard reads, never writes, the stored binding.
+  assert.ok((await readFile(gw.files.idle, "utf8")).includes("delivery_pending"));
+});
+
+test("B-F004 an accepted deferred restart keeps the fence and the restarting receipt until the new incarnation completes", async () => {
+  const gw = await started();
+  gw.listen("aura").next();
+  gw.listen("claw").next();
+  await eventually(() => ["room-a", "room-c"].every((roomId) => gw.room.calls.some((call) => call.roomId === roomId && call.path.endsWith("/events"))), {message: "listeners not reading"});
+  const supervisor = await fakeSupervisor(gw, 0, {stdout: hostAnswer("deferred")});
+  gw.configure({binary: supervisor.binary, spawner: supervisor.spawner});
+  const registrations = gw.room.registrations.length;
+  mock.timers.enable({apis: ["setTimeout", "setInterval", "Date"], now: Date.now()});
+  try {
+    gw.room.control = gw.command("cmd-deferred", "restart");
+    await gw.runtimes.aura.maintainPresence();
+    await spin(() => supervisor.children[0]?.exited, {message: "the host CLI never answered"});
+    await spin(async () => (await receiptNow(gw))?.phase === "restarting");
+    assert.equal(control?.connectorControl?.fenced?.(), true);
+    // The host defers for 280 s (another channel's work); nothing gives up.
+    for (let second = 0; second < 280; second += 10) {
+      mock.timers.tick(10_000);
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.equal(control?.connectorControl?.fenced?.(), true, `fence held at ${second + 10} s`);
+    }
+  } finally {
+    mock.timers.reset();
+  }
+  await settle(200);
+  assert.deepEqual(gw.phases("cmd-deferred"), ["restarting"], "no failed report");
+  assert.equal((await receiptNow(gw)).phase, "restarting");
+  assert.equal(control?.connectorControl?.fenced?.(), true);
+  assert.equal(gw.room.registrations.length, registrations, "no listener was resumed");
+
+  // The new gateway incarnation comes up and completes, exactly once.
+  await gw.close();
+  open.splice(open.indexOf(gw), 1);
+  await control?.connectorControlTest?.reset?.();
+  gw.room.control = gw.command("cmd-deferred", "restart", "restarting");
+  const status = new LocalStatus(gw.statusPath, {plugin: "openclaw", version: packageJson.version, hostLabel: "test-host", logger: quiet});
+  const next = gw.accounts.filter((item) => item.enabled).map((account) =>
+    new OpenClawRoomRuntime(account, {fetchImpl: gw.room.fetchImpl, logger: quiet, status, waitForRenewal: true}));
+  gw.configure({binary: supervisor.binary, spawner: supervisor.spawner});
+  try {
+    for (const runtime of next) await runtime.initialize();
+    await eventually(() => gw.phases("cmd-deferred").includes("completed"), {message: "completion never reported"});
+    for (const runtime of next) await runtime.maintainPresence();
+    await settle();
+    assert.deepEqual(gw.phases("cmd-deferred"), ["restarting", "completed"]);
+    assert.equal(supervisor.calls.length, 1);
+  } finally {
+    for (const runtime of next) await runtime.close();
+  }
+});
+
+test("B-F004 a hung host CLI is killed, the receipt is restart_unconfirmed, the fence held and nothing reported", async () => {
+  const gw = await started();
+  const supervisor = await fakeSupervisor(gw, 0, {hangSeconds: 30});
+  gw.configure({binary: supervisor.binary, spawner: supervisor.spawner, supervisorTimeoutMs: 400});
+  gw.room.control = gw.command("cmd-hang", "restart");
+  await gw.runtimes.aura.maintainPresence();
+  await eventually(() => supervisor.children[0]?.exited, {message: "the hung CLI was not killed"});
+  assert.ok(supervisor.children[0].signal, "ended by a signal");
+  await eventually(async () => (await receiptNow(gw))?.phase === "restart_unconfirmed", {message: "receipt not restart_unconfirmed"});
+  await settle(300);
+  assert.deepEqual(gw.phases("cmd-hang"), ["restarting"]);
+  assert.equal(control?.connectorControl?.fenced?.(), true);
+});
+
+test("B-F004 only an explicit error, a spawn error or a non-zero exit without an accepted status is supervisor_unavailable", async () => {
+  const gw = await started();
+  // A non-zero exit that still carries an accepted status: accepted.
+  const coalesced = await fakeSupervisor(gw, 1, {stdout: hostAnswer("coalesced")});
+  gw.configure({binary: coalesced.binary, spawner: coalesced.spawner});
+  gw.room.control = gw.command("cmd-coalesced", "restart");
+  await gw.runtimes.aura.maintainPresence();
+  await eventually(() => coalesced.children[0]?.exited, {message: "no answer"});
+  await settle(300);
+  assert.deepEqual(gw.phases("cmd-coalesced"), ["restarting"]);
+  assert.equal((await receiptNow(gw)).phase, "restarting");
+  assert.equal(control?.connectorControl?.fenced?.(), true);
+  // An explicit error answer: supervisor_unavailable, then service restored.
+  await control?.connectorControlTest?.reset?.();
+  const second = await started();
+  const refused = await fakeSupervisor(second, 1, {stdout: JSON.stringify({ok: false, error: "gateway unreachable"})});
+  second.configure({binary: refused.binary, spawner: refused.spawner});
+  const registrations = second.room.registrations.length;
+  second.room.control = second.command("cmd-error", "restart");
+  await second.runtimes.claw.maintainPresence();
+  await eventually(() => second.phases("cmd-error").includes("failed"), {message: "no failure report"});
+  assert.equal(second.room.reports.find((item) => item.body.phase === "failed" && item.commandId === "cmd-error").body.code, "supervisor_unavailable");
+  await eventually(() => second.room.registrations.length >= registrations + 2, {message: "service not restored"});
+  assert.equal(control?.connectorControl?.fenced?.(), false);
+});
+
+async function acceptedRestart(gw, commandId) {
+  const supervisor = await fakeSupervisor(gw, 0, {stdout: hostAnswer("deferred")});
+  gw.configure({binary: supervisor.binary, spawner: supervisor.spawner});
+  gw.room.control = gw.command(commandId, "restart");
+  await gw.runtimes.aura.maintainPresence();
+  await eventually(() => supervisor.children[0]?.exited, {message: "the host CLI never answered"});
+  await eventually(async () => (await receiptNow(gw))?.phase === "restarting", {message: "no restarting receipt"});
+  await settle();
+  gw.room.control = gw.command(commandId, "restart", "restarting");
+  return supervisor;
+}
+
+test("B-F005 a presence fallback or a re-attached account of the same incarnation never completes or resumes", async () => {
+  const gw = await started();
+  gw.listen("aura").next();
+  await eventually(() => gw.room.calls.some((call) => call.roomId === "room-a" && call.path.endsWith("/events")), {message: "listener not reading"});
+  await acceptedRestart(gw, "cmd-same-incarnation");
+  const reads = () => gw.room.calls.filter((call) => call.roomId === "room-a" && call.path.endsWith("/events")).length;
+  const readsBefore = reads();
+  // A heartbeat-only fallback runtime of this gateway registers during restarting.
+  const fallback = new OpenClawRoomRuntime(gw.accounts[0], {fetchImpl: gw.room.fetchImpl, logger: quiet, status: gw.status, controlRole: "fallback"});
+  // A host channel restart of one account (same process, same plugin load).
+  await gw.runtimes.claw.close();
+  const reattached = new OpenClawRoomRuntime(gw.accounts[1], {fetchImpl: gw.room.fetchImpl, logger: quiet, status: gw.status, waitForRenewal: true});
+  try {
+    await fallback.initialize();
+    await reattached.initialize();
+    await fallback.maintainPresence();
+    await reattached.maintainPresence();
+    await settle(300);
+    assert.deepEqual(gw.phases("cmd-same-incarnation"), ["restarting"], "no completion from the same incarnation");
+    assert.equal((await receiptNow(gw)).phase, "restarting");
+    assert.equal(control?.connectorControl?.fenced?.(), true);
+    assert.ok(gw.runtimes.aura.controlPause, "the drained listener stays drained");
+    assert.equal(reads(), readsBefore, "the drained listener did not read again");
+  } finally {
+    await fallback.close();
+    await reattached.close();
+  }
+});
+
+test("B-F005 the host's in-process restart starts a new incarnation that completes once", async () => {
+  const gw = await started();
+  await acceptedRestart(gw, "cmd-in-process");
+  const receipt = await receiptNow(gw);
+  assert.match(receipt.incarnation ?? "", /^[A-Za-z0-9._:-]{8,128}$/);
+  // The host closes the gateway (gateway_stop) and starts it again in this process.
+  control?.connectorControl?.gatewayStopped?.();
+  await gw.close();
+  open.splice(open.indexOf(gw), 1);
+  assert.notEqual(control?.connectorControl?.incarnation, receipt.incarnation);
+  assert.equal(control?.connectorControl?.fenced?.(), false, "the new incarnation is not fenced");
+  const next = gw.accounts.filter((item) => item.enabled).map((account) =>
+    new OpenClawRoomRuntime(account, {fetchImpl: gw.room.fetchImpl, logger: quiet, status: gw.status, waitForRenewal: true}));
+  try {
+    for (const runtime of next) await runtime.initialize();
+    await eventually(() => gw.phases("cmd-in-process").includes("completed"), {message: "completion never reported"});
+    for (const runtime of next) await runtime.maintainPresence();
+    await settle();
+    assert.deepEqual(gw.phases("cmd-in-process"), ["restarting", "completed"]);
+    assert.equal((await receiptNow(gw)).phase, "reported");
+  } finally {
+    for (const runtime of next) await runtime.close();
+  }
+});
+
+test("R2-1 the registry, fence and incarnation live on globalThis and a re-imported module shares them", async () => {
+  const holder = globalThis[Symbol.for("synthetic-sociality-room.connector-control.v1")];
+  assert.ok(holder, "a process-global holder exists");
+  const again = await import(`../src/connector-control.js?reimport=${Date.now()}`);
+  assert.equal(again.connectorControl, control?.connectorControl);
+  assert.equal(again.connectorControl, holder);
+  control.connectorControl.raiseFence();
+  try {
+    assert.equal(again.connectorControl.fenced(), true);
+  } finally {
+    control.connectorControl.liftFence();
+  }
+});
+
+test("R2-3 a registration granted connector.control.v1 declares the installation's memberships and origins", async () => {
+  const room = fakeRoom();
+  room.grant = true;
+  const gw = await gateway({fetchRoom: room, extra: [{accountId: "elsewhere", roomId: "room-e", baseUrl: "https://other.example/api", enabled: true, running: false}]});
+  open.push(gw);
+  room.declarationAnswer = (call) => (call.roomId === "room-c" ? json({code: "not_found"}, 404) : undefined);
+  await gw.start();
+  await eventually(() => room.declarations.length >= 2, {message: "no declaration"});
+  const installationId = JSON.parse(await readFile(join(gw.store, "installation.json"), "utf8")).installationId;
+  for (const declaration of room.declarations) {
+    const registration = room.registrations.find((item) => item.roomId === declaration.roomId);
+    assert.equal(declaration.sessionId, registration.sessionId);
+    assert.equal(declaration.body.installationId, installationId);
+    assert.match(declaration.body.incarnation, /^[A-Za-z0-9._:-]{8,128}$/);
+    assert.deepEqual([...declaration.body.memberships].sort(), ["member-room-a", "member-room-c", "member-room-o"]);
+    assert.deepEqual(declaration.body.origins, [
+      {origin: "https://other.example", bindings: 1, enabled: 1},
+      {origin: "https://room.example", bindings: 3, enabled: 2},
+    ]);
+    assert.ok(!JSON.stringify(declaration.body).includes("fixture-credential"));
+  }
+  assert.equal(new Set(room.declarations.map((item) => item.body.incarnation)).size, 1);
+  // A 404 is not fatal: both accounts are connected and heartbeat.
+  await gw.runtimes.claw.maintainPresence();
+  assert.ok(room.heartbeats.some((call) => call.roomId === "room-c"));
+  // Not granted: no declaration.
+  const plain = await started();
+  await settle();
+  assert.equal(plain.room.declarations.length, 0);
 });
