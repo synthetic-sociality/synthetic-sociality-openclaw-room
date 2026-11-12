@@ -1333,7 +1333,13 @@ the connector side, identical in both connectors.
   `deferred` or `coalesced` (`dist/restart-DJLfBy-X.js:107`); a failure
   throws and the CLI exits non-zero. A host deferral is bounded by
   `gateway.reload.deferralTimeoutMs` (default 300 s) and may then force the
-  restart. Outcomes: `scheduled`, `deferred` or `coalesced` is accepted: the
+  restart. The `restarting` report carries `restartWithinSeconds` (R2-8b):
+  OpenClaw `gateway.reload.deferralTimeoutMs / 1000 + 300`, read from the
+  host's runtime config, `300 + 300` when absent or unreadable
+  (`dist/restart-BF68zBs3.js:117`, `:401-405`), 86400 when the host waits
+  indefinitely (0 or less); Hermes the effective `restart_after_turn_timeout`
+  + 300. The Room server's `restarting` deadline is that window clamped to
+  600..7200 s. Outcomes: `scheduled`, `deferred` or `coalesced` is accepted: the
   fence, the drained listeners and the `restarting` receipt stay, nothing is
   reported and no timeout gives up; completion is the next incarnation's
   (P17-7). An explicit error answer, a non-zero exit without an accepted

@@ -306,6 +306,7 @@ export function createRoomChannel({makeClient}) {
           registered = true;
           // Contract P17-4: every binding of this gateway, for the control inventory.
           connectorControl.setAccounts(() => resolvedRoomAccounts(ctx.cfg));
+          if (!connectorControl.options.config) connectorControl.setConfig(() => ctx.cfg);
           client = makeClient(ctx.account, {logger: scrubbingLogger(ctx.log), waitForRenewal: true, status: localStatus});
           // Contract P7d-5: the agent the host routes a Room conversation of
           // this account to (the same route resolution as each turn below).
@@ -583,6 +584,8 @@ export function createRoomChannel({makeClient}) {
       // never a CLI discovery pass.
       const gatewayLoad = api?.registrationMode === "full";
       if (gatewayLoad) roomLocalStatus(api?.logger, api?.config).setLoaded(true);
+      // R2-8b: the restart window follows the host's current runtime config.
+      if (gatewayLoad) connectorControl.setConfig(() => api?.runtime?.config?.current?.() ?? api?.config);
       // Contract P2c-1: fence the store in every session, and scrub results.
       if (typeof api?.on === "function") {
         const fence = roomToolCallPolicy(api, {noteWebRead: gatewayLoad});

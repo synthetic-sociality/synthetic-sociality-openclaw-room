@@ -819,3 +819,29 @@ test("R2-3 a registration granted connector.control.v1 declares the installation
   await settle();
   assert.equal(plain.room.declarations.length, 0);
 });
+
+test("B-F004 restart window: the restarting report carries restartWithinSeconds from the host deferral", async () => {
+  const gw = await started();
+  const supervisor = await fakeSupervisor(gw, 0, {stdout: hostAnswer("deferred")});
+  // A configured deferral of 900 s: 900 + 300.
+  gw.configure({binary: supervisor.binary, spawner: supervisor.spawner, config: () => ({gateway: {reload: {deferralTimeoutMs: 900_000}}})});
+  gw.room.control = gw.command("cmd-window", "restart");
+  await gw.runtimes.aura.maintainPresence();
+  await eventually(() => gw.phases("cmd-window").includes("restarting"), {message: "no restarting report"});
+  assert.equal(gw.room.reports.find((item) => item.commandId === "cmd-window").body.restartWithinSeconds, 1200);
+  assert.equal(control?.restartWithinSeconds?.({gateway: {reload: {deferralTimeoutMs: 900_000}}}), 1200);
+});
+
+test("B-F004 restart window: absent or unreadable deferral uses 300 + 300", async () => {
+  const gw = await started();
+  const supervisor = await fakeSupervisor(gw, 0, {stdout: hostAnswer("deferred")});
+  gw.configure({binary: supervisor.binary, spawner: supervisor.spawner, config: () => ({gateway: {}})});
+  gw.room.control = gw.command("cmd-window-default", "restart");
+  await gw.runtimes.aura.maintainPresence();
+  await eventually(() => gw.phases("cmd-window-default").includes("restarting"), {message: "no restarting report"});
+  assert.equal(gw.room.reports.find((item) => item.commandId === "cmd-window-default").body.restartWithinSeconds, 600);
+  assert.equal(control?.restartWithinSeconds?.(undefined), 600);
+  assert.equal(control?.restartWithinSeconds?.({gateway: {reload: {deferralTimeoutMs: "300000"}}}), 600);
+  const throwing = {get gateway() { throw new Error("unreadable"); }};
+  assert.equal(control?.restartWithinSeconds?.(throwing), 600);
+});

@@ -43,6 +43,7 @@ const SETTLED_INTENTS = new Set(["posted", "superseded", "skipped", "quarantined
 
 const DEFAULTS = Object.freeze({
   accounts: null,
+  config: null, // the host's runtime config (gateway.reload.deferralTimeoutMs)
   loadState,
   spawner: spawn,
   binary: null,
@@ -203,6 +204,25 @@ export function parseHostAnswer(text) {
   return null;
 }
 
+// R2-8b: the window the Room server allows the restart: the host's own
+// safe-restart deferral bound plus a 300 s margin for the drain and the new
+// process. Host 2026.7.1-2 restart-BF68zBs3.js:401-405: a non-number uses the
+// default 300000 ms (:117); 0 or less waits indefinitely (the field's
+// maximum, 86400, is sent; the server clamps it).
+export const RESTART_MARGIN_SECONDS = 300;
+export const DEFAULT_DEFERRAL_SECONDS = 300;
+export function restartWithinSeconds(config) {
+  let timeoutMs;
+  try {
+    timeoutMs = config?.gateway?.reload?.deferralTimeoutMs;
+  } catch {
+    timeoutMs = undefined;
+  }
+  if (typeof timeoutMs !== "number" || !Number.isFinite(timeoutMs)) return DEFAULT_DEFERRAL_SECONDS + RESTART_MARGIN_SECONDS;
+  if (timeoutMs <= 0) return 86_400;
+  return Math.min(86_400, Math.max(60, Math.floor(timeoutMs / 1000) + RESTART_MARGIN_SECONDS));
+}
+
 export function inventoryCounts(bindings) {
   const enabled = bindings.filter((binding) => binding.enabled).length;
   return {bindings: bindings.length, enabled, disabled: bindings.length - enabled};
@@ -271,6 +291,21 @@ class ConnectorControl {
   // The channel's account list (every binding of the gateway, enabled or not).
   setAccounts(accounts) {
     if (typeof accounts === "function") this.options.accounts = accounts;
+  }
+
+  // R2-8b: the host's runtime config, read when a restart is reported.
+  setConfig(config) {
+    if (typeof config === "function") this.options.config = config;
+  }
+
+  restartWindow() {
+    let config;
+    try {
+      config = this.options.config?.();
+    } catch {
+      config = undefined;
+    }
+    return restartWithinSeconds(config);
   }
 
   fenced() {
@@ -615,7 +650,7 @@ class ConnectorControl {
   }
 
   async restart(runtime, sessionId, base, generation) {
-    await this.report(runtime, sessionId, base.commandId, {phase: "restarting"});
+    await this.report(runtime, sessionId, base.commandId, {phase: "restarting", restartWithinSeconds: this.restartWindow()});
     const runtimes = this.liveRuntimes();
     const before = await this.inventory(runtimes, new Map());
     const startedAt = now();
