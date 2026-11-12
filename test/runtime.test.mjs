@@ -6,6 +6,7 @@ import {tmpdir} from "node:os";
 import {join} from "node:path";
 import {ARTIFACT_CONTEXT_CHARACTER_LIMIT, HANDOVER_CONTEXT_CHARACTER_LIMIT, HOST_LABEL, canonicalRoomContext, commandInstruction, discussionHandoverContext, sourceArtifactContext, cyclePhaseInstruction, epochConversationId, epochEvidence, eventEpochId, isAssignedEvent, isAssignedMessage, isBoundaryEvent, isLifecycleOnlyCycleTerminal, normalizeEvent, OpenClawRoomRuntime, resetEnrollmentLineages, resolveStandaloneRecipientSelectors, validateActiveEpochPage} from "../src/runtime.js";
 import {RoomAPIError} from "../src/room-client.js";
+import {ROOM_CONNECTOR_PROVENANCE} from "../src/release-provenance.js";
 import {loadState, saveState, validateState} from "../src/state.js";
 // Runtimes in this file get a private scratch state file: a runtime may write
 // its state (ackEvent, persistState), and the directory is made 0700.
@@ -189,10 +190,15 @@ test("initializes one connector session when native startup and event polling ov
   assert.equal(second.sessionId, "session-1");
   assert.equal(registrations, 1);
   assert.equal(statusRequests, 0, "legacy Room deployments must not be blocked by an unauthenticated /status probe");
-  assert.deepEqual(registrationBody.metadata, {
+  // Contract P17-1: the installation id (random, persisted) and the version.
+  const {installationId, ...registrationMetadata} = registrationBody.metadata;
+  assert.match(installationId, /^openclaw-inst-[0-9a-f]{32}$/);
+  assert.deepEqual(registrationMetadata, {
     runtimeName: "OpenClaw", runtimeVersion: "2026.7.1-2",
     hostLabel: HOST_LABEL, transport: "long_poll", modelDescriptor: "host-selected",
+    connectorVersion: ROOM_CONNECTOR_PROVENANCE.version,
   });
+  assert.ok(registrationBody.capabilities.includes("connector.control.v1"));
   assert.equal((await loadState(stateFile)).messagePayloadDialect, "v2");
   assert.equal(activities.length, 1);
   assert.deepEqual(activities[0], {
@@ -282,7 +288,9 @@ test("verified build provenance stays embedded without violating strict registra
     if(url.endsWith("/activity"))return new Response(JSON.stringify({acceptedStreamSeq:1}),{status:202}); throw new Error(url);
   }});
   await runtime.initialize();
-  assert.deepEqual(metadata, {runtimeName:"OpenClaw",runtimeVersion:"2026.7.1-2",hostLabel:HOST_LABEL,transport:"long_poll",modelDescriptor:"host-selected"});
+  const {installationId, ...strictMetadata} = metadata;
+  assert.match(installationId, /^openclaw-inst-[0-9a-f]{32}$/);
+  assert.deepEqual(strictMetadata, {runtimeName:"OpenClaw",runtimeVersion:"2026.7.1-2",hostLabel:HOST_LABEL,transport:"long_poll",modelDescriptor:"host-selected",connectorVersion:"0.2.26"});
   assert.equal(runtime.releaseProvenance.version,"0.2.26");
   assert.equal(runtime.releaseProvenance.sourceCommit,"a".repeat(40));
   assert.equal(runtime.releaseProvenance.artifactIdentity,"sha256:"+"b".repeat(64));

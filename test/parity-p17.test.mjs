@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import {readFile} from "node:fs/promises";
+import {readFile, readdir} from "node:fs/promises";
+import {join} from "node:path";
 
 // P17 (shared with Hermes 1.0.104): owner connector control. The cases run in
 // test/connector-control.test.mjs against two Room accounts of one gateway;
@@ -59,3 +60,30 @@ test("P17 version pairing: OpenClaw 0.2.79 implements the clause", async () => {
   assert.equal(packageJson.version, "0.2.79");
   assert.equal(conformance.adapterVersion, "0.2.79");
 });
+
+// Host pin: the exact peer (2026.7.1-2) offers `openclaw gateway restart --safe`,
+// the restart that asks the running gateway to restart after its active work
+// drains. Read only; the real binary is never run.
+const HOST_ROOT = process.env.OPENCLAW_HOST_ROOT;
+test("P17 host pin: the OpenClaw peer offers gateway restart --safe with active-work deferral",
+  {skip: HOST_ROOT ? false : "OPENCLAW_HOST_ROOT is unset; the host dist cannot be read"}, async () => {
+    const packageJson = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
+    const host = JSON.parse(await readFile(join(HOST_ROOT, "package.json"), "utf8"));
+    assert.equal(host.version, packageJson.peerDependencies.openclaw);
+    const dist = join(HOST_ROOT, "dist");
+    const names = await readdir(dist);
+    const read = async (prefix) => Promise.all(names.filter((name) => name.startsWith(prefix) && name.endsWith(".js"))
+      .map(async (name) => [name, await readFile(join(dist, name), "utf8")]));
+    // The CLI: `gateway restart` has the --safe option (register-service-commands-*.js).
+    const commands = (await read("register-service-commands-")).filter(([, text]) =>
+      /command\("restart"\)[^\n]*\.option\("--safe", "Request an OpenClaw-aware restart after active work drains/.test(text));
+    assert.equal(commands.length, 1, "gateway restart --safe option");
+    // --safe asks the running gateway (lifecycle-*.js requestSafeGatewayRestart).
+    const lifecycle = (await read("lifecycle-")).filter(([, text]) => text.includes("if (opts.safe) return await requestSafeGatewayRestart(opts);")
+      && /async function requestSafeGatewayRestart\(opts\) \{[\s\S]{0,600}method: "gateway\.restart\.request"/.test(text));
+    assert.equal(lifecycle.length, 1, "safe restart goes through gateway.restart.request");
+    // The gateway defers the restart while work is active (restart-*.js).
+    const deferral = (await read("restart-")).filter(([, text]) => text.includes('"gateway.restart.request": async')
+      && /status: restart\.coalesced \? "coalesced" : skipDeferral \|\| preflight\.safe \? "scheduled" : "deferred"/.test(text));
+    assert.equal(deferral.length, 1, "safe restart defers for in-flight work");
+  });

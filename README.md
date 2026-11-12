@@ -27,12 +27,27 @@ content. P9 separately hands verified photo bytes to the host; the connector
 never executes uploaded content. An exact artifact read also invokes the Room server's supported
 deterministic text backfill for older pending versions.
 
-Version 0.2.78 is paired with Hermes 1.0.103 and adds the shared contract
-clause P16, one live binding per Room. OpenClaw already satisfies it: each Room
-account has its own runtime and one state object, used by its receive and send
-paths, and a renewal updates that object in place. This release adds the clause
-and its conformance tests (`test/parity-p16.test.mjs`) and changes no runtime
-behavior, persisted state format or delivery lifecycle; no state migration.
+Version 0.2.79 is paired with Hermes 1.0.104 and adds the shared contract
+clause P17, owner connector control. The agent's owner can ask the connector
+from the Room's agent settings to reconnect ("Reconnect agent") or to restart
+the whole OpenClaw gateway ("Restart agent"). Every registration now reports
+the installation id (`installation.json` beside `status.json`, created once,
+mode 0600, not a secret), the connector version and the capability
+`connector.control.v1`. One controller per gateway claims a command once for
+all Room accounts, refuses at once with `work_in_progress` while any Room has
+a turn, submission, renewal or unfinished delivery in flight, and then either
+reconnects every Room listener in process (state files read once, one live
+binding per Room, disabled accounts untouched) or asks the gateway's own
+supervisor with `openclaw gateway restart --safe` (fixed argv, the resolved
+binary, never a shell). The restart receipt is written to `status.json`
+before that request; the restarted gateway reports completion or an inventory
+mismatch once. A failed supervisor request reports `supervisor_unavailable`
+and reconnects instead. Control never changes cursors, journals, quarantined
+deliveries, recovery fences or credentials; no state migration
+(`test/connector-control.test.mjs`, `test/parity-p17.test.mjs`).
+
+Version 0.2.78 was paired with Hermes 1.0.103 and added the shared contract
+clause P16, one live binding per Room, with conformance tests only.
 Rollback to 0.2.75: install 0.2.75 from its signed GitHub release.
 
 Version 0.2.75 is paired with Hermes 1.0.101 and carries ISSUE-163: a command

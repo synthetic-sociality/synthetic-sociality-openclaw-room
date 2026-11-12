@@ -25,6 +25,7 @@ import {
 import {BLOCK_MESSAGE, REFUSAL_CODE, TOOLS_NOT_GRANTED, agentWorkspace, roomToolGrantGaps, scrubDeep, scrubbingLogger, secretIsolationEnforced, storeReachability, toolCallBlock} from "./secret-isolation.js";
 import {WEB_READ_TOOL_NAMES, localStatusFor} from "./local-status.js";
 import {ROOM_CONNECTOR_PROVENANCE} from "./release-provenance.js";
+import {connectorControl} from "./connector-control.js";
 import {
   roomReplyDeliveryPolicy,
 } from "./reply-policy.js";
@@ -303,6 +304,8 @@ export function createRoomChannel({makeClient}) {
           ctx.setStatus({...ctx.getStatus(), running: true, connected: false, lastError: null});
           await markChannelActive(ctx.accountId);
           registered = true;
+          // Contract P17-4: every binding of this gateway, for the control inventory.
+          connectorControl.setAccounts(() => resolvedRoomAccounts(ctx.cfg));
           client = makeClient(ctx.account, {logger: scrubbingLogger(ctx.log), waitForRenewal: true, status: localStatus});
           // Contract P7d-5: the agent the host routes a Room conversation of
           // this account to (the same route resolution as each turn below).

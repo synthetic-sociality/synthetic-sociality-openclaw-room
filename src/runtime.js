@@ -11,6 +11,7 @@ import {ROOM_CONNECTOR_PROVENANCE} from "./release-provenance.js";
 import {renewCredential} from "./credential-renewal.js";
 import {speakerLabel, speakerName} from "./speaker.js";
 import {rememberSecrets} from "./secret-isolation.js";
+import {CONTROL_CAPABILITY, connectorControl, deliveryIntentUnfinished, installationIdFor, roomStateDirectory, untilSignal} from "./connector-control.js";
 import {
   discussionDocumentContext, discussionDocuments, documentToolState, effectiveGiven, givenMemory, knownSize, observedHostSession, readVersion, validGivenMemory,
 } from "./documents.js";
@@ -610,8 +611,19 @@ export class OpenClawRoomRuntime {
     renewalWait = sleep,
     status = null,
     hostLabel = HOST_LABEL,
+    controlRole = "native",
   } = {}) {
     this.account = account;
+    // Contract P17: a native account runtime executes owner connector
+    // control; a presence fallback only when no native runtime runs.
+    this.controlRole = controlRole === "fallback" ? "fallback" : "native";
+    this.listenerAbort = new AbortController();
+    this.controlPause = null;
+    this.readerRunning = false;
+    this.inflightEvent = null;
+    this.renewing = false;
+    this.submissions = 0;
+    this.registeredAt = 0;
     // Contract P2c-4 status writer (shared per installation) and P2c-3 flag:
     // the next contact registers the connector session again.
     this.status = status;
@@ -709,6 +721,9 @@ export class OpenClawRoomRuntime {
   }
 
   async initializeOnce(signal) {
+    // Contract P17-7: after a restart, the stored inventory is read before
+    // any listener of the new gateway starts.
+    try { await connectorControl.beforeStart(this); } catch {}
     this.state = await waitForState(this.account.stateFile, signal);
     signal?.throwIfAborted();
     if (this.closed || this.account.enabled === false || this.state.enabled === false || this.state.revoked === true) throw new Error("Room account is disabled, revoked or closed");
@@ -758,17 +773,30 @@ export class OpenClawRoomRuntime {
     return this.connectorSession;
   }
 
+  // Contract P17-1: the installation id of this gateway (beside status.json).
+  installationId() {
+    try {
+      return installationIdFor(this.status?.path ? dirname(this.status.path) : roomStateDirectory(this.account.stateFile));
+    } catch {
+      return "";
+    }
+  }
+
   async registerConnector(signal) {
+    const installationId = this.installationId();
     this.connectorSession = await this.client.register(this.state, {
       clientInstanceId: this.state.clientInstanceId,
       contractVersion: 1,
-      capabilities: ["events.long_poll", "activity.relay", MESSAGE_LOGICAL_CONTRIBUTION_CAPABILITY],
+      capabilities: ["events.long_poll", "activity.relay", MESSAGE_LOGICAL_CONTRIBUTION_CAPABILITY,
+        ...(installationId ? [CONTROL_CAPABILITY] : [])],
       metadata: {
         runtimeName: "OpenClaw",
         runtimeVersion: "2026.7.1-2",
         hostLabel: this.hostLabel,
         transport: "long_poll",
         modelDescriptor: "host-selected",
+        ...(installationId ? {installationId} : {}),
+        connectorVersion: String(this.releaseProvenance?.version ?? ""),
       },
     }, signal);
     const capabilities = this.connectorSession?.capabilities;
@@ -792,7 +820,110 @@ export class OpenClawRoomRuntime {
     // P8-4: an idle frame follows every registration (the start sends it at once).
     this.idleFrameAt = 0;
     this.reportStatus({connected: true, registered: true});
+    // Contract P17-2/P17-7: a registration answer may carry a control command;
+    // a restarted gateway reports on its first registration.
+    this.registeredAt = Date.now();
+    if (!this.closed) {
+      try {
+        connectorControl.attach(this);
+        this.noteConnectorControl(this.connectorSession?.connectorControl);
+        connectorControl.registered(this);
+      } catch {
+        // Control never breaks a registration.
+      }
+    }
     return this.connectorSession;
+  }
+
+  // Contract P17-2: offered to the gateway's controller; malformed is ignored.
+  noteConnectorControl(raw) {
+    if (raw === undefined || raw === null) return;
+    try {
+      connectorControl.offer(this, raw);
+    } catch {
+      // Never breaks the loop.
+    }
+  }
+
+  // Contract P17-3: no new dispatch, turn claim or renewal while it is up.
+  async controlFence(signal) {
+    if (connectorControl.fenced()) await connectorControl.fenceWait(signal);
+  }
+
+  // Contract P17-3: active dispatch, in-flight event, submission, pending or
+  // nonquiescent renewal, or an unfinished delivery intent of this binding.
+  controlWorkInProgress() {
+    if (this.closed || !this.state) return false;
+    if (this.attemptLeases.size > 0 || this.inflightEvent || this.submissions > 0 || this.renewing) return true;
+    const pending = this.pendingEvent;
+    if (pending && !(pending.seq <= this.state.cursor || this.terminalEvidenceFor(pending) || this.isQuarantinedEvent(pending))) return true;
+    if (this.state.credentialRotation) return true;
+    return Object.values(this.state.deliveryIntents ?? {}).some(deliveryIntentUnfinished);
+  }
+
+  // Contract P17-5: stop this binding's listener, heartbeat and enrollment
+  // task and wait for them; the listener parks until resumeAfterControl.
+  async suspendForControl(waitMs = 30_000) {
+    if (this.controlPause) return true;
+    const pause = {parked: Promise.withResolvers(), resume: Promise.withResolvers()};
+    this.controlPause = pause;
+    const reading = this.readerRunning;
+    this.listenerAbort.abort(new Error("Room connector control pause"));
+    this.heartbeatAbort.abort();
+    await this.heartbeatTask?.catch(() => {});
+    let parked = true;
+    if (reading) {
+      let timer;
+      parked = await Promise.race([pause.parked.promise.then(() => true),
+        new Promise((resolve) => { timer = setTimeout(() => resolve(false), waitMs); timer.unref?.(); })]);
+      clearTimeout(timer);
+    }
+    await this.bindingOperation.catch(() => {});
+    return parked;
+  }
+
+  // Contract P17-5: the reloaded binding adopted into the one live object
+  // (P16: listener and send path keep sharing it).
+  adoptReloadedState(loaded) {
+    return this.withBindingOperation(async () => {
+      const live = this.state;
+      for (const key of Object.keys(live)) delete live[key];
+      Object.assign(live, loaded);
+      if (this.client) this.client.credential = live.credential;
+      rememberSecrets(live);
+    });
+  }
+
+  // Contract P17-5: forced re-registration, heartbeat and listener again.
+  async resumeAfterControl() {
+    const pause = this.controlPause;
+    this.controlPause = null;
+    this.heartbeatAbort = new AbortController();
+    this.heartbeatError = undefined;
+    this.listenerAbort = new AbortController();
+    if (!this.closed) {
+      this.reregister = true;
+      try {
+        await this.maintainPresence(this.heartbeatAbort.signal);
+      } catch (error) {
+        this.logger?.warn?.(`Room registration after connector control failed${roomErrorDiagnostic(error)}; retrying`);
+      }
+      if (!this.closed) this.runHeartbeat();
+    }
+    pause?.resume.resolve();
+  }
+
+  // The listener paused by control waits here; false when its stop came.
+  async awaitControlResume(signal) {
+    const pause = this.controlPause;
+    if (!pause) return !this.closed;
+    pause.parked.resolve();
+    try {
+      await untilSignal(pause.resume.promise, signal);
+    } catch {
+      return false;
+    }
+    return !this.closed && !signal?.aborted;
   }
 
   // Contract P8-1: the instructed interval in ms, floored and capped.
@@ -898,10 +1029,13 @@ export class OpenClawRoomRuntime {
         if (!this.isQuarantinedEvent(this.pendingEvent)) return false;
         this.pendingEvent = null;
       }
+      // Contract P17-3: no renewal starts under the control fence.
+      if (connectorControl.fenced() && !this.state.credentialRotation) return false;
       if (!this.state.credentialRotation && Date.now() - this.lastRenewalCheck < this.renewalIntentIntervalMs()) return false;
       this.lastRenewalCheck = Date.now();
       const bounded = AbortSignal.timeout(15_000);
       const renewalSignal = signal ? AbortSignal.any([signal, bounded]) : bounded;
+      this.renewing = true;
       try {
         const changed = await renewCredential({state: this.state, stateFile: this.account.stateFile,
           account: this.account, client: this.client, signal: renewalSignal});
@@ -919,6 +1053,8 @@ export class OpenClawRoomRuntime {
         if (this.state.credentialRotation) throw error;
         this.logger?.warn?.(`Room renewal discovery unavailable${roomErrorDiagnostic(error)}`);
         return false;
+      } finally {
+        this.renewing = false;
       }
     });
   }
@@ -933,10 +1069,29 @@ export class OpenClawRoomRuntime {
     let step = 0;
     let failed = null;
     for (;;) {
+      // Contract P17-5: owner connector control pauses this listener through
+      // its own signal; the host's stop signal keeps its meaning.
+      const pause = this.listenerAbort.signal;
+      const scanSignal = signal ? AbortSignal.any([signal, pause]) : pause;
+      const paused = () => pause.aborted && !signal?.aborted && !this.closed;
+      this.readerRunning = true;
       try {
-        for await (const turn of this.assignedTurnsOnce(signal)) yield turn;
-        return;
+        try {
+          for await (const turn of this.assignedTurnsOnce(scanSignal)) yield turn;
+        } finally {
+          this.readerRunning = false;
+          this.inflightEvent = null;
+        }
+        if (!paused()) return;
+        this.pendingEvent = null;
+        if (!(await this.awaitControlResume(signal))) return;
+        continue;
       } catch (error) {
+        if (paused()) {
+          this.pendingEvent = null;
+          if (!(await this.awaitControlResume(signal))) return;
+          continue;
+        }
         this.failClosedOnRequestError(error);
         if (signal?.aborted || this.closed || !transientRoomFailure(error)) throw error;
         if (failed && (this.scanPasses !== failed.passes
@@ -958,6 +1113,7 @@ export class OpenClawRoomRuntime {
     // from the durable frontier and consults the per-event evidence again.
     let scanCursor = this.state.cursor;
     while (!signal.aborted && !this.closed) {
+      await this.controlFence(signal);
       await this.renewAccess(signal);
       await this.applyRecoveryClosures(signal);
       const page = await this.readEventsResilient(Math.max(scanCursor, this.state.cursor), signal);
@@ -981,7 +1137,12 @@ export class OpenClawRoomRuntime {
       await this.maintainPresenceResilient(signal, {heartbeat: this.presenceDueOnRead()});
       this.reportLedger();
       for (const event of page.events ?? []) {
+        this.inflightEvent = null;
         if (event.seq <= this.state.cursor) continue;
+        // Contract P17-3: events stay durable and are processed after the
+        // control fence lifts; one past it is in flight for the guard.
+        await this.controlFence(signal);
+        this.inflightEvent = event;
         if (this.isQuarantinedEvent(event)) {
           // No replay, superseding, deletion or fabricated terminal receipt.
           await this.markLedger(event, "quarantined");
@@ -1167,6 +1328,7 @@ export class OpenClawRoomRuntime {
           break;
         }
       }
+      this.inflightEvent = null;
       // Contract P2c-3a: a full pass without a failure resets the schedule.
       this.scanPasses += 1;
     }
@@ -2477,10 +2639,16 @@ export class OpenClawRoomRuntime {
   }
 
   async postAndFinish(request) {
-    return this.withBindingOperation(() => {
-      if (this.state.credentialRotation) throw new Error("Room access renewal is pending; outbound delivery paused");
-      return this.postAndFinishOnce(request);
-    });
+    // Contract P17-3: a submission in flight is work in progress.
+    this.submissions += 1;
+    try {
+      return await this.withBindingOperation(() => {
+        if (this.state.credentialRotation) throw new Error("Room access renewal is pending; outbound delivery paused");
+        return this.postAndFinishOnce(request);
+      });
+    } finally {
+      this.submissions -= 1;
+    }
   }
 
   async postAndFinishOnce({roomId, text, replyToId, idempotencyKey, signal, sourceEventId, sourceEpochId = "", cycleAttempt = null, resolveRecipientMentions = false, contributionType, literal = false}) {
@@ -3249,6 +3417,8 @@ export class OpenClawRoomRuntime {
         try {
           const answer = await this.client.heartbeat(this.state, this.connectorSession.sessionId, signal);
           this.presenceAcceptedAt = Date.now();
+          // Contract P17-2: an owner control command for this installation.
+          this.noteConnectorControl(answer?.connectorControl);
           // P8-1: a later session answer's interval takes effect.
           if (answer?.heartbeatIntervalSeconds !== undefined) this.instructedHeartbeatSeconds = answer.heartbeatIntervalSeconds;
         } catch (error) {
@@ -3492,6 +3662,9 @@ export class OpenClawRoomRuntime {
 
   async close() {
     this.closed = true;
+    connectorControl.detach(this);
+    // A listener paused by connector control ends with the runtime.
+    this.controlPause?.resume.resolve();
     // P8-2: a closed account no longer lists for its lineage.
     if (this.state) this.enrollmentLineage().members.delete(this);
     // Stop every renewal before aborting, so an aborted claim is not read as lost authority.

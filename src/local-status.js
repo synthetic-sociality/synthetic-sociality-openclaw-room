@@ -6,7 +6,7 @@
 // renewal secret, message body, reply text or prompt: every value is a fixed
 // code, an identifier, a number or a time.
 import {randomUUID} from "node:crypto";
-import {chmodSync, closeSync, existsSync, fsyncSync, mkdirSync, openSync, renameSync, statSync, unlinkSync, writeSync} from "node:fs";
+import {chmodSync, closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeSync} from "node:fs";
 import {dirname, join, resolve} from "node:path";
 
 export const STATUS_SCHEMA = "synthetic-sociality-room-status-v1";
@@ -29,6 +29,12 @@ function timer(milliseconds, callback) {
 
 function now() {
   return new Date().toISOString().replace(/\.\d{3}Z$/, "Z");
+}
+
+function validControlReceipt(value) {
+  return Boolean(value && typeof value === "object" && !Array.isArray(value)
+    && typeof value.commandId === "string" && /^[A-Za-z0-9_.:-]{1,128}$/.test(value.commandId)
+    && typeof value.phase === "string" && CODE.test(value.phase));
 }
 
 function code(value) {
@@ -72,6 +78,26 @@ export class LocalStatus {
     // Room's own connection state under that mark (P2c-4).
     this.inactive = new Set();
     this.connection = new Map();
+    // Contract P17: the owner connector control receipt survives the process
+    // (a restart reads it back); every other value starts fresh.
+    try {
+      const prior = JSON.parse(readFileSync(path, "utf8"))?.connectorControl;
+      if (validControlReceipt(prior)) this.data.connectorControl = prior;
+    } catch {
+      // No earlier file, or not readable: no receipt.
+    }
+  }
+
+  // Contract P17: codes, ids, counts, times and the non-secret binding
+  // inventory only. True when it is durable in the file.
+  setConnectorControl(receipt) {
+    if (!validControlReceipt(receipt)) return false;
+    this.data.connectorControl = structuredClone(receipt);
+    return this.write();
+  }
+
+  connectorControlReceipt() {
+    return this.data.connectorControl ? structuredClone(this.data.connectorControl) : null;
   }
 
   // Contract P2c-6: a web reading tool the host itself named in a Room turn.

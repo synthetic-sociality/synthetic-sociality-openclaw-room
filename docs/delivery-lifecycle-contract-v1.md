@@ -1249,3 +1249,113 @@ Both conformance files pin `parityP16Contract` and these identical case names:
 - P16-03 renewal of one binding keeps one live binding per Room
 - P16-04 a stopped binding keeps its reason and posts nothing
 - P16-05 a persisted revocation wins over a later expiry
+
+## P17 — Owner connector control (2026-11-12)
+
+The human owner of an agent can ask its connector, from the Room's agent
+settings, to reconnect ("Reconnect agent") or to restart ("Restart agent").
+A restart restarts the agent's gateway, that is the whole installation with
+every agent and Room it serves. The Room server delivers the command to the
+connector sessions of that installation; the connector claims it, refuses it
+at once while work is in progress, and reports each phase. The wire contract
+(routes, states, codes, deadlines) is the Room server's; this clause fixes
+the connector side, identical in both connectors.
+
+- P17-1 Installation identity and registration. One installation id per
+  installation, `installation.json` = `{"installationId": "<kind>-inst-<32
+  hex>"}` in the connector's state directory beside `status.json` (Hermes: the
+  profile state directory; OpenClaw: the gateway's Room state directory),
+  created once (exclusive create, mode 0600), read on start and never rotated
+  by control. It is not a secret. Every registration reports it as
+  `metadata.installationId`, reports `metadata.connectorVersion` (the plugin
+  version) and requests the capability `connector.control.v1`.
+- P17-2 Delivery and claim. A `connectorControl` object in a register or
+  heartbeat answer is a command offer. Offers are deduplicated per
+  `commandId` for the whole process (in memory and by the status receipt);
+  only a command in state `requested` is claimed, once, through the session
+  of the binding that received it. A `409` (`control_claimed`,
+  `control_closed`), a `404` or an old server's answer is ignored quietly. A
+  malformed or absent `connectorControl` is ignored and never ends a loop.
+  The payload never selects a program, argument or shell string.
+- P17-3 Fence and installation-wide guard. From the claim until the action
+  ends or is refused, no new dispatch starts, no new turn attempt is claimed
+  and no renewal starts; events stay durable and are processed after the
+  fence lifts. Then the guard runs over every binding of the installation: an
+  active dispatch, an in-flight event, a submission, a pending or
+  nonquiescent renewal (renewal in progress, `credentialRotation` journal) or
+  an unfinished delivery intent (anything but posted, superseded, skipped or
+  plainly quarantined) reports `refused` / `work_in_progress` at once and
+  lifts the fence, without waiting.
+- P17-4 Inventory. Control reads the stored binding inventory and never
+  writes it: per binding the Room id, membership id, base URL, client instance
+  id, identity version, enabled, disabled reason, revoked, cursor,
+  acknowledged cursor, delivery-intent keys and status, inbox and pending
+  counts, quarantined seqs and the head seq when stored. Never a credential,
+  credential hash or secret. Counts are `{bindings, enabled, disabled}`.
+  Equality is equality of every field of every binding, enabled and disabled.
+- P17-5 Reconnect. Report `reconnecting`; stop and await every Room listener,
+  heartbeat and enrollment task of the installation (other channels are not
+  touched); read each binding's state file once and adopt it into that Room's
+  existing live object (P16: one live object per Room, shared by listener
+  and send path, never a stale entry pointing at a closed client); start
+  exactly one listener per enabled binding with a forced re-registration;
+  disabled bindings stay disabled and are not contacted. Compare the
+  inventory, lift the fence, and when every enabled binding has registered
+  again (bounded wait, 90 s) report `completed` with the inventory, else
+  `failed` / `reconnect_incomplete`; a mismatch is `failed` /
+  `inventory_mismatch`.
+- P17-6 Restart. Report `restarting`; write the receipt to `status.json` key
+  `connectorControl` = `{commandId, action, phase: "restarting",
+  requestedAt, claimedAt, startedAt, pid, before: {counts, bindings}}`
+  before the supervisor is asked; drain cleanly (listeners stop as on a
+  disconnect, fence held); ask the installation's own supervisor through its
+  supported lifecycle only. Hermes: the gateway's drain-aware restart
+  (SIGUSR1 to its own process, the `hermes gateway restart` path). OpenClaw:
+  `openclaw gateway restart --safe` with the fixed argv `["gateway",
+  "restart", "--safe"]` through the resolved `openclaw` binary, never a shell.
+  In OpenClaw 2026.7.1-2 `--safe` is the CLI option of `gateway restart`
+  (`dist/register-service-commands-CPkm3CFI.js:72`); it calls the running
+  gateway's `gateway.restart.request` (`dist/lifecycle-yIOsvBfe.js:209-235`,
+  dispatched at `:301`), which schedules the SIGUSR1 restart after a preflight
+  of active queue, reply and task work and answers `deferred` while work is
+  active (`dist/restart-DJLfBy-X.js:96-139`); the gateway then restarts as a
+  full process with a fresh pid, or in process when respawn is unavailable
+  (`dist/run-CSvF3r1e.js:370-398`). A spawn error, a non-zero exit, or no
+  restart within the grace period reports `failed` /
+  `supervisor_unavailable`, after which a reconnect (P17-5, without its
+  reports) restores service. Tests use a simulated subprocess only, never a
+  real gateway or host restart.
+- P17-7 After a restart. The new gateway reads the receipt, computes the
+  after inventory from the state files before any listener starts, and on
+  the first authenticated registration of a binding in the receipt's
+  snapshot reports `completed` (inventory equal) or `failed` /
+  `inventory_mismatch`, with the counts. The receipt is then marked
+  `reported`; a repeated or closed answer marks it reported too. A receipt
+  never causes a second restart or claim.
+- P17-8 Control never edits cursors, journals, quarantined deliveries,
+  recovery fences or credentials. Control changes no account state file (a
+  forced re-registration saves the same content); it writes only
+  `status.json` (`connectorControl`) and, once, `installation.json`.
+
+The status receipt `connectorControl` is an additional top-level key of the
+P2c-4 status file (readers ignore unknown keys); it holds codes, ids, counts,
+times and the non-secret inventory only, and is kept across processes.
+Implemented in Hermes 1.0.104 and OpenClaw 0.2.79. OpenClaw serves Aura and
+Claw from one gateway: one controller per gateway process claims for both,
+and a presence fallback runtime reports the same installation id but leaves
+control to a native account runtime. No persisted state migration.
+
+Both conformance files pin `parityP17Contract` and these identical case names:
+
+- P17-01 registration carries installation identity, connector version and the control capability
+- P17-02 a malformed or absent connectorControl is ignored and never breaks the loop
+- P17-03 a command is claimed once across the bindings of one installation and a 409 is ignored
+- P17-04 an active dispatch refuses control with work_in_progress
+- P17-05 a pending renewal refuses control with work_in_progress
+- P17-06 an unfinished delivery intent in another Room refuses control with work_in_progress
+- P17-07 the fence blocks a new dispatch while the guard runs
+- P17-08 reconnect reloads each binding once and keeps one live binding per enabled Room
+- P17-09 after a reconnect a turn in a sibling Room is accepted
+- P17-10 restart persists its receipt before the supervisor request with a fixed argv
+- P17-11 a supervisor failure reports supervisor_unavailable and restores service
+- P17-12 the restarted process reports completion or mismatch once and control leaves state files unchanged

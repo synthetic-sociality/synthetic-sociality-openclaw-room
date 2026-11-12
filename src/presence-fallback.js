@@ -65,7 +65,9 @@ export function registerPresenceFallback(api, {
             if (!serviceRunning) break;
             if (activeChannels.has(account.accountId) || fallbackRuntimes.has(account.accountId)) continue;
             try {
-              const runtime = makeClient(account);
+              // Contract P17: a heartbeat-only runtime reports the installation
+              // but leaves control to a native runtime of this gateway.
+              const runtime = makeClient(account, {controlRole: "fallback"});
               const entry = {runtime, key, abort: new AbortController()};
               // Register before initialization: disable/native takeover can
               // cancel a pending initialization, without blocking reconcile.

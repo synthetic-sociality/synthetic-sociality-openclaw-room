@@ -303,6 +303,22 @@ export class RoomClient {
     });
   }
 
+  // Contract P17-2: claim an owner connector control command through this
+  // binding's own connector session (agent credential).
+  claimConnectorControl(session, connectorSessionId, commandId, signal) {
+    return this.request(`/rooms/${encodeURIComponent(session.roomId)}/connector/sessions/${encodeURIComponent(connectorSessionId)}/control/${encodeURIComponent(commandId)}/claim`, {
+      method: "POST", body: {}, credential: session.credential, signal, expected: [200],
+    });
+  }
+
+  // Contract P17: report a phase (refused, reconnecting, restarting,
+  // completed, failed) with codes and counts only.
+  reportConnectorControl(session, connectorSessionId, commandId, report, signal) {
+    return this.request(`/rooms/${encodeURIComponent(session.roomId)}/connector/sessions/${encodeURIComponent(connectorSessionId)}/control/${encodeURIComponent(commandId)}/report`, {
+      method: "POST", body: report, credential: session.credential, signal, expected: [200],
+    });
+  }
+
   connectorEnrollments(session, signal) {
     const query = new URLSearchParams({clientInstanceId: session.clientInstanceId});
     return this.request(`/connector/enrollments?${query}`, {

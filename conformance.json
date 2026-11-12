@@ -3,7 +3,7 @@
   "contract": "synthetic-sociality-room-delivery-lifecycle-v1",
   "contractDocument": "docs/delivery-lifecycle-contract-v1.md",
   "adapter": "synthetic-sociality-room",
-  "adapterVersion": "0.2.78",
+  "adapterVersion": "0.2.79",
   "platform": "OpenClaw",
   "roomProtocol": "external-agent-connector-v1",
   "verifiedFeatures": {
@@ -1545,5 +1545,20 @@
     "P16-03 renewal of one binding keeps one live binding per Room",
     "P16-04 a stopped binding keeps its reason and posts nothing",
     "P16-05 a persisted revocation wins over a later expiry"
+  ],
+  "parityP17Contract": "docs/delivery-lifecycle-contract-v1.md#p17--owner-connector-control-2026-11-12",
+  "parityP17Cases": [
+    "P17-01 registration carries installation identity, connector version and the control capability",
+    "P17-02 a malformed or absent connectorControl is ignored and never breaks the loop",
+    "P17-03 a command is claimed once across the bindings of one installation and a 409 is ignored",
+    "P17-04 an active dispatch refuses control with work_in_progress",
+    "P17-05 a pending renewal refuses control with work_in_progress",
+    "P17-06 an unfinished delivery intent in another Room refuses control with work_in_progress",
+    "P17-07 the fence blocks a new dispatch while the guard runs",
+    "P17-08 reconnect reloads each binding once and keeps one live binding per enabled Room",
+    "P17-09 after a reconnect a turn in a sibling Room is accepted",
+    "P17-10 restart persists its receipt before the supervisor request with a fixed argv",
+    "P17-11 a supervisor failure reports supervisor_unavailable and restores service",
+    "P17-12 the restarted process reports completion or mismatch once and control leaves state files unchanged"
   ]
 }
