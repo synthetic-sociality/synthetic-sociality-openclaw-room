@@ -248,7 +248,7 @@ test("persists an owner-approved Room before hot activation without a gateway re
     connectorEnrollments: async (state) => {
       assert.equal(state.clientInstanceId, "client-1");
       listings += 1;
-      return listings === 1 ? [{invitationId: "invite-2", roomTitle: "WAM GGF3"}] : [];
+      return listings === 1 ? [{invitationId: "invite-2", roomId: "room-2", roomTitle: "WAM GGF3"}] : [];
     },
     claimConnectorEnrollment: async (state, invitationId) => {
       assert.equal(state.clientInstanceId, "client-1");

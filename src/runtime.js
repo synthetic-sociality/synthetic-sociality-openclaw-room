@@ -3,6 +3,7 @@ import {PHOTO_TYPES, appendPhotoContext, effectivePhotos, hostImageStore, photoC
 import {contributionOutput, frozenContributionType} from "./contribution.js";
 import {createHash, randomUUID} from "node:crypto";
 import {hostname} from "node:os";
+import {readdir, readFile} from "node:fs/promises";
 import {dirname, join} from "node:path";
 import {RETRY_AFTER_MAXIMUM_SECONDS, RoomAPIError, RoomClient, RoomRequestError, RoomResponseError, RoomTransportError, roomErrorDiagnostic} from "./room-client.js";
 import {loadState, migrateStateFile, saveNewState, saveState} from "./state.js";
@@ -3556,6 +3557,20 @@ export class OpenClawRoomRuntime {
     for (const enrollment of pending.slice(0, 32)) {
       const invitationId = String(enrollment?.invitationId ?? "").trim();
       if (!invitationId) continue;
+      // OP-12 R5 B-F009: the listed Room decides before the claim. A claim
+      // consumes the invitation and re-admits the membership, so a listing
+      // without a valid roomId, or a Room whose held account may not be
+      // replaced, is left unclaimed: the invitation and the removed membership stay.
+      const listedRoom = typeof enrollment?.roomId === "string" ? enrollment.roomId.trim() : "";
+      if (!listedRoom) {
+        this.logger?.warn?.(`Room enrollment ${invitationId} skipped: the listing names no Room`);
+        continue;
+      }
+      const heldForRoom = await this.heldStateForRoom(listedRoom);
+      if (heldForRoom === false || (heldForRoom && !staleInertState(heldForRoom))) {
+        this.logger?.warn?.(`Room ${listedRoom} is already bound and its account is not replaceable; enrollment ${invitationId} left unclaimed`);
+        continue;
+      }
       let claimed;
       try {
         claimed = await this.client.claimConnectorEnrollment(this.state, invitationId, signal);
@@ -3614,6 +3629,25 @@ export class OpenClawRoomRuntime {
       this.logger?.info?.(`Activated owner-approved Room ${roomId}`);
     }
     return activated;
+  }
+
+  /**
+   * The stored account state of this gateway for a Room on this Room server, read only: null when none is held,
+   * false when one is held but unreadable (never claim on uncertain evidence).
+   * @param {string} roomId - The listed Room.
+   * @returns {Promise<object|null|false>} The held state.
+   */
+  async heldStateForRoom(roomId) {
+    const directory = dirname(this.account.stateFile);
+    let names;
+    try { names = await readdir(directory); } catch { return false; }
+    for (const name of names.filter((entry) => entry.endsWith(".json"))) {
+      let raw;
+      try { raw = JSON.parse(await readFile(join(directory, name), "utf8")); } catch { continue; }
+      if (raw?.roomId !== roomId || raw?.baseUrl !== this.state.baseUrl) continue;
+      try { return await loadState(join(directory, name)); } catch { return false; }
+    }
+    return null;
   }
 
   async publishPresence(signal) {

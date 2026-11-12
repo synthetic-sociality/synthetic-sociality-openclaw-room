@@ -366,7 +366,7 @@ test("P8-03 a newly approved Room is claimed at the next listing; a mute is seen
   const installation = await idleInstallation(clock, room, {status, activations});
   await clock.runUntil(200 * SECOND);
   // The owner approves a new Room for lineage A, and mutes a2.
-  room.pending.set("lineage-A", [{invitationId: "invite-new"}]);
+  room.pending.set("lineage-A", [{invitationId: "invite-new", roomId: "a4"}]);
   room.claims.set("invite-new", {roomId: "a4", membershipId: "member-a4", credential: "credential-a4", headSeq: 0});
   room.muted.add("a2");
   // A lost session (b1) and a revoked credential (b2) at their next heartbeat.
