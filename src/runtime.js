@@ -4,7 +4,7 @@ import {contributionOutput, frozenContributionType} from "./contribution.js";
 import {createHash, randomUUID} from "node:crypto";
 import {hostname} from "node:os";
 import {readdir, readFile} from "node:fs/promises";
-import {dirname, join} from "node:path";
+import {dirname, join, resolve} from "node:path";
 import {RETRY_AFTER_MAXIMUM_SECONDS, RoomAPIError, RoomClient, RoomRequestError, RoomResponseError, RoomTransportError, roomErrorDiagnostic} from "./room-client.js";
 import {loadState, migrateStateFile, saveNewState, saveState} from "./state.js";
 import {activateRoomChannel} from "./activation.js";
@@ -676,6 +676,19 @@ const backgroundSleep = (milliseconds, signal) => new Promise((resolve, reject) 
 
 // Owner 2026-11-12 re-admission and contract P18: see readmission.js.
 export {staleInertState};
+
+/**
+ * PR80-O-001, contract P18-1: the host config names this account state file with enabled:false (an operator's
+ * disable, whatever the state file says). An unreadable account list counts as disabled (fail closed).
+ * @param {string} stateFile - An account state file.
+ * @returns {boolean} Whether the account must be left untouched.
+ */
+export function configDisabledAccount(stateFile) {
+  const listed = connectorControl.listedAccounts();
+  if (!Array.isArray(listed)) return true;
+  const target = resolve(stateFile);
+  return listed.some((account) => account?.enabled === false && typeof account?.stateFile === "string" && resolve(account.stateFile) === target);
+}
 
 export class OpenClawRoomRuntime {
   constructor(account, {
@@ -3638,6 +3651,11 @@ export class OpenClawRoomRuntime {
       }
       const heldAccount = await this.heldAccountForRoom(listedRoom);
       const heldForRoom = heldAccount ? heldAccount.state : heldAccount;
+      if (heldAccount && configDisabledAccount(heldAccount.stateFile)) {
+        // PR80-O-001: an operator-disabled account is never abandoned, claimed over, replaced or re-enabled.
+        this.logger?.warn?.(`Room ${listedRoom} is held by an operator-disabled account; enrollment ${invitationId} left unclaimed`);
+        continue;
+      }
       if (heldForRoom && !staleInertState(heldForRoom) && abandonableEntries(heldForRoom)) {
         // Contract P18-5: only while a listed enrollment names this Room and before the claim. A live runtime of
         // the revoked account is closed first; the claim follows only when the account is inert afterwards.
@@ -3646,6 +3664,11 @@ export class OpenClawRoomRuntime {
       }
       if (heldForRoom === false || (heldForRoom && !staleInertState(heldForRoom))) {
         this.logger?.warn?.(`Room ${listedRoom} is already bound and its account is not replaceable; enrollment ${invitationId} left unclaimed`);
+        continue;
+      }
+      if (heldAccount && configDisabledAccount(heldAccount.stateFile)) {
+        // PR80-O-001: re-read immediately before the claim (an operator may disable the account meanwhile).
+        this.logger?.warn?.(`Room ${listedRoom} was operator-disabled before its claim; enrollment ${invitationId} left unclaimed`);
         continue;
       }
       let claimed;
@@ -3680,6 +3703,11 @@ export class OpenClawRoomRuntime {
       // configuration hot reload can expose this binding to another runtime.
       let held = null;
       try { held = await loadState(stateFile); } catch (error) { held = error?.code === "ENOENT" ? null : false; }
+      if (configDisabledAccount(stateFile)) {
+        // PR80-O-001: never write over, or merge enabled:true into, an account the operator disabled.
+        this.logger?.warn?.(`Room ${roomId} is operator-disabled in the host config; the claimed enrollment is not activated`);
+        continue;
+      }
       if (held === null) {
         await saveNewState(stateFile, nextState);
       } else {
