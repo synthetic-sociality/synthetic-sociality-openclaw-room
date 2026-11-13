@@ -894,3 +894,31 @@ test("A3 settled and quarantined ledger entries do not refuse control", async ()
   assert.equal(storedWorkInProgress({receiveLedger: {7: {eventId: "e", status: "posted"}, 8: {eventId: "f", status: "quarantined"}}}), false);
   assert.equal(storedWorkInProgress({receiveLedger: {9: {eventId: "g", status: "received"}}}), true);
 });
+
+// A3 (gap map §2 "Receipt write failure", "Command parse"): parity with Hermes. A restart whose receipt cannot be
+// persisted reports failed / receipt_unavailable and neither drains nor asks the supervisor; a command id outside
+// the shared pattern ^[A-Za-z0-9_-]{1,128}$ is ignored.
+test("A3 a restart whose receipt cannot be written reports receipt_unavailable without drain or supervisor", async () => {
+  const gw = await started();
+  const supervisor = await fakeSupervisor(gw, 0);
+  gw.configure({binary: supervisor.binary, spawner: supervisor.spawner});
+  const original = gw.status.setConnectorControl.bind(gw.status);
+  gw.status.setConnectorControl = (receipt) => (receipt?.phase === "restarting" ? false : original(receipt));
+  gw.room.control = gw.command("cmd-receipt", "restart");
+  await gw.runtimes.aura.maintainPresence();
+  await eventually(() => gw.phases("cmd-receipt").includes("failed"), {message: "no failed report"});
+  const failed = gw.room.reports.find((item) => item.commandId === "cmd-receipt" && item.body.phase === "failed");
+  assert.equal(failed.body.code, "receipt_unavailable");
+  assert.equal(supervisor.calls.length, 0, "the supervisor is never asked");
+  assert.equal(gw.runtimes.aura.controlPause ?? null, null, "nothing was drained");
+});
+
+test("A3 a command id outside the shared pattern is ignored", async () => {
+  const gw = await started();
+  for (const commandId of ["cmd.dot", "cmd:colon"]) {
+    gw.room.control = gw.command(commandId, "reconnect");
+    await gw.runtimes.aura.maintainPresence();
+  }
+  await settle();
+  assert.deepEqual(gw.room.claims.filter((item) => ["cmd.dot", "cmd:colon"].includes(item.commandId)), []);
+});
