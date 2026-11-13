@@ -683,7 +683,12 @@ export {staleInertState};
  * @returns {Array<object>|null} The accounts.
  */
 export function hostAccountList() {
-  const listed = connectorControl.listedAccounts();
+  // PAIR-F002: read the host account source directly; a throw or a non-array answer (null) is unreadable, and only a
+  // gateway without an account source is an empty list. The P17 guard's listedAccounts() is unchanged.
+  const source = connectorControl.options?.accounts;
+  if (typeof source !== "function") return [];
+  let listed;
+  try { listed = source(); } catch { return null; }
   return Array.isArray(listed) ? listed : null;
 }
 
@@ -3735,7 +3740,8 @@ export class OpenClawRoomRuntime {
       }
       // PR80-O-006/O-007: a first-time credential is always kept (a list read failure never discards it), but an
       // account the raw host config names enabled:false is never activated, so no enabled:true is merged over it.
-      const configDisabledFresh = held === null && Boolean(listedNow) && configDisabledAccount(stateFile, listedNow, accountId);
+      // PAIR-F002: a null post-claim list counts as disabled for activation only; the credential is still saved.
+      const configDisabledFresh = held === null && (!listedNow || configDisabledAccount(stateFile, listedNow, accountId));
       if (held === null) {
         await saveNewState(stateFile, nextState);
       } else {
@@ -3756,7 +3762,9 @@ export class OpenClawRoomRuntime {
         this.logger?.info?.(`Replaced the stale binding of re-admitted Room ${roomId}`);
       }
       if (configDisabledFresh) {
-        this.logger?.warn?.(`Room ${roomId} is operator-disabled in the host config; the claimed credential is saved privately and the account is not activated`);
+        this.logger?.warn?.(listedNow
+          ? `Room ${roomId} is operator-disabled in the host config; the claimed credential is saved privately and the account is not activated`
+          : `Room ${roomId}: the host account list cannot be read after the claim; the credential is saved privately and the account is not activated`);
         continue;
       }
       await this.activateEnrollment({accountId, baseUrl: nextState.baseUrl, stateFile});
@@ -3789,7 +3797,9 @@ export class OpenClawRoomRuntime {
     try { names = await readdir(directory); } catch { return false; }
     for (const name of names.filter((entry) => entry.endsWith(".json"))) {
       let raw;
-      try { raw = JSON.parse(await readFile(join(directory, name), "utf8")); } catch { continue; }
+      // PAIR-F001 (brief A1: directory-wide held-state scan, fail closed on an unreadable file): any account file
+      // that cannot be read or parsed may hold this Room, so the whole scan refuses; no claim on uncertain evidence.
+      try { raw = JSON.parse(await readFile(join(directory, name), "utf8")); } catch { return false; }
       if (raw?.roomId !== roomId || raw?.baseUrl !== this.state.baseUrl) continue;
       const stateFile = join(directory, name);
       try { return {state: await loadState(stateFile), stateFile}; } catch { return false; }
