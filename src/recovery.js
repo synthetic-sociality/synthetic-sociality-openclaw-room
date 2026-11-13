@@ -185,7 +185,8 @@ export function roomForState(client, state, signal) {
   return {
     listEpochs: () => client.listEpochs(state, signal),
     epochEvents: (after, epochId) => client.readEpochEvents(state, after, epochId, signal),
-    roomState: () => client.roomState(state, signal),
+    // Contract P15-2 (PR80-O-004): recovery waits while participation is paused.
+    roomState: () => client.roomState(state, signal, {background: true}),
     getDiscussionCycle: (cycleId) => client.getDiscussionCycle(state, cycleId, signal),
   };
 }

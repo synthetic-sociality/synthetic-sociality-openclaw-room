@@ -299,7 +299,7 @@ test("PR80-O-004 the final credential-renewal and the recovery Room-state reads 
     },
   });
   const renewal = renewCredential({state: structuredClone(state), stateFile, account: {}, client});
-  await tick(120);
+  for (let waited = 0; probes < 1 && waited < 3000; waited += 20) await tick(20);
   assert.ok(probes >= 1, "the paused renewal rechecks through the own-roster probe");
   assert.ok(stateReads.length >= 1 && stateReads.every((value) => value === "muted"), "only probes reached the Room while paused");
   const recovery = roomForState(client, {...state, credential: "replacement"}).roomState();

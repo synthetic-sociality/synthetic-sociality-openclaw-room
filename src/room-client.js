@@ -388,7 +388,7 @@ export class RoomClient {
   }
 
   claimConnectorEnrollment(session, invitationId, signal) {
-    return this.request(`/connector/enrollments/${encodeURIComponent(invitationId)}/claim`, {background: true, 
+    return this.request(`/connector/enrollments/${encodeURIComponent(invitationId)}/claim`, {
       method: "POST",
       body: {clientInstanceId: session.clientInstanceId},
       credential: session.credential,
@@ -432,9 +432,10 @@ export class RoomClient {
     });
   }
 
-  roomState(session, signal, {probe = false} = {}) {
-    // Contract P15-2: the own-roster probe itself never waits on, nor feeds, the participation gate.
-    return this.request(`/rooms/${encodeURIComponent(session.roomId)}/state`, {probe, 
+  roomState(session, signal, {probe = false, background = false} = {}) {
+    // Contract P15-2: the own-roster probe itself never waits on, nor feeds, the participation gate; background
+    // callers (credential renewal, recovery) wait while paused; a turn-time read fails fast.
+    return this.request(`/rooms/${encodeURIComponent(session.roomId)}/state`, {probe, background, 
       credential: session.credential, signal, expected: [200],
     });
   }

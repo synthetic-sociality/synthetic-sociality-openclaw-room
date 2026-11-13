@@ -679,7 +679,7 @@ class ConnectorControl {
     }
     // Clean drain: the listeners stop as on a disconnect; the fence is held.
     await Promise.all(runtimes.map((item) => item.suspendForControl(this.options.drainWaitMs)));
-    const outcome = persisted ? await this.requestSupervisor() : {kind: "rejected", reason: "receipt_unwritten"};
+    const outcome = await this.requestSupervisor();
     if (this.generation !== generation) return;
     if (outcome.kind !== "rejected") {
       // R2-8: accepted, or possibly armed: keep the fence, the drained

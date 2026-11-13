@@ -139,7 +139,8 @@ export async function renewCredential({state, stateFile, account, client, signal
       || !Number.isFinite(Date.parse(event.payload.credentialExpiresAt))) fail();
     await update({phase: "confirmed", confirmationEventId: event.id}, {credentialExpiresAt: event.payload.credentialExpiresAt});
   }
-  const active = member(await client.roomState(replacement, signal), journal.expected);
+  // Contract P15-2 (PR80-O-004): credential discovery is a background watcher; it waits while participation is paused.
+  const active = member(await client.roomState(replacement, signal, {background: true}), journal.expected);
   delivery(active, journal.expected);
   const finished = {...state, displayName: journal.expected.displayName, identityVersion: journal.expected.identityVersion};
   delete finished.credentialRotation;
