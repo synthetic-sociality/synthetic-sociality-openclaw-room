@@ -4,7 +4,7 @@
 // channel.js sets it) over an isolated OPENCLAW_STATE_DIR, never a hand-built list.
 import assert from "node:assert/strict";
 import test from "node:test";
-import {mkdtemp, mkdir, readFile, readdir} from "node:fs/promises";
+import {chmod, mkdtemp, mkdir, readFile, readdir, writeFile} from "node:fs/promises";
 import {tmpdir} from "node:os";
 import {join} from "node:path";
 
@@ -22,7 +22,8 @@ const JOURNAL = "revocation-abandonment.jsonl";
 let round = 0;
 
 async function enroll({accountsConfig = undefined, held = FIXTURE, listing = [{invitationId: "invite-9", roomId: "room-2"}],
-  claimed = {roomId: "room-2", membershipId: "member-2"}, accounts = null, onClaim = null, accountsFor = null} = {}) {
+  claimed = {roomId: "room-2", membershipId: "member-2"}, accounts = null, onClaim = null, accountsFor = null,
+  rawHeld = null, mode = null, extraFiles = {}} = {}) {
   round += 1;
   const directory = join(state, `round-${round}`, "synthetic-sociality-room", "accounts");
   process.env.OPENCLAW_STATE_DIR = join(state, `round-${round}`);
@@ -30,8 +31,11 @@ async function enroll({accountsConfig = undefined, held = FIXTURE, listing = [{i
   const sourceFile = join(directory, "default.json");
   const heldFile = join(directory, "member-2.json");
   await saveState(sourceFile, SOURCE);
-  if (held) await saveState(heldFile, structuredClone(held));
-  const before = held ? await readFile(heldFile) : null;
+  if (rawHeld !== null) await writeFile(heldFile, rawHeld, {mode: 0o600});
+  else if (held) await saveState(heldFile, structuredClone(held));
+  for (const [name, bytes] of Object.entries(extraFiles)) await writeFile(join(directory, name), bytes, {mode: 0o600});
+  const before = held || rawHeld !== null ? await readFile(heldFile) : null;
+  if (mode !== null) await chmod(heldFile, mode);
   const cfg = {channels: {"synthetic-sociality-room": {enabled: true, baseUrl: SOURCE.baseUrl, stateFile: sourceFile,
     ...(accountsConfig ? {accounts: accountsConfig} : {})}}};
   connectorControl.setAccounts(accounts ?? accountsFor?.(cfg) ?? (() => resolvedRoomAccounts(cfg)));
@@ -53,6 +57,7 @@ async function enroll({accountsConfig = undefined, held = FIXTURE, listing = [{i
     await runtime.acceptConnectorEnrollments();
   } finally {
     connectorControl.setAccounts(() => []);
+    if (mode !== null) await chmod(heldFile, 0o600);
   }
   let journal = [];
   try { journal = (await readFile(join(directory, JOURNAL), "utf8")).split("\n").filter(Boolean).map((line) => JSON.parse(line)); } catch {}
@@ -104,7 +109,8 @@ test("PR80-O-006 a list that becomes unreadable after the claim never discards a
     accounts: () => { reads += 1; if (reads > 1) throw new Error("config unreadable"); return []; }});
   assert.deepEqual(result.claims, ["invite-7"]);
   assert.equal((await loadState(join(result.directory, "member-7.json"))).credential, "secret-fresh", "the credential is saved");
-  assert.deepEqual(result.activations, ["member-7"]);
+  // PAIR-F002: a null post-claim list counts as disabled for activation only; the credential stays retained.
+  assert.deepEqual(result.activations, []);
 });
 
 // PR80-O-007 / PR80-O-008 (OpenClaw 0.2.80 r4; contract P18-1 "never … re-enabled", "re-read … before a replacement,
@@ -144,4 +150,41 @@ test("PR80-O-008 a held revoked account is not replaced when the account list ca
   assert.equal(persisted.credential, "secret-old", "never replaced");
   assert.equal(persisted.revoked, true, "the old credential is never re-enabled");
   assert.equal(result.warnings.filter((line) => /cannot be read before the replacement/.test(line)).length, 1);
+});
+
+// PAIR-F001 (OP-12 PAIR R1, P2; brief A1 "directory-wide held-state scan, fail-closed on an unreadable file"): any
+// account file of the directory that cannot be read or parsed leaves the enrollment unclaimed, so no invitation is
+// consumed and no fresh credential is lost; the stored bytes stay. PAIR-F002 (P3): a first-time claim of a raw
+// config-disabled account is never activated when the post-claim list cannot be read; its credential is kept.
+test("PAIR-F001 a corrupt (non-JSON) account file of the listed Room leaves the enrollment unclaimed and its bytes unchanged", async () => {
+  const result = await enroll({rawHeld: '{"roomId":"room-2","baseUrl":"https://room.example/api", corrupt'});
+  assert.deepEqual(result.claims, [], "never claimed on an unparseable held file");
+  assert.deepEqual(result.activations, []);
+  assert.equal(Buffer.compare(result.before, await readFile(result.heldFile)), 0);
+  assert.deepEqual(result.journal, []);
+});
+
+test("PAIR-F001 an unreadable (mode 000) account file leaves the enrollment unclaimed and its bytes unchanged", async () => {
+  assert.notEqual(process.getuid?.(), 0, "never run as root: mode 000 would still be readable");
+  const result = await enroll({mode: 0o000});
+  assert.deepEqual(result.claims, [], "never claimed on an unreadable held file");
+  assert.deepEqual(result.activations, []);
+  assert.equal(Buffer.compare(result.before, await readFile(result.heldFile)), 0);
+  assert.deepEqual(result.journal, []);
+});
+
+test("PAIR-F001 an unrelated unparseable account file fails the whole directory scan closed, even for a first-time enrollment", async () => {
+  const result = await enroll({held: null, listing: [{invitationId: "invite-7", roomId: "room-7"}],
+    claimed: {roomId: "room-7", membershipId: "member-7"}, extraFiles: {"other.json": "not json"}});
+  assert.deepEqual(result.claims, [], "fail closed for the directory");
+  assert.deepEqual((await readdir(result.directory)).sort(), ["default.json", "other.json"]);
+});
+
+test("PAIR-F002 a first-time claim of a raw config-disabled account keeps the credential and is not activated when the post-claim list cannot be read", async () => {
+  let failing = false;
+  const result = await enroll({held: null, accountsConfig: {"member-2": {enabled: false}}, onClaim: () => { failing = true; },
+    accountsFor: (cfg) => () => (failing ? null : resolvedRoomAccounts(cfg))});
+  assert.deepEqual(result.claims, ["invite-9"]);
+  assert.equal((await loadState(result.heldFile)).credential, "secret-fresh", "the fresh credential is saved privately");
+  assert.deepEqual(result.activations, [], "uncertain evidence never activates");
 });
