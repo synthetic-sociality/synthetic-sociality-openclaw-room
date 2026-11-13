@@ -330,3 +330,72 @@ test("PR80-O-013 the rescue writer refuses an existing name or a symlink and nev
   await assert.rejects(runtimeModule.writeClaimedRescue(directory, "member-2.claimed-y", {credential: "secret-fresh"}));
   await assert.rejects(readFile(join(directory, "target")), /ENOENT/, "nothing written through the link");
 });
+
+// PR80-O-014 (OpenClaw 0.2.80 r7): in the supported layout whose account files are NOT in an `accounts/`
+// directory, the connector's own status.json (channel.js roomStatusPath) and installation.json
+// (connector-control.js) live beside them. The held scan skips exactly those two names there, and only there;
+// every other *.json keeps the full approved loadState gate, and in the `accounts/` layout nothing is skipped.
+async function enrollFlat({held = null, extraFiles = {}, listing = [{invitationId: "invite-9", roomId: "room-2"}],
+  claimed = {roomId: "room-2", membershipId: "member-2"}} = {}) {
+  const {installationIdFor, roomStateDirectory} = await import("../src/connector-control.js");
+  const {LocalStatus} = await import("../src/local-status.js");
+  const base = await mkdtemp(join(tmpdir(), "openclaw-room-flat-"));
+  const directory = join(base, "room");
+  await mkdir(directory, {mode: 0o700});
+  process.env.OPENCLAW_STATE_DIR = join(base, "openclaw");
+  const sourceFile = join(directory, "default.json");
+  await saveState(sourceFile, SOURCE);
+  assert.equal(roomStateDirectory(sourceFile), directory, "the flat layout: status.json lives beside the account files");
+  new LocalStatus(join(directory, "status.json"), {version: "0.2.80", hostLabel: "test"}).write();
+  assert.ok(installationIdFor(directory), "installation.json written beside the account files");
+  const heldFile = join(directory, "member-2.json");
+  if (held) await saveState(heldFile, structuredClone(held));
+  for (const [name, bytes] of Object.entries(extraFiles)) await writeFile(join(directory, name), bytes, {mode: 0o600});
+  const cfg = {channels: {"synthetic-sociality-room": {enabled: true, baseUrl: SOURCE.baseUrl, stateFile: sourceFile}}};
+  connectorControl.setAccounts(() => resolvedRoomAccounts(cfg));
+  const claims = [];
+  const activations = [];
+  const warnings = [];
+  const runtime = new OpenClawRoomRuntime({accountId: "default", stateFile: sourceFile, baseUrl: SOURCE.baseUrl},
+    {activateEnrollment: async (activation) => { activations.push(activation.accountId); }});
+  runtime.state = {...SOURCE};
+  runtime.logger = {warn: (message) => warnings.push(String(message)), info: () => {}};
+  resetEnrollmentLineages();
+  runtime.client = {
+    connectorEnrollments: async () => listing.map((item) => ({...item})),
+    claimConnectorEnrollment: async (_state, invitationId) => (claims.push(invitationId), {...claimed,
+      credential: "secret-fresh", credentialExpiresAt: "2026-12-12T00:00:00Z", identityVersion: 3, headSeq: 2650}),
+  };
+  try { await runtime.acceptConnectorEnrollments(); } finally { connectorControl.setAccounts(() => []); }
+  return {claims, activations, warnings, directory, heldFile};
+}
+
+test("PR80-O-014 flat layout: the connector's own status.json and installation.json do not block a first-time enrollment", async () => {
+  const result = await enrollFlat();
+  assert.deepEqual(result.claims, ["invite-9"]);
+  assert.deepEqual(result.activations, ["member-2"]);
+  assert.ok(!result.warnings.some((line) => /cannot be read/.test(line)));
+});
+
+test("PR80-O-014 flat layout: the owner case (revoked held account with pending work) is claimed and replaced beside its own metadata", async () => {
+  const result = await enrollFlat({held: FIXTURE});
+  assert.deepEqual(result.claims, ["invite-9"]);
+  assert.equal((await loadState(result.heldFile)).credential, "secret-fresh");
+});
+
+test("PR80-O-014 flat layout: any other unusable *.json still fails the scan closed", async () => {
+  for (const name of ["other.json", "status-copy.json", "Status.json"]) {
+    const result = await enrollFlat({extraFiles: {[name]: "not json"}});
+    assert.deepEqual(result.claims, [], name);
+    assert.ok(result.warnings.some((line) => line.includes(`account file ${name} cannot be read`)), name);
+  }
+});
+
+test("PR80-O-014 accounts/ layout: a status.json or installation.json inside accounts/ is not skipped", async () => {
+  for (const name of ["status.json", "installation.json"]) {
+    const result = await enroll({held: null, listing: [{invitationId: "invite-9", roomId: "room-9"}],
+      claimed: {roomId: "room-9", membershipId: "member-9"}, extraFiles: {[name]: JSON.stringify({installationId: "x"})}});
+    assert.deepEqual(result.claims, [], name);
+    assert.ok(result.warnings.some((line) => line.includes(`account file ${name} cannot be read (invalid_state)`)), name);
+  }
+});
