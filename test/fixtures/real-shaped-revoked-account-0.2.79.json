@@ -1,0 +1,38 @@
+{
+  "_comment": "Synthetic, Real-shaped OpenClaw account state (P18, OpenClaw 0.2.80). Not production state: every id, credential and body is invented. Shape: an account the Room revoked while a cycle reply's lifecycle was unfinished (lifecycle_pending after cycle_conflict), plus one retained settled terminal intent and posted terminal evidence awaiting acknowledgement.",
+  "version": 1,
+  "baseUrl": "https://room.example/api",
+  "roomId": "room-2",
+  "membershipId": "member-2",
+  "credential": "secret-old",
+  "credentialExpiresAt": "2099-01-01T00:00:00Z",
+  "identityVersion": 3,
+  "clientInstanceId": "client-1",
+  "cursor": 2645,
+  "deliveredCursor": 2646,
+  "revoked": true,
+  "revokedReason": "credential_revoked",
+  "revokedAt": "2026-11-12T09:40:00.000Z",
+  "receiveLedger": {
+    "2646": {"eventId": "evt-2646", "status": "posted"}
+  },
+  "terminalEvidence": {
+    "2646": {"status": "posted", "sourceSeq": 2646, "sourceEventId": "evt-2646", "canonicalEventId": "ev-reply-2646", "canonicalSeq": 2647, "canonicalTs": "2026-11-12T09:31:00.000Z", "reason": ""}
+  },
+  "deliveryIntents": {
+    "evt-2600:final": {
+      "version": 1, "status": "posted", "messagePayloadDialect": "v1",
+      "identity": {"roomId": "room-2", "body": "an earlier settled reply", "sourceEventId": "evt-2600"},
+      "deliveryState": "posted", "lifecycleState": "complete",
+      "canonicalMessage": {"id": "ev-reply-2600", "seq": 2601, "ts": "2026-11-11T18:00:00.000Z"}
+    },
+    "evt-2646:final": {
+      "version": 1, "status": "lifecycle_pending", "messagePayloadDialect": "v1",
+      "identity": {"roomId": "room-2", "body": "the reply whose cycle lifecycle never finished", "sourceEventId": "evt-2646"},
+      "deliveryState": "posted", "lifecycleState": "pending", "lifecycleAttempts": 1,
+      "lifecycleErrorCode": "cycle_conflict", "lifecycleAutomaticRetry": true,
+      "lifecycleFailedAt": "2026-11-12T09:31:02.000Z",
+      "canonicalMessage": {"id": "ev-reply-2646", "seq": 2647, "ts": "2026-11-12T09:31:00.000Z"}
+    }
+  }
+}
