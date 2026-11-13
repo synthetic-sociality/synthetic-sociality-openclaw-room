@@ -877,3 +877,20 @@ test("A3 a claim refused with control_transition_invalid is asked again at the n
   await eventually(() => gw.room.claims.filter((item) => item.commandId === "cmd-transition").length >= 2,
     {message: "control_transition_invalid was final: the command was dropped"});
 });
+
+// A3 (OpenClaw 0.2.80, gap map §2 "Guard (stored, not running)"): parity with Hermes renewal.quiescent, which counts
+// an inbox entry outside terminal/quarantined and a pending_since. OpenClaw's equivalent is a receive-ledger entry
+// still `received` (read, not yet processed): it is work in progress and refuses control. Settled and quarantined
+// ledger entries do not (Hermes: terminal and quarantined inbox values are quiescent).
+test("A3 a stored binding with an unprocessed received ledger entry refuses control", async () => {
+  const gw = await started({disabled: false, extra: [{accountId: "reader", roomId: "room-r", enabled: true, running: false,
+    stored: {receiveLedger: {7: {eventId: "evt-7", status: "received"}}}}]});
+  await refusedWith(gw, "cmd-ledger-reconnect", "reconnect");
+  await refusedWith(gw, "cmd-ledger-restart", "restart");
+});
+
+test("A3 settled and quarantined ledger entries do not refuse control", async () => {
+  const {storedWorkInProgress} = await import("../src/connector-control.js");
+  assert.equal(storedWorkInProgress({receiveLedger: {7: {eventId: "e", status: "posted"}, 8: {eventId: "f", status: "quarantined"}}}), false);
+  assert.equal(storedWorkInProgress({receiveLedger: {9: {eventId: "g", status: "received"}}}), true);
+});
