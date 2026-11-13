@@ -493,6 +493,13 @@ class ConnectorControl {
       this.seen.delete(command.commandId);
       return;
     }
+    // A3 (Hermes parity, R2-3): declaration, then claim. The declaration of
+    // this registration is answered (or failed) before the claim is sent.
+    if (runtime.controlDeclaration) await runtime.controlDeclaration;
+    if (this.generation !== generation || runtime.closed) {
+      this.seen.delete(command.commandId);
+      return;
+    }
     // P17-3: the fence from the claim on.
     this.raiseFence();
     try {
@@ -500,8 +507,10 @@ class ConnectorControl {
         await runtime.client.claimConnectorControl(runtime.state, sessionId, command.commandId, this.timeoutSignal());
       } catch (error) {
         // 409 control_claimed / control_closed (a sibling or another process
-        // has it, or it ended), 404 or an old server: ignored quietly.
-        if (!finalAnswer(error)) this.seen.delete(command.commandId);
+        // has it, or it ended), 404 or an old server: ignored quietly. A
+        // control_transition_invalid (the claim reached the Room before the
+        // declaration) is asked again at the next offer, as Hermes does.
+        if (!finalAnswer(error) || answerCode(error) === "control_transition_invalid") this.seen.delete(command.commandId);
         runtime.logger?.info?.(`Room connector control not claimed code=${answerCode(error)}`);
         return;
       }

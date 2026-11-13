@@ -836,7 +836,8 @@ export class OpenClawRoomRuntime {
         // R2-3: the installation declaration, only when the Room granted control.
         const granted = this.connectorSession?.capabilities;
         if (installationId && Array.isArray(granted) && granted.includes(CONTROL_CAPABILITY)) {
-          connectorControl.declare(this, installationId).catch(() => {});
+          // A3 (Hermes parity): the claim of a command offered with this answer awaits the declaration.
+          this.controlDeclaration = connectorControl.declare(this, installationId).catch(() => {});
         }
         this.noteConnectorControl(this.connectorSession?.connectorControl);
         connectorControl.registered(this);
