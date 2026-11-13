@@ -36,9 +36,18 @@ only when the account is inert afterwards; settled terminal intents no longer
 block a re-admission, while unsettled receive-ledger entries and applied
 recovery closures now do. P17: the installation declaration is awaited before
 a control claim, and a claim refused with `control_transition_invalid` is asked
-again. P11b: every Room request carries `User-Agent:
-synthetic-sociality-openclaw/1.0`. P13, P14 and P15 are not yet implemented in
-OpenClaw (see the contract).
+again, and both P17 guards count a receive-ledger entry still `received` as
+work in progress. P11b: every Room request carries `User-Agent:
+synthetic-sociality-openclaw/1.0`. P13: a cycle reply's @DisplayName mentions of
+active agents merge once with the rotation recipient, capped at the remaining
+follow-ups and frozen with the delivery intent; the standalone (cross-channel)
+routing is unchanged. P15: an ask (`human.command`) is a cycle source and
+presents its instruction; one participation gate per membership pauses every
+background Room contact while the own roster says the membership is muted or
+otherwise not active, replies and turn tools fail fast with
+`membership_inactive`, and a Room 403 probes the own roster once. `status.json`
+carries every key an updater's canary gate reads (contract Appendix, updater
+readiness). P14 (ArtCraft tools) is not yet implemented in OpenClaw.
 
 Version 0.2.79 is paired with Hermes 1.0.104 and adds the shared contract
 clause P17, owner connector control. The agent's owner can ask the connector

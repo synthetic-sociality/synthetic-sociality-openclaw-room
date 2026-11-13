@@ -1,6 +1,6 @@
-// A4 (OpenClaw 0.2.80, connector side only): status.json carries what the external updater reads from Hermes'
-// status.json (contract Appendix P2c-4, §U-5): version, pluginLoaded, pid, startedAt, updatedAt and per-Room
-// connection with membership id and last error code. The same keys and types as Hermes local_status.py.
+// A4 (OpenClaw 0.2.80, connector side only; contract Appendix "Updater readiness"): status.json carries every key the
+// external updater's canary gate reads, with the shared names and types. Completed-attempt counts are server-derived
+// by the updater, not a connector field. Same case and field list as the Hermes connector (conformance).
 import assert from "node:assert/strict";
 import test from "node:test";
 import {mkdtemp, readFile} from "node:fs/promises";
@@ -8,22 +8,31 @@ import {tmpdir} from "node:os";
 import {join} from "node:path";
 import {LocalStatus} from "../src/local-status.js";
 
-test("A4 status.json carries the updater health fields with Hermes' names and types", async () => {
+const conformance = JSON.parse(await readFile(new URL("../conformance.json", import.meta.url), "utf8"));
+const contract = await readFile(new URL("../docs/delivery-lifecycle-contract-v1.md", import.meta.url), "utf8");
+const TYPES = {version: "string", pluginLoaded: "boolean", pid: "number", startedAt: "string", updatedAt: "string",
+  "rooms.<id>.connection": "string", "rooms.<id>.membershipId": "string", "rooms.<id>.holeSeqs": "array",
+  "rooms.<id>.quarantinedSeqs": "array", "rooms.<id>.lastErrorCode": "string"};
+
+test(conformance.statusReadinessCases[0], async () => {
+  assert.deepEqual(conformance.statusReadinessFields, Object.keys(TYPES));
+  assert.ok(contract.includes("Completed-attempt counts are not a connector field"));
   const directory = await mkdtemp(join(tmpdir(), "openclaw-room-status-"));
   const path = join(directory, "status.json");
   const status = new LocalStatus(path, {version: "0.2.80", hostLabel: "test"});
-  status.room("room-1", "member-1", {connection: "connected", connected: true, registered: true});
+  status.room("room-1", "member-1", {connection: "connected", connected: true, registered: true,
+    ledger: {acknowledgedSeq: 3, holeSeqs: [5], quarantinedSeqs: [7], ledgerCode: "ack_hole"}});
   status.write();
-  await new Promise((resolve) => setTimeout(resolve, 50));
   const data = JSON.parse(await readFile(path, "utf8"));
+  const room = data.rooms["room-1"];
+  for (const [field, type] of Object.entries(TYPES)) {
+    const value = field.startsWith("rooms.<id>.") ? room[field.slice("rooms.<id>.".length)] : data[field];
+    assert.equal(type === "array" ? (Array.isArray(value) ? "array" : typeof value) : typeof value, type, field);
+  }
   assert.equal(data.version, "0.2.80");
   assert.equal(data.pluginLoaded, true);
   assert.equal(data.pid, process.pid);
   for (const key of ["startedAt", "updatedAt"]) assert.ok(Number.isFinite(Date.parse(data[key])), key);
-  assert.equal(typeof data.rooms, "object");
-  const room = data.rooms["room-1"];
-  assert.ok(room, "per-Room entry");
-  assert.equal(room.membershipId, "member-1");
-  assert.equal(room.connection, "connected");
-  assert.equal(typeof (room.lastErrorCode ?? ""), "string");
+  assert.deepEqual([room.membershipId, room.connection, room.holeSeqs, room.quarantinedSeqs], ["member-1", "connected", [5], [7]]);
+  assert.ok(!Object.keys(room).some((key) => /attempt/i.test(key)), "no completed-attempt field");
 });
