@@ -478,3 +478,124 @@ test("PR81-P-002 a start while paused as muted never awaits the gated startup fr
     await runtime.close().catch(() => {});
   }
 });
+
+// OP-12 parity remedy 0.2.82 (Hermes H107-P-005 twin): a paused (muted) start never spends a durable
+// lifecycle attempt the gate refuses locally, without any Room contact. Fake clock (Date), fake fetch.
+const LIFECYCLE_INTENTS = {
+  turn: {
+    version: 2, status: "lifecycle_pending", deliveryState: "posted", lifecycleState: "pending", lifecycleAttempts: 1,
+    identity: {roomId: "room-1", body: "Frozen", replyToId: "human-1", sourceEventId: "source-5"},
+    binding: {roomId: "room-1", membershipId: "member-1", clientInstanceId: "client-1"},
+    messagePayloadDialect: "v2", turn: {turnId: "turn-1"}, finishIdempotencyKey: "finish-good",
+    canonicalMessage: {id: "posted-6", seq: 6, ts: "2026-08-17T00:00:00Z"},
+    lifecycleRequest: {kind: "turn", turnId: "turn-1", observedSeq: 6, sourceEventId: "source-5", idempotencyKey: "finish-good"},
+    receipt: {eventId: "posted-6", sentAt: Date.parse("2026-08-17T00:00:00Z")},
+  },
+  cycle: {
+    version: 2, status: "lifecycle_pending", deliveryState: "posted", lifecycleState: "pending", lifecycleAttempts: 1,
+    identity: {roomId: "room-1", body: "Frozen", replyToId: "human-1", sourceEventId: "source-5", cycle: {cycleId: "cycle-1", attemptId: "attempt-1", generation: 3}},
+    binding: {roomId: "room-1", membershipId: "member-1", clientInstanceId: "client-1"},
+    messagePayloadDialect: "v2",
+    canonicalMessage: {id: "posted-6", seq: 6, ts: "2026-08-17T00:00:00Z"},
+    lifecycleRequest: {kind: "cycle", cycleId: "cycle-1", attemptId: "attempt-1", payload: {generation: 3, action: "contribute", eventId: "posted-6"}},
+    receipt: {eventId: "posted-6", sentAt: Date.parse("2026-08-17T00:00:00Z")},
+  },
+};
+const lifecycleContact = (call) => call.endsWith("/turns/finish") || call.endsWith("/attempts/attempt-1/complete");
+
+async function lifecycleStateFile(kind) {
+  const stateFile = joinPath(await makeTemp(joinPath(osTmp(), `openclaw-p15-lifecycle-${kind}-`)), "state.json");
+  await writeState(stateFile, {version: 1, baseUrl: "https://room.example/api", roomId: "room-1", membershipId: "member-1",
+    credential: "secret-1", clientInstanceId: "client-1", cursor: 4, deliveryIntents: {"source-5:final": structuredClone(LIFECYCLE_INTENTS[kind])}});
+  return stateFile;
+}
+
+// One fresh start of the account on the durable state; `paused` mutes the gate before the start.
+async function lifecycleStart(stateFile, {paused = false, lifecycle = () => Response.json({}), afterStart} = {}) {
+  const calls = [];
+  const runtime = new OpenClawRoomRuntime({accountId: "default", stateFile, baseUrl: "https://room.example/api"}, {fetchImpl: async (url, init) => {
+    const call = `${init.method ?? "GET"} ${String(url).replace("https://room.example/api", "")}`;
+    calls.push(call);
+    if (lifecycleContact(call)) return lifecycle();
+    if (String(url).endsWith("/state")) return Response.json({roster: [{membershipId: "member-1", status: paused ? "muted" : "active"}]});
+    if (String(url).endsWith("/connector/sessions")) return Response.json({sessionId: "s-1"});
+    if (String(url).includes("/events")) return Response.json({events: []});
+    return Response.json({});
+  }});
+  try {
+    if (paused) runtime.participation.observe("muted");
+    runtime.lastRenewalCheck = Date.now();
+    assert.equal(await settlesWithin(runtime.initializeOnce()), "done", "the start is not held");
+    assert.ok(runtime.heartbeatTask, "the heartbeat loop runs");
+    await afterStart?.(runtime, calls);
+  } finally {
+    runtime.participation.close();
+    await runtime.close().catch(() => {});
+  }
+  return {calls, intent: (await readState(stateFile)).deliveryIntents["source-5:final"]};
+}
+
+for (const kind of ["turn", "cycle"]) {
+  test(`0.2.82 three muted starts with a pending ${kind} lifecycle spend no attempt and send no lifecycle request`, {timeout: 4000}, async (t) => {
+    t.mock.timers.enable({apis: ["Date"], now: Date.parse("2026-11-14T00:00:00Z")});
+    const stateFile = await lifecycleStateFile(kind);
+    for (let start = 0; start < 3; start += 1) {
+      const {calls, intent} = await lifecycleStart(stateFile, {paused: true});
+      assert.equal(calls.filter(lifecycleContact).length, 0, "no lifecycle request reaches the Room");
+      assert.equal(intent.lifecycleAttempts, 1, `start ${start + 1} keeps the durable attempt count`);
+      assert.equal(intent.lifecycleState, "pending");
+      assert.equal(intent.status, "lifecycle_pending");
+      assert.notEqual(intent.lifecycleAutomaticRetry, false, "automatic retry stays allowed");
+    }
+  });
+
+  test(`0.2.82 a pending ${kind} lifecycle held by a muted start completes at the next active start, not on unmute alone`, {timeout: 4000}, async (t) => {
+    t.mock.timers.enable({apis: ["Date"], now: Date.parse("2026-11-14T00:00:00Z")});
+    const stateFile = await lifecycleStateFile(kind);
+    const held = await lifecycleStart(stateFile, {paused: true, afterStart: async (runtime, calls) => {
+      // A real unmute on the running account: the gate reopens; repair is startup work (as Hermes r3).
+      runtime.participation.observe("active");
+      assert.equal(runtime.participation.paused, false);
+      await runtime.maintainPresence(undefined, {heartbeat: true});
+      assert.equal(calls.filter(lifecycleContact).length, 0, "the reopened gate alone sends no lifecycle request");
+    }});
+    assert.equal(held.intent.lifecycleAttempts, 1);
+    assert.equal(held.intent.lifecycleState, "pending");
+    const next = await lifecycleStart(stateFile);
+    assert.equal(next.calls.filter(lifecycleContact).length, 1, "the next start sends the lifecycle request once");
+    assert.equal(next.intent.lifecycleState, "complete");
+    assert.equal(next.intent.lifecycleAttempts, 2);
+  });
+
+  test(`0.2.82 control: an active start completes the pending ${kind} lifecycle as before`, {timeout: 4000}, async (t) => {
+    t.mock.timers.enable({apis: ["Date"], now: Date.parse("2026-11-14T00:00:00Z")});
+    const {calls, intent} = await lifecycleStart(await lifecycleStateFile(kind));
+    assert.equal(calls.filter(lifecycleContact).length, 1);
+    assert.equal(intent.lifecycleState, "complete");
+    assert.equal(intent.status, "posted");
+    assert.equal(intent.lifecycleAttempts, 2);
+  });
+
+  test(`0.2.82 control: an ambiguous ${kind} lifecycle contact still spends its attempt (never refunded)`, {timeout: 4000}, async (t) => {
+    t.mock.timers.enable({apis: ["Date"], now: Date.parse("2026-11-14T00:00:00Z")});
+    const {calls, intent} = await lifecycleStart(await lifecycleStateFile(kind), {lifecycle: () => { throw new TypeError("fetch failed"); }});
+    assert.equal(calls.filter(lifecycleContact).length, 1);
+    assert.equal(intent.lifecycleAttempts, 2);
+    assert.equal(intent.lifecycleState, "pending");
+    assert.equal(intent.lifecycleAutomaticRetry, true);
+  });
+
+  test(`0.2.82 control: a retryable Room error on the ${kind} lifecycle still counts`, {timeout: 4000}, async (t) => {
+    t.mock.timers.enable({apis: ["Date"], now: Date.parse("2026-11-14T00:00:00Z")});
+    const stateFile = await lifecycleStateFile(kind);
+    const busy = () => Response.json({code: "unavailable", retryable: true}, {status: 503});
+    const first = await lifecycleStart(stateFile, {lifecycle: busy});
+    assert.equal(first.intent.lifecycleAttempts, 2);
+    assert.equal(first.intent.lifecycleState, "pending");
+    const second = await lifecycleStart(stateFile, {lifecycle: busy});
+    assert.equal(second.calls.filter(lifecycleContact).length, 1);
+    assert.equal(second.intent.lifecycleAttempts, 3);
+    assert.equal(second.intent.lifecycleState, "blocked");
+    assert.equal(second.intent.lifecycleAutomaticRetry, false);
+  });
+}
