@@ -915,9 +915,14 @@ export class OpenClawRoomRuntime {
     }
     if (this.closed) throw new Error("Room account closed during credential maintenance");
     await this.repairPendingLifecycles(signal);
-    await this.publishPresence(signal);
-    if (this.activityError) this.logger?.warn?.(`Room activity signal unavailable${roomErrorDiagnostic(this.activityError)}`);
-    else this.logger?.info?.("Room activity signal established");
+    // P15-2/P2c-3b (0.2.81): a paused (muted) start never awaits the gated
+    // frame; it stays owed for the first tick after the gate reopens.
+    if (this.participation?.paused) this.logger?.info?.("Room activity signal deferred while the membership is paused");
+    else {
+      await this.publishPresence(signal);
+      if (this.activityError) this.logger?.warn?.(`Room activity signal unavailable${roomErrorDiagnostic(this.activityError)}`);
+      else this.logger?.info?.("Room activity signal established");
+    }
     this.runHeartbeat();
     return this.connectorSession;
   }

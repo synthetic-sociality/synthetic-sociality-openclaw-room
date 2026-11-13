@@ -467,6 +467,8 @@ test("PR81-P-002 a start while paused as muted never awaits the gated startup fr
   try {
     // A retried start on the same runtime after an earlier attempt paused the gate.
     runtime.participation.observe("muted");
+    // The earlier attempt already checked renewal (a due renewal stays gated, bounded at 15 s; PR80-O-004).
+    runtime.lastRenewalCheck = Date.now();
     assert.equal(await settlesWithin(runtime.initializeOnce()), "done", "the start is not held by the gated frame");
     assert.ok(runtime.heartbeatTask, "the heartbeat loop runs");
     assert.equal(calls.filter((call) => call.includes("/activity")).length, 0, "no activity write while muted");
