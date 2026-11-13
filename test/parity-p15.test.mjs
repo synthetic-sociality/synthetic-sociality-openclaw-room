@@ -197,3 +197,118 @@ test(CASES[11], async () => {
   gate.close();
   await next;
 });
+
+// PR80-O-003 / PR80-O-004 (contract P15-2): the enrollment claim fails fast and is asked again at the next listing;
+// credential-renewal and recovery reads of the Room state wait while paused, and the own-roster probe stays reachable.
+import {mkdtemp as makeTemp} from "node:fs/promises";
+import {tmpdir as osTmp} from "node:os";
+import {join as joinPath} from "node:path";
+import {randomBytes, createHash} from "node:crypto";
+import {renewCredential} from "../src/credential-renewal.js";
+import {roomForState} from "../src/recovery.js";
+import {loadState as readState, saveState as writeState} from "../src/state.js";
+import {ParticipationGate as Gate} from "../src/participation.js";
+
+test("PR80-O-003 a muted source membership at claim time refuses the claim at once and the next poll claims", async () => {
+  const directory = await makeTemp(joinPath(osTmp(), "openclaw-room-o003-"));
+  const stateFile = joinPath(directory, "default.json");
+  const source = {version: 1, baseUrl: "https://room.example/api", roomId: "room-1", membershipId: "member-1",
+    credential: "secret-1", clientInstanceId: "client-1", cursor: 0};
+  await writeState(stateFile, source);
+  let runtime;
+  const claims = [];
+  const fetchImpl = async (url) => {
+    const path = new URL(url).pathname;
+    if (path.endsWith("/connector/enrollments")) {
+      // Muted between the listing and the claim.
+      runtime.participation.observe("muted");
+      return Response.json({enrollments: [{invitationId: "invite-9", roomId: "room-9"}]});
+    }
+    if (path.includes("/connector/enrollments/") || path.endsWith("/claim")) {
+      claims.push(path);
+      return Response.json({roomId: "room-9", membershipId: "member-9", credential: "fresh-9", credentialExpiresAt: "2099-01-01T00:00:00Z", identityVersion: 1, headSeq: 3});
+    }
+    if (path.endsWith("/state")) return Response.json({roster: [{membershipId: "member-1", status: "active"}]});
+    return Response.json({});
+  };
+  const activations = [];
+  runtime = new OpenClawRoomRuntime({accountId: "default", stateFile, baseUrl: source.baseUrl},
+    {fetchImpl, activateEnrollment: async (activation) => { activations.push(activation); }});
+  runtime.state = {...source};
+  runtime.client = new RoomClient({baseUrl: source.baseUrl, credential: source.credential, fetchImpl});
+  runtime.client.participation = runtime.participation;
+  resetEnrollmentLineages();
+  const first = await Promise.race([runtime.acceptConnectorEnrollments(), tick(300).then(() => "waited")]);
+  assert.deepEqual(first, [], "the claim fails fast instead of waiting for an unmute");
+  assert.deepEqual(claims, []);
+  runtime.participation.observe("active");
+  resetEnrollmentLineages();
+  const fetchAgain = runtime.client;
+  fetchAgain.participation = null; // the next poll's listing no longer mutes
+  runtime.client = new RoomClient({baseUrl: source.baseUrl, credential: source.credential, fetchImpl: async (url, init) => {
+    if (new URL(url).pathname.endsWith("/connector/enrollments")) return Response.json({enrollments: [{invitationId: "invite-9", roomId: "room-9"}]});
+    return fetchImpl(url, init);
+  }});
+  runtime.client.participation = runtime.participation;
+  const second = await runtime.acceptConnectorEnrollments();
+  assert.equal(claims.length, 1, "the next poll claims");
+  assert.equal(second.length, 1);
+  assert.equal(activations.length, 1);
+  runtime.participation.close();
+});
+
+test("PR80-O-004 the final credential-renewal and the recovery Room-state reads wait while paused; the own-roster probe stays reachable", async () => {
+  const stateFile = joinPath(await makeTemp(joinPath(osTmp(), "openclaw-room-o004-")), "state.json");
+  const state = {version: 1, baseUrl: "https://room.example/api", roomId: "room-1", membershipId: "member-1",
+    clientInstanceId: "instance-1", credential: "expired-base", credentialExpiresAt: "2020-01-01T00:00:00Z",
+    cursor: 7, terminalEvidence: {}, deliveryIntents: {}};
+  await writeState(stateFile, state);
+  const request = {roomId: "room-1", membershipId: "member-1", displayName: "An agent", identityVersion: 2,
+    baseCredentialGeneration: 1, requestId: randomBytes(32).toString("base64url"), deliveredSeq: 9, acknowledgedSeq: 7,
+    state: "owner_requested", expiresAt: new Date(Date.now() + 60_000).toISOString()};
+  const proof = {...request, grantId: "grant-1", credentialExpiresAt: "2030-01-01T00:00:00Z"};
+  let status = "active";
+  const stateReads = [];
+  const fetchImpl = async (url) => {
+    if (new URL(url).pathname.endsWith("/state")) {
+      stateReads.push(status);
+      return Response.json({roomId: "room-1", roster: [{...proof, status}]});
+    }
+    return Response.json({});
+  };
+  const client = new RoomClient({baseUrl: state.baseUrl, credential: state.credential, fetchImpl});
+  let probes = 0;
+  const gate = new Gate({recheckMs: 30, probe: async () => {
+    probes += 1;
+    const answer = await client.roomState({roomId: "room-1", credential: "probe"}, undefined, {probe: true});
+    return answer.roster.find((item) => item.membershipId === "member-1")?.status ?? "";
+  }});
+  client.participation = gate;
+  // The renewal grant flow is the fixture's; the final Room-state read is the real RoomClient path.
+  let confirmed = false;
+  Object.assign(client, {
+    credentialRenewalIntent: async () => ({request: confirmed ? null : request}),
+    requestCredentialRenewal: async () => ({...request, state: "issued", grantId: "grant-1"}),
+    redeemCredentialRenewal: async () => proof,
+    verifyCredentialRenewal: async () => proof,
+    confirmCredentialRenewal: async () => {
+      confirmed = true;
+      status = "muted";
+      gate.observe("muted"); // a mute lands between the confirmation and the final read
+      return {id: "event-1", type: "credential.renewed", payload: {membershipId: "member-1", credentialGeneration: 2, credentialExpiresAt: proof.credentialExpiresAt}};
+    },
+  });
+  const renewal = renewCredential({state: structuredClone(state), stateFile, account: {}, client});
+  await tick(120);
+  assert.ok(probes >= 1, "the paused renewal rechecks through the own-roster probe");
+  assert.ok(stateReads.length >= 1 && stateReads.every((value) => value === "muted"), "only probes reached the Room while paused");
+  const recovery = roomForState(client, {...state, credential: "replacement"}).roomState();
+  await tick(40);
+  const readsWhilePaused = stateReads.length;
+  assert.equal(readsWhilePaused, probes, "every Room-state contact while paused was a probe");
+  status = "active";
+  assert.equal(await renewal, true, "the renewal completes after the unmute instead of failing with membership_inactive");
+  assert.equal((await recovery).roomId, "room-1", "the recovery read completes after the unmute");
+  assert.equal((await readState(stateFile)).credentialRotation, undefined);
+  gate.close();
+});
