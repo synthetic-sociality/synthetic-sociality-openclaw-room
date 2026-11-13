@@ -106,3 +106,29 @@ test("ClawHub operator instructions never publish the unbuilt Git checkout", asy
   assert.match(readme, /release:prepare-clawhub/);
   assert.match(readme, /openclaw-room-clawhub-reviewed/);
 });
+
+// PR81-P-004: an unsigned build needs an explicit --unsigned; without it and without --signing-key the build refuses
+// before anything runs. A scratch copy of the build script, so nothing is built.
+test("PR81-P-004 build-release requires --signing-key or an explicit --unsigned, never both", async () => {
+  const {cp, mkdtemp, rm} = await import("node:fs/promises");
+  const {tmpdir} = await import("node:os");
+  const {spawnSync} = await import("node:child_process");
+  const scratch = await mkdtemp(join(tmpdir(), "openclaw-build-args-"));
+  try {
+    await cp(join(packageRoot, "tools/build-release.mjs"), join(scratch, "tools/build-release.mjs"));
+    await cp(join(packageRoot, "tools/release-guards.mjs"), join(scratch, "tools/release-guards.mjs"));
+    const build = (...args) => spawnSync(process.execPath, [join(scratch, "tools/build-release.mjs"), "--output", join(scratch, "out"), ...args],
+      {cwd: scratch, encoding: "utf8", timeout: 20_000});
+    const usage = /--signing-key ED25519_PRIVATE_KEY or --unsigned/;
+    const neither = build();
+    assert.notEqual(neither.status, 0);
+    assert.match(neither.stderr, usage, "no key and no --unsigned refuses with the usage");
+    const both = build("--unsigned", "--signing-key", join(scratch, "key.pem"));
+    assert.notEqual(both.status, 0);
+    assert.match(both.stderr, usage, "--unsigned with a signing key refuses");
+    const unsigned = build("--unsigned");
+    assert.doesNotMatch(unsigned.stderr, usage, "--unsigned alone passes the argument check");
+  } finally {
+    await rm(scratch, {recursive: true, force: true});
+  }
+});

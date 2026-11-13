@@ -130,7 +130,7 @@ test(CASES[6], async () => {
   await paused;
 });
 
-test(CASES[7], async () => {
+test(CASES[7], {timeout: 4000}, async () => {
   assert.ok(participation?.ParticipationGate, "OpenClaw 0.2.80 has the shared participation gate");
   const calls = [];
   const fetchImpl = async (url, init) => {
@@ -320,7 +320,7 @@ test("PR80-O-004 the final credential-renewal and the recovery Room-state reads 
 
 // OpenClaw 0.2.81 (Zurie, 13 Nov 2026): 0.2.80 held the muted Climate Room's heartbeat in the gate and its lease expired.
 // PR81-01: a muted membership keeps registering, heartbeating and reading events; enrollment and activity stay paused.
-test(CASES[12], async () => {
+test(CASES[12], {timeout: 4000}, async () => {
   const within = (promise, ms = 300) => Promise.race([promise.then(() => "done"), tick(ms).then(() => "held")]);
   const calls = [];
   const fetchImpl = async (url, init) => {
@@ -384,4 +384,95 @@ test("PR81-02 controls: active is unchanged, a removed or other non-active statu
   const muted = client(revoked.gate, () => Response.json({code: "credential_revoked"}, {status: 401}));
   await assert.rejects(muted.client.heartbeat(SESSION, "s-1"), (error) => error.code === "credential_revoked");
   assert.equal(revoked.probes.length, 0, "a revocation never probes and stays terminal");
+});
+
+// PR81-P-001/P-002 (pre-review): a paused (muted) gate never lets a gated contact wait where the heartbeat needs it.
+function mutedRuntime(fetchImpl, stateFile = "/nonexistent/x.json") {
+  const runtime = new OpenClawRoomRuntime({accountId: "default", stateFile, baseUrl: "https://room.example/api"}, {fetchImpl});
+  runtime.state = {version: 1, baseUrl: "https://room.example/api", roomId: "room-1", membershipId: "member-1", credential: "secret-1",
+    clientInstanceId: "client-1", cursor: 0};
+  runtime.client = new RoomClient({baseUrl: "https://room.example/api", credential: "secret-1", fetchImpl});
+  runtime.client.participation = runtime.participation;
+  runtime.connectorSession = {sessionId: "s-1"};
+  resetEnrollmentLineages();
+  return runtime;
+}
+const settlesWithin = (promise, ms = 300) => Promise.race([promise.then(() => "done"), tick(ms).then(() => "held")]);
+
+test("PR81-P-001 a membership paused as muted before its first listing heartbeats every tick and never lists", {timeout: 4000}, async () => {
+  const calls = [];
+  const runtime = mutedRuntime(async (url, init) => {
+    calls.push(`${init.method ?? "GET"} ${String(url).replace("https://room.example/api", "")}`);
+    if (String(url).endsWith("/state")) return Response.json({roster: [{membershipId: "member-1", status: "muted"}]});
+    return Response.json({});
+  });
+  try {
+    runtime.participation.observe("muted");
+    assert.equal(runtime.inactiveCheckedAt, 0, "no listing has set the inactive check yet");
+    const results = [];
+    for (let round = 0; round < 3; round += 1) results.push(await settlesWithin(runtime.maintainPresence(undefined, {heartbeat: true})));
+    assert.deepEqual(results, ["done", "done", "done"], "no tick is held");
+    assert.equal(calls.filter((call) => call.endsWith("/connector/sessions/s-1/heartbeat")).length, 3, "three heartbeats");
+    assert.equal(calls.filter((call) => call.includes("/connector/enrollments")).length, 0, "no enrollment listing");
+  } finally {
+    runtime.participation.close();
+  }
+});
+
+test("PR81-P-001 a muted membership with one unread state read at the recheck keeps every tick", {timeout: 4000}, async () => {
+  const dir = await makeTemp(joinPath(osTmp(), "openclaw-p15-muted-"));
+  const calls = [];
+  let stateReads = 0;
+  const runtime = mutedRuntime(async (url, init) => {
+    calls.push(`${init.method ?? "GET"} ${String(url).replace("https://room.example/api", "")}`);
+    if (String(url).endsWith("/state")) {
+      stateReads += 1;
+      // A Room deploy: the recheck's state read fails once (P2c-3b treats it as "register again").
+      if (stateReads === 1) return Response.json({code: "unavailable"}, {status: 503});
+      return Response.json({roster: [{membershipId: "member-1", status: "muted"}]});
+    }
+    if (String(url).endsWith("/connector/sessions")) return Response.json({sessionId: "s-1"});
+    return Response.json({});
+  }, joinPath(dir, "state.json"));
+  try {
+    runtime.participation.observe("muted");
+    runtime.inactiveRecheckMs = 30;
+    runtime.inactiveCheckedAt = 1;
+    const results = [];
+    for (let round = 0; round < 4; round += 1) results.push(await settlesWithin(runtime.maintainPresence(undefined, {heartbeat: true})));
+    assert.deepEqual(results, ["done", "done", "done", "done"], "no tick is held after the unread recheck");
+    assert.equal(stateReads >= 1, true, "the recheck read the Room state");
+    assert.equal(calls.filter((call) => call === "POST /connector/sessions").length, 1, "the unread state registers once more");
+    assert.equal(calls.filter((call) => call.endsWith("/connector/sessions/s-1/heartbeat")).length, 3, "every other tick heartbeats");
+    assert.equal(calls.filter((call) => call.includes("/connector/enrollments")).length, 0, "no enrollment listing while muted");
+    assert.equal(runtime.participation.paused, true, "the gate stays paused as muted");
+  } finally {
+    runtime.participation.close();
+  }
+});
+
+test("PR81-P-002 a start while paused as muted never awaits the gated startup frame and starts the heartbeat", {timeout: 4000}, async () => {
+  const dir = await makeTemp(joinPath(osTmp(), "openclaw-p15-start-"));
+  const stateFile = joinPath(dir, "state.json");
+  await writeState(stateFile, {version: 1, baseUrl: "https://room.example/api", roomId: "room-1", membershipId: "member-1",
+    credential: "secret-1", clientInstanceId: "client-1", cursor: 0});
+  const calls = [];
+  const runtime = new OpenClawRoomRuntime({accountId: "default", stateFile, baseUrl: "https://room.example/api"}, {fetchImpl: async (url, init) => {
+    calls.push(`${init.method ?? "GET"} ${String(url).replace("https://room.example/api", "")}`);
+    if (String(url).endsWith("/state")) return Response.json({roster: [{membershipId: "member-1", status: "muted"}]});
+    if (String(url).endsWith("/connector/sessions")) return Response.json({sessionId: "s-1"});
+    if (String(url).includes("/events")) return Response.json({events: []});
+    return Response.json({});
+  }});
+  try {
+    // A retried start on the same runtime after an earlier attempt paused the gate.
+    runtime.participation.observe("muted");
+    assert.equal(await settlesWithin(runtime.initializeOnce()), "done", "the start is not held by the gated frame");
+    assert.ok(runtime.heartbeatTask, "the heartbeat loop runs");
+    assert.equal(calls.filter((call) => call.includes("/activity")).length, 0, "no activity write while muted");
+    assert.equal(runtime.idleFrameAt, 0, "the startup frame stays owed for the first tick after unmute");
+  } finally {
+    runtime.participation.close();
+    await runtime.close().catch(() => {});
+  }
 });
