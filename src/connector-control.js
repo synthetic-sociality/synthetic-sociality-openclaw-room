@@ -35,7 +35,8 @@ export const ACCEPTED_RESTART_STATUSES = Object.freeze(["scheduled", "deferred",
 export const CONTROL_HOLDER = Symbol.for("synthetic-sociality-room.connector-control.v1");
 const STDOUT_LIMIT = 64 * 1024;
 const INSTALLATION_ID = /^openclaw-inst-[0-9a-f]{32}$/;
-const COMMAND_ID = /^[A-Za-z0-9_.:-]{1,128}$/;
+// P17-2 (shared with Hermes): any other command id is ignored.
+const COMMAND_ID = /^[A-Za-z0-9_-]{1,128}$/;
 const ACTIONS = new Set(["reconnect", "restart"]);
 const OFFERED_STATES = new Set(["requested", "claimed", "reconnecting", "restarting"]);
 // A delivery intent that is no longer work: terminal, or plainly quarantined.
@@ -669,6 +670,13 @@ class ConnectorControl {
     // the supervisor is asked.
     const receipt = {...base, phase: "restarting", startedAt, pid: process.pid, incarnation: this.incarnation, before};
     const persisted = this.writeReceipt(runtime, receipt);
+    if (!persisted) {
+      // P17-6 (shared with Hermes): an unwritten receipt is reported at once; nothing is drained and no supervisor
+      // is asked, so the running listeners keep serving.
+      runtime.logger?.warn?.("Room connector restart receipt could not be written: receipt_unavailable");
+      await this.report(runtime, sessionId, base.commandId, {phase: "failed", code: "receipt_unavailable"});
+      return;
+    }
     // Clean drain: the listeners stop as on a disconnect; the fence is held.
     await Promise.all(runtimes.map((item) => item.suspendForControl(this.options.drainWaitMs)));
     const outcome = persisted ? await this.requestSupervisor() : {kind: "rejected", reason: "receipt_unwritten"};
