@@ -326,6 +326,76 @@ export function resolveStandaloneRecipientSelectors(body, roster, sourceMembersh
   return selected.map(({membershipId}) => ({kind: "membership", membershipId}));
 }
 
+// Contract P13-1: the visible prose a mention may come from. Fenced code (backticks or tildes), matching inline
+// backtick spans and quoted lines (first non-whitespace character ">") never address anyone.
+function mentionProse(body) {
+  const out = [];
+  let fence = null;
+  for (const line of String(body ?? "").split("\n")) {
+    const marker = /^\s*(`{3,}|~{3,})/.exec(line)?.[1];
+    if (fence) {
+      if (marker && marker[0] === fence[0] && marker.length >= fence.length) fence = null;
+      out.push("");
+    } else if (marker) {
+      fence = marker;
+      out.push("");
+    } else if (/^\s*>/.test(line)) {
+      out.push("");
+    } else {
+      out.push(line.replace(/(`+)[^`]*?\1/g, (span) => " ".repeat(span.length)));
+    }
+  }
+  return out.join("\n");
+}
+
+/**
+ * Contract P13-1: the active agents a reply addresses by a complete @DisplayName, in first-occurrence order. Unicode
+ * lowercase (toLowerCase, no casefold, no locale); only active participant_agent and room_master memberships other
+ * than the sender; @everyone, unknown, inactive and ambiguous names (shared with the sender, another agent or an
+ * active human) stay prose silently. Never throws.
+ * @param {string} body - The reply text.
+ * @param {Array<object>} roster - The Room roster.
+ * @param {string} membershipId - The sender.
+ * @returns {string[]} Membership ids.
+ */
+export function mentionedAgentMemberships(body, roster, membershipId) {
+  const members = (Array.isArray(roster) ? roster : []).filter((member) => member && member.status === "active"
+    && typeof member.displayName === "string" && member.displayName.trim());
+  const owners = new Map();
+  for (const member of members) {
+    const key = member.displayName.trim().toLowerCase();
+    owners.set(key, [...(owners.get(key) ?? []), member]);
+  }
+  const text = mentionProse(body).toLowerCase();
+  const selected = [];
+  for (const [key, candidates] of owners) {
+    if (key === "everyone" || candidates.length !== 1) continue;
+    const [member] = candidates;
+    if (!["participant_agent", "room_master"].includes(member.role) || String(member.membershipId) === String(membershipId)) continue;
+    const match = new RegExp(`(^|[^\\p{L}\\p{N}_@])@${escapedPattern(key)}(?=$|[^\\p{L}\\p{N}_-])`, "u").exec(text);
+    if (match) selected.push({index: match.index + match[1].length, membershipId: String(member.membershipId)});
+  }
+  selected.sort((left, right) => left.index - right.index || left.membershipId.localeCompare(right.membershipId));
+  return selected.map((item) => item.membershipId);
+}
+
+/**
+ * Contract P13-2: the recipients a cycle reply freezes with its delivery intent. Explicit mentions in mention order,
+ * merged once with the rotation recipient, capped at max(0, maxFollowUps - followUps) of the same cycle snapshot.
+ * Without a mention the historical rotation selection is kept unchanged (nextRecipient).
+ * @param {string} body - The reply text.
+ * @param {{roster: Array<object>, cycle: object, membershipId: string}} context - Room roster, cycle snapshot, sender.
+ * @returns {{nextRecipient: string, recipientSelectors: Array<{kind: string, membershipId: string}>}} The selection.
+ */
+export function cycleRecipientSelectors(body, {roster, cycle, membershipId}) {
+  const rotation = nextCycleRecipient(cycle, membershipId);
+  const remaining = Math.max(0, Number(cycle?.budgets?.maxFollowUps ?? 0) - Number(cycle?.followUps ?? 0));
+  const mentioned = remaining > 0 ? mentionedAgentMemberships(body, roster, membershipId) : [];
+  if (!mentioned.length) return {nextRecipient: rotation, recipientSelectors: []};
+  const merged = rotation && !mentioned.includes(rotation) ? [...mentioned, rotation] : mentioned;
+  return {nextRecipient: "", recipientSelectors: merged.slice(0, remaining).map((id) => ({kind: "membership", membershipId: id}))};
+}
+
 function validCycleIdentity(cycle) {
   return Boolean(
     cycle
@@ -2816,10 +2886,17 @@ export class OpenClawRoomRuntime {
       const policy = policyEnvelope?.policy && typeof policyEnvelope.policy === "object" ? policyEnvelope.policy : policyEnvelope;
       const openExchange = String(policy?.coordinationMode ?? "coordinated") === "open";
       const coordinationMode = cycleAttempt ? "cycle" : (openExchange ? "open" : "coordinated");
-      const nextRecipient = cycleAttempt ? nextCycleRecipient(cycleAttempt.cycle, this.state.membershipId) : "";
-      const recipientSelectors = !nextRecipient && intent.identity.resolveRecipientMentions
-        ? resolveStandaloneRecipientSelectors(intent.identity.body, initialState.roster, this.state.membershipId)
-        : [];
+      // Contract P13-2: a cycle reply's @DisplayName mentions merge with the rotation (frozen with the intent);
+      // the standalone (cross-channel) routing below is unchanged.
+      const cycleSelection = cycleAttempt
+        ? cycleRecipientSelectors(intent.identity.body, {roster: initialState.roster, cycle: cycleAttempt.cycle, membershipId: this.state.membershipId})
+        : null;
+      const nextRecipient = cycleSelection ? cycleSelection.nextRecipient : "";
+      const recipientSelectors = cycleSelection?.recipientSelectors.length
+        ? cycleSelection.recipientSelectors
+        : !nextRecipient && intent.identity.resolveRecipientMentions
+          ? resolveStandaloneRecipientSelectors(intent.identity.body, initialState.roster, this.state.membershipId)
+          : [];
       Object.assign(intent.identity, {
         coordinationMode,
         nextRecipient,
