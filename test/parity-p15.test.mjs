@@ -525,7 +525,8 @@ async function lifecycleStart(stateFile, {paused = false, lifecycle = () => Resp
   try {
     if (paused) runtime.participation.observe("muted");
     runtime.lastRenewalCheck = Date.now();
-    assert.equal(await settlesWithin(runtime.initializeOnce()), "done", "the start is not held");
+    // A held start waits at least the 15 s renewal bound or the 60 s recheck; 1.5 s tolerates a loaded parallel suite.
+    assert.equal(await settlesWithin(runtime.initializeOnce(), 1500), "done", "the start is not held");
     assert.ok(runtime.heartbeatTask, "the heartbeat loop runs");
     await afterStart?.(runtime, calls);
   } finally {
@@ -536,7 +537,7 @@ async function lifecycleStart(stateFile, {paused = false, lifecycle = () => Resp
 }
 
 for (const kind of ["turn", "cycle"]) {
-  test(`0.2.82 three muted starts with a pending ${kind} lifecycle spend no attempt and send no lifecycle request`, {timeout: 4000}, async (t) => {
+  test(`0.2.82 three muted starts with a pending ${kind} lifecycle spend no attempt and send no lifecycle request`, {timeout: 10000}, async (t) => {
     t.mock.timers.enable({apis: ["Date"], now: Date.parse("2026-11-14T00:00:00Z")});
     const stateFile = await lifecycleStateFile(kind);
     for (let start = 0; start < 3; start += 1) {
@@ -549,7 +550,7 @@ for (const kind of ["turn", "cycle"]) {
     }
   });
 
-  test(`0.2.82 a pending ${kind} lifecycle held by a muted start completes at the next active start, not on unmute alone`, {timeout: 4000}, async (t) => {
+  test(`0.2.82 a pending ${kind} lifecycle held by a muted start completes at the next active start, not on unmute alone`, {timeout: 10000}, async (t) => {
     t.mock.timers.enable({apis: ["Date"], now: Date.parse("2026-11-14T00:00:00Z")});
     const stateFile = await lifecycleStateFile(kind);
     const held = await lifecycleStart(stateFile, {paused: true, afterStart: async (runtime, calls) => {
@@ -567,7 +568,7 @@ for (const kind of ["turn", "cycle"]) {
     assert.equal(next.intent.lifecycleAttempts, 2);
   });
 
-  test(`0.2.82 control: an active start completes the pending ${kind} lifecycle as before`, {timeout: 4000}, async (t) => {
+  test(`0.2.82 control: an active start completes the pending ${kind} lifecycle as before`, {timeout: 10000}, async (t) => {
     t.mock.timers.enable({apis: ["Date"], now: Date.parse("2026-11-14T00:00:00Z")});
     const {calls, intent} = await lifecycleStart(await lifecycleStateFile(kind));
     assert.equal(calls.filter(lifecycleContact).length, 1);
@@ -576,7 +577,7 @@ for (const kind of ["turn", "cycle"]) {
     assert.equal(intent.lifecycleAttempts, 2);
   });
 
-  test(`0.2.82 control: an ambiguous ${kind} lifecycle contact still spends its attempt (never refunded)`, {timeout: 4000}, async (t) => {
+  test(`0.2.82 control: an ambiguous ${kind} lifecycle contact still spends its attempt (never refunded)`, {timeout: 10000}, async (t) => {
     t.mock.timers.enable({apis: ["Date"], now: Date.parse("2026-11-14T00:00:00Z")});
     const {calls, intent} = await lifecycleStart(await lifecycleStateFile(kind), {lifecycle: () => { throw new TypeError("fetch failed"); }});
     assert.equal(calls.filter(lifecycleContact).length, 1);
@@ -585,7 +586,7 @@ for (const kind of ["turn", "cycle"]) {
     assert.equal(intent.lifecycleAutomaticRetry, true);
   });
 
-  test(`0.2.82 control: a retryable Room error on the ${kind} lifecycle still counts`, {timeout: 4000}, async (t) => {
+  test(`0.2.82 control: a retryable Room error on the ${kind} lifecycle still counts`, {timeout: 10000}, async (t) => {
     t.mock.timers.enable({apis: ["Date"], now: Date.parse("2026-11-14T00:00:00Z")});
     const stateFile = await lifecycleStateFile(kind);
     const busy = () => Response.json({code: "unavailable", retryable: true}, {status: 503});
