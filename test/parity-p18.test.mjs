@@ -39,3 +39,11 @@ test("every P18 case maps to an existing test", async () => {
     for (const name of names) assert.ok(source.includes(`test("${name}"`), `${id}: ${name}`);
   }
 });
+
+// PR80-H-005: the whole shared contract is pinned, so a single-repo edit to any clause fails the suite.
+test("the whole shared contract matches conformance contractSha256", async () => {
+  const {createHash} = await import("node:crypto");
+  const bytes = await readFile(new URL("docs/delivery-lifecycle-contract-v1.md", ROOT));
+  assert.match(conformance.contractSha256, /^[0-9a-f]{64}$/);
+  assert.equal(createHash("sha256").update(bytes).digest("hex"), conformance.contractSha256);
+});
