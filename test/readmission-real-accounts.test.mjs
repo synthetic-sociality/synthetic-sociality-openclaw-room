@@ -22,7 +22,7 @@ const JOURNAL = "revocation-abandonment.jsonl";
 let round = 0;
 
 async function enroll({accountsConfig = undefined, held = FIXTURE, listing = [{invitationId: "invite-9", roomId: "room-2"}],
-  claimed = {roomId: "room-2", membershipId: "member-2"}, accounts = null} = {}) {
+  claimed = {roomId: "room-2", membershipId: "member-2"}, accounts = null, onClaim = null, accountsFor = null} = {}) {
   round += 1;
   const directory = join(state, `round-${round}`, "synthetic-sociality-room", "accounts");
   process.env.OPENCLAW_STATE_DIR = join(state, `round-${round}`);
@@ -34,17 +34,19 @@ async function enroll({accountsConfig = undefined, held = FIXTURE, listing = [{i
   const before = held ? await readFile(heldFile) : null;
   const cfg = {channels: {"synthetic-sociality-room": {enabled: true, baseUrl: SOURCE.baseUrl, stateFile: sourceFile,
     ...(accountsConfig ? {accounts: accountsConfig} : {})}}};
-  connectorControl.setAccounts(accounts ?? (() => resolvedRoomAccounts(cfg)));
+  connectorControl.setAccounts(accounts ?? accountsFor?.(cfg) ?? (() => resolvedRoomAccounts(cfg)));
   const listedBefore = accounts ? null : resolvedRoomAccounts(cfg);
   const claims = [];
   const activations = [];
   const runtime = new OpenClawRoomRuntime({accountId: "default", stateFile: sourceFile, baseUrl: SOURCE.baseUrl},
     {activateEnrollment: async (activation) => { activations.push(activation.accountId); }});
   runtime.state = {...SOURCE};
+  const warnings = [];
+  runtime.logger = {warn: (message) => warnings.push(String(message)), info: () => {}};
   resetEnrollmentLineages();
   runtime.client = {
     connectorEnrollments: async () => listing.map((item) => ({...item})),
-    claimConnectorEnrollment: async (_state, invitationId) => (claims.push(invitationId), {...claimed,
+    claimConnectorEnrollment: async (_state, invitationId) => (claims.push(invitationId), onClaim?.(), {...claimed,
       credential: "secret-fresh", credentialExpiresAt: "2026-12-12T00:00:00Z", identityVersion: 3, headSeq: 2650}),
   };
   try {
@@ -54,7 +56,7 @@ async function enroll({accountsConfig = undefined, held = FIXTURE, listing = [{i
   }
   let journal = [];
   try { journal = (await readFile(join(directory, JOURNAL), "utf8")).split("\n").filter(Boolean).map((line) => JSON.parse(line)); } catch {}
-  return {claims, activations, heldFile, before, directory, journal, cfg, listedBefore};
+  return {claims, activations, heldFile, before, directory, journal, cfg, listedBefore, warnings};
 }
 
 test("PR80-O-005 (a) the owner case with the real account list: a revoked account, not config-disabled, is claimed, journaled and replaced", async () => {
@@ -103,4 +105,35 @@ test("PR80-O-006 a list that becomes unreadable after the claim never discards a
   assert.deepEqual(result.claims, ["invite-7"]);
   assert.equal((await loadState(join(result.directory, "member-7.json"))).credential, "secret-fresh", "the credential is saved");
   assert.deepEqual(result.activations, ["member-7"]);
+});
+
+// PR80-O-007 / PR80-O-008 (OpenClaw 0.2.80 r4; contract P18-1 "never … re-enabled", "re-read … before a replacement,
+// and an unreadable list refuses"), with the real resolvedRoomAccounts(cfg) over an isolated state dir.
+test("PR80-O-007 a raw config enabled:false with no state file: the claimed credential is saved privately, never activated, the operator's false stays", async () => {
+  const result = await enroll({held: null, accountsConfig: {"member-2": {enabled: false}}});
+  assert.deepEqual(result.claims, ["invite-9"]);
+  const saved = await loadState(result.heldFile);
+  assert.equal(saved.credential, "secret-fresh", "the one-time credential is kept in the private state file");
+  const {stat} = await import("node:fs/promises");
+  assert.equal((await stat(result.heldFile)).mode & 0o777, 0o600);
+  assert.deepEqual(result.activations, [], "no activation, so no enabled:true merge");
+  assert.equal(result.cfg.channels["synthetic-sociality-room"].accounts["member-2"].enabled, false);
+  assert.equal(resolvedRoomAccounts(result.cfg).find((account) => account.accountId === "member-2")?.configEnabled, false,
+    "the real resolver still reports the operator's false");
+  assert.equal(result.warnings.filter((line) => /operator-disabled/.test(line)).length, 1, "one log line");
+});
+
+test("PR80-O-007 control: the same first-time enrollment without a config disable is saved and activated", async () => {
+  const result = await enroll({held: null});
+  assert.deepEqual(result.claims, ["invite-9"]);
+  assert.deepEqual(result.activations, ["member-2"]);
+});
+
+test("PR80-O-008 a held revoked account is not replaced when the account list cannot be read after the claim", async () => {
+  let claimedYet = false;
+  const result = await enroll({onClaim: () => { claimedYet = true; },
+    accountsFor: (cfg) => () => { if (claimedYet) throw new Error("config unreadable"); return resolvedRoomAccounts(cfg); }});
+  assert.deepEqual(result.claims, ["invite-9"], "the pre-claim reads were readable");
+  assert.deepEqual(result.activations, [], "no activation");
+  assert.equal(Buffer.compare(result.before, await readFile(result.heldFile)), 0, "the held state stays byte for byte");
 });
