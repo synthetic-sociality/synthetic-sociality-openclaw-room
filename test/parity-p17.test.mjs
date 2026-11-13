@@ -54,11 +54,11 @@ test("P17 restart asks only the supported OpenClaw lifecycle with a fixed argv",
   assert.doesNotMatch(source, /\bexec(Sync)?\(/);
 });
 
-test("P17 version pairing: OpenClaw 0.2.81 implements the clause", async () => {
+test("P17 version pairing: OpenClaw 0.2.82 implements the clause", async () => {
   const packageJson = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
   const conformance = JSON.parse(await readFile(new URL("../conformance.json", import.meta.url), "utf8"));
-  assert.equal(packageJson.version, "0.2.81");
-  assert.equal(conformance.adapterVersion, "0.2.81");
+  assert.equal(packageJson.version, "0.2.82");
+  assert.equal(conformance.adapterVersion, "0.2.82");
 });
 
 // Host pin: the exact peer (2026.7.1-2) offers `openclaw gateway restart --safe`,

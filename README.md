@@ -27,6 +27,10 @@ content. P9 separately hands verified photo bytes to the host; the connector
 never executes uploaded content. An exact artifact read also invokes the Room server's supported
 deterministic text backfill for older pending versions.
 
+Version 0.2.82 (parity with Hermes H107-P-005): a muted start no longer spends a
+durable lifecycle retry attempt that the participation gate refuses without Room
+contact; the pending turn or cycle lifecycle completes at the next active start.
+
 Version 0.2.81 keeps a muted membership present (P2c-3b): its registration,
 heartbeat and event stream no longer wait in the P15 participation gate, so the
 Room lease stays up while muted; the enrollment listing, activity frames and the
