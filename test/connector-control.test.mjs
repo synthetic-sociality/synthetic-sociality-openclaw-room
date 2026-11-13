@@ -845,3 +845,35 @@ test("B-F004 restart window: absent or unreadable deferral uses 300 + 300", asyn
   const throwing = {get gateway() { throw new Error("unreadable"); }};
   assert.equal(control?.restartWithinSeconds?.(throwing), 600);
 });
+
+// A3 (OpenClaw 0.2.80, gap map §2): parity with Hermes _control_answer: the installation declaration is awaited
+// before the claim, and a claim the Room refuses with control_transition_invalid (it arrived before the declaration
+// was recorded) is asked again at the next offer.
+test("A3 the installation declaration completes before the control claim", async () => {
+  const room = fakeRoom();
+  room.grant = true;
+  let declaredAt = 0;
+  room.declarationAnswer = () => new Promise((resolve) => setTimeout(() => { declaredAt = Date.now(); resolve(json({accepted: true})); }, 150));
+  room.control = (roomId) => (roomId === "room-a" ? {commandId: "cmd-order", action: "reconnect", state: "requested", code: null,
+    requestedAt: "2026-11-12T08:00:00Z", expiresAt: "2099-11-12T08:02:00Z"} : null);
+  const gw = await gateway({fetchRoom: room});
+  open.push(gw);
+  await gw.start();
+  await eventually(() => room.claims.some((item) => item.commandId === "cmd-order"), {message: "no claim"});
+  const claim = room.claims.find((item) => item.commandId === "cmd-order");
+  assert.ok(declaredAt > 0 && claim.at >= declaredAt, "the claim follows the answered declaration");
+});
+
+test("A3 a claim refused with control_transition_invalid is asked again at the next offer", async () => {
+  const gw = await started();
+  let refused = 0;
+  gw.room.claimAnswer = (call) => (call.commandId === "cmd-transition" && refused++ === 0
+    ? json({code: "control_transition_invalid"}, 409) : undefined);
+  gw.room.control = gw.command("cmd-transition", "reconnect");
+  await gw.runtimes.aura.maintainPresence();
+  await eventually(() => gw.room.claims.some((item) => item.commandId === "cmd-transition"), {message: "no first claim"});
+  await settle();
+  await gw.runtimes.aura.maintainPresence();
+  await eventually(() => gw.room.claims.filter((item) => item.commandId === "cmd-transition").length >= 2,
+    {message: "control_transition_invalid was final: the command was dropped"});
+});
