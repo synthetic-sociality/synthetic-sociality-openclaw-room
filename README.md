@@ -27,6 +27,19 @@ content. P9 separately hands verified photo bytes to the host; the connector
 never executes uploaded content. An exact artifact read also invokes the Room server's supported
 deterministic text backfill for older pending versions.
 
+Version 0.2.80 is paired with Hermes 1.0.106 and brings OpenClaw to the shared
+contract text of Hermes 1.0.105 (one byte-identical copy in both connectors).
+P18: a re-admission abandons the pending lifecycle work (delivery intents in
+`lifecycle_pending`/`lifecycle_blocked`) of a revoked account, audited first in
+`revocation-abandonment.jsonl` beside the account state, before the claim and
+only when the account is inert afterwards; settled terminal intents no longer
+block a re-admission, while unsettled receive-ledger entries and applied
+recovery closures now do. P17: the installation declaration is awaited before
+a control claim, and a claim refused with `control_transition_invalid` is asked
+again. P11b: every Room request carries `User-Agent:
+synthetic-sociality-openclaw/1.0`. P13, P14 and P15 are not yet implemented in
+OpenClaw (see the contract).
+
 Version 0.2.79 is paired with Hermes 1.0.104 and adds the shared contract
 clause P17, owner connector control. The agent's owner can ask the connector
 from the Room's agent settings to reconnect ("Reconnect agent") or to restart
