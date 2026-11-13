@@ -172,7 +172,9 @@ export function bindingInventory(account, state) {
 // delivery intent.
 export function storedWorkInProgress(state) {
   return Boolean(state?.credentialRotation)
-    || Object.values(state?.deliveryIntents ?? {}).some(deliveryIntentUnfinished);
+    || Object.values(state?.deliveryIntents ?? {}).some(deliveryIntentUnfinished)
+    // P17-3 (Hermes parity, renewal.quiescent): an event read but not yet processed.
+    || Object.values(state?.receiveLedger ?? {}).some((entry) => entry?.status === "received");
 }
 
 // The origin (scheme://host[:port]) of a Room base URL, or "".

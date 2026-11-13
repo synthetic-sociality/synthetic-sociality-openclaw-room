@@ -14,7 +14,7 @@ import {ROOM_CONNECTOR_PROVENANCE} from "./release-provenance.js";
 import {renewCredential} from "./credential-renewal.js";
 import {speakerLabel, speakerName} from "./speaker.js";
 import {rememberSecrets} from "./secret-isolation.js";
-import {CONTROL_CAPABILITY, connectorControl, deliveryIntentUnfinished, installationIdFor, roomStateDirectory, untilSignal} from "./connector-control.js";
+import {CONTROL_CAPABILITY, connectorControl, installationIdFor, roomStateDirectory, storedWorkInProgress, untilSignal} from "./connector-control.js";
 import {
   discussionDocumentContext, discussionDocuments, documentToolState, effectiveGiven, givenMemory, knownSize, observedHostSession, readVersion, validGivenMemory,
 } from "./documents.js";
@@ -944,8 +944,7 @@ export class OpenClawRoomRuntime {
     if (this.attemptLeases.size > 0 || this.inflightEvent || this.submissions > 0 || this.renewing) return true;
     const pending = this.pendingEvent;
     if (pending && !(pending.seq <= this.state.cursor || this.terminalEvidenceFor(pending) || this.isQuarantinedEvent(pending))) return true;
-    if (this.state.credentialRotation) return true;
-    return Object.values(this.state.deliveryIntents ?? {}).some(deliveryIntentUnfinished);
+    return storedWorkInProgress(this.state);
   }
 
   // Contract P17-5: stop this binding's listener, heartbeat and enrollment
