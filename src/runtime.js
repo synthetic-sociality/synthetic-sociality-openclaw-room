@@ -695,10 +695,14 @@ export function hostAccountList() {
  * @param {Array<object>|null} [listed] - The host account list.
  * @returns {boolean} Whether the account must be left untouched.
  */
-export function configDisabledAccount(stateFile, listed = hostAccountList()) {
+export function configDisabledAccount(stateFile, listed = hostAccountList(), accountId = "") {
   if (!listed) return true;
   const target = resolve(stateFile);
-  return listed.some((account) => account?.configEnabled === false && typeof account?.stateFile === "string" && resolve(account.stateFile) === target);
+  // PR80-O-007: a config entry for an account whose state file does not exist yet resolves to another path, so the
+  // claimed account id matches as well.
+  return listed.some((account) => account?.configEnabled === false && (
+    (typeof account?.stateFile === "string" && resolve(account.stateFile) === target)
+    || (accountId && account?.accountId === accountId)));
 }
 
 export class OpenClawRoomRuntime {
@@ -3721,13 +3725,17 @@ export class OpenClawRoomRuntime {
       let held = null;
       try { held = await loadState(stateFile); } catch (error) { held = error?.code === "ENOENT" ? null : false; }
       const listedNow = hostAccountList();
-      if (held !== null && listedNow && configDisabledAccount(stateFile, listedNow)) {
-        // PR80-O-001/O-006: after the claim, refuse only an explicit host-config enabled:false of an already held
-        // file (never write over, or merge enabled:true into, it); a list read failure here never discards the
-        // consumed one-time credential.
-        this.logger?.warn?.(`Room ${roomId} is operator-disabled in the host config; the claimed enrollment is not activated`);
+      if (held !== null && (!listedNow || configDisabledAccount(stateFile, listedNow, accountId))) {
+        // PR80-O-001/O-008, contract P18-1: a held account is re-read before its replacement; an explicit host-config
+        // enabled:false or an unreadable list refuses, and the stored state stays byte for byte.
+        this.logger?.warn?.(listedNow
+          ? `Room ${roomId} is operator-disabled in the host config; the claimed enrollment is not activated`
+          : `Room ${roomId}: the host account list cannot be read before the replacement; the held account is kept`);
         continue;
       }
+      // PR80-O-006/O-007: a first-time credential is always kept (a list read failure never discards it), but an
+      // account the raw host config names enabled:false is never activated, so no enabled:true is merged over it.
+      const configDisabledFresh = held === null && Boolean(listedNow) && configDisabledAccount(stateFile, listedNow, accountId);
       if (held === null) {
         await saveNewState(stateFile, nextState);
       } else {
@@ -3746,6 +3754,10 @@ export class OpenClawRoomRuntime {
         }
         await saveState(stateFile, nextState);
         this.logger?.info?.(`Replaced the stale binding of re-admitted Room ${roomId}`);
+      }
+      if (configDisabledFresh) {
+        this.logger?.warn?.(`Room ${roomId} is operator-disabled in the host config; the claimed credential is saved privately and the account is not activated`);
+        continue;
       }
       await this.activateEnrollment({accountId, baseUrl: nextState.baseUrl, stateFile});
       activated.push({accountId, roomId, membershipId, stateFile});

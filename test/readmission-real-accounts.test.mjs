@@ -131,9 +131,17 @@ test("PR80-O-007 control: the same first-time enrollment without a config disabl
 
 test("PR80-O-008 a held revoked account is not replaced when the account list cannot be read after the claim", async () => {
   let claimedYet = false;
-  const result = await enroll({onClaim: () => { claimedYet = true; },
+  let atClaim = null;
+  const {readFileSync} = await import("node:fs");
+  const result = await enroll({onClaim: () => { claimedYet = true; atClaim = readFileSync(join(process.env.OPENCLAW_STATE_DIR, "synthetic-sociality-room", "accounts", "member-2.json")); },
     accountsFor: (cfg) => () => { if (claimedYet) throw new Error("config unreadable"); return resolvedRoomAccounts(cfg); }});
   assert.deepEqual(result.claims, ["invite-9"], "the pre-claim reads were readable");
   assert.deepEqual(result.activations, [], "no activation");
-  assert.equal(Buffer.compare(result.before, await readFile(result.heldFile)), 0, "the held state stays byte for byte");
+  // The P18 abandonment ran before the claim (the account was eligible then); from the claim on the stored state
+  // must stay byte for byte: no replacement.
+  assert.equal(Buffer.compare(atClaim, await readFile(result.heldFile)), 0, "the held state stays byte for byte");
+  const persisted = await loadState(result.heldFile);
+  assert.equal(persisted.credential, "secret-old", "never replaced");
+  assert.equal(persisted.revoked, true, "the old credential is never re-enabled");
+  assert.equal(result.warnings.filter((line) => /cannot be read before the replacement/.test(line)).length, 1);
 });
