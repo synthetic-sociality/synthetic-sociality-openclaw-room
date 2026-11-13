@@ -42,7 +42,7 @@ const denied = (code = "forbidden") => Response.json({code}, {status: 403});
 
 test("P15 conformance names the clause and the shared cases", () => {
   assert.match(conformance.parityP15Contract, /^docs\/delivery-lifecycle-contract-v1\.md#p15/);
-  assert.equal(CASES.length, 12);
+  assert.equal(CASES.length, 13);
   const section = contract.split("## P15 — ")[1].split("\n## ")[0];
   assert.deepEqual(section.split("\n").filter((line) => /^- P15-\d\d /.test(line)).map((line) => line.slice(2)), CASES);
 });
@@ -63,10 +63,11 @@ test(CASES[1], async () => {
 });
 
 test(CASES[2], async () => {
-  let status = "muted";
+  // A removed (non-muted) status holds every watcher; a muted one keeps its presence and event stream (P15-13).
+  let status = "removed";
   const {gate} = gateFor(() => status);
   const {client: room, calls} = client(gate, (url) => Response.json(url.includes("/events") ? {events: []} : {}));
-  gate.observe("muted");
+  gate.observe("removed");
   const pending = Promise.allSettled([room.readEvents(SESSION, 0, {wait: 1}), room.heartbeat(SESSION, "s-1"),
     room.publishActivity(SESSION, {kind: "heartbeat"}), room.acknowledge(SESSION, 3)]);
   await tick();
@@ -105,7 +106,7 @@ test(CASES[5], async () => {
   const {client: room} = client(gate, () => denied("credential_revoked"));
   await assert.rejects(room.heartbeat(SESSION, "s-1"), (error) => error.code === "credential_revoked");
   assert.equal(probes.length, 0, "credential failures never probe");
-  gate.observe("muted");
+  gate.observe("removed");
   const controller = new AbortController();
   const waiting = room.readEvents(SESSION, 0, {wait: 1, signal: controller.signal});
   controller.abort();
@@ -116,11 +117,11 @@ test(CASES[5], async () => {
 });
 
 test(CASES[6], async () => {
-  const one = gateFor(() => "muted");
+  const one = gateFor(() => "removed");
   const two = gateFor(() => "active");
   const first = client(one.gate);
   const second = client(two.gate);
-  one.gate.observe("muted");
+  one.gate.observe("removed");
   const paused = first.client.heartbeat(SESSION, "s-1").catch(() => {});
   await second.client.heartbeat({roomId: "room-2", credential: "secret-2"}, "s-2");
   assert.equal(second.calls.length, 1, "the sibling membership keeps running");
@@ -147,12 +148,15 @@ test(CASES[7], async () => {
   await runtime.acceptConnectorEnrollments();
   assert.equal(runtime.participation.paused, true, "the muted answer pauses the gate");
   const before = calls.length;
-  const heartbeat = runtime.client.heartbeat(runtime.state, "s-1").catch(() => {});
-  const events = runtime.client.readEvents(runtime.state, 0, {wait: 1}).catch(() => {});
+  const enrollments = runtime.client.connectorEnrollments(runtime.state).catch(() => {});
+  const activity = runtime.client.publishActivity(runtime.state, {kind: "heartbeat"}).catch(() => {});
   await tick();
-  assert.equal(calls.length, before, "heartbeat and event watchers wait");
+  assert.equal(calls.length, before, "enrollment and activity watchers wait");
+  await runtime.client.heartbeat(runtime.state, "s-1");
+  await runtime.client.readEvents(runtime.state, 0, {wait: 1});
+  assert.equal(calls.length, before + 2, "heartbeat and the event stream do not wait (P2c-3b)");
   runtime.participation.close();
-  await Promise.all([heartbeat, events]);
+  await Promise.all([enrollments, activity]);
 });
 
 test(CASES[8], async () => {
@@ -311,4 +315,72 @@ test("PR80-O-004 the final credential-renewal and the recovery Room-state reads 
   assert.equal((await recovery).roomId, "room-1", "the recovery read completes after the unmute");
   assert.equal((await readState(stateFile)).credentialRotation, undefined);
   gate.close();
+});
+
+// OpenClaw 0.2.81 (Zurie, 13 Nov 2026): 0.2.80 held the muted Climate Room's heartbeat in the gate and its lease expired.
+// PR81-01: a muted membership keeps registering, heartbeating and reading events; enrollment and activity stay paused.
+test(CASES[12], async () => {
+  const within = (promise, ms = 300) => Promise.race([promise.then(() => "done"), tick(ms).then(() => "held")]);
+  const calls = [];
+  const fetchImpl = async (url, init) => {
+    calls.push(`${init.method ?? "GET"} ${String(url).replace("https://room.example/api", "")}`);
+    if (String(url).includes("/connector/enrollments")) return Response.json({code: "connector_not_active"}, {status: 401});
+    if (String(url).endsWith("/state")) return Response.json({roster: [{membershipId: "member-1", status: "muted"}]});
+    if (String(url).includes("/events")) return Response.json({events: []});
+    return Response.json({});
+  };
+  const runtime = new OpenClawRoomRuntime({accountId: "default", stateFile: "/nonexistent/x.json", baseUrl: "https://room.example/api"}, {fetchImpl});
+  runtime.state = {version: 1, baseUrl: "https://room.example/api", roomId: "room-1", membershipId: "member-1", credential: "secret-1",
+    clientInstanceId: "client-1", cursor: 0};
+  runtime.client = new RoomClient({baseUrl: "https://room.example/api", credential: "secret-1", fetchImpl});
+  runtime.client.participation = runtime.participation;
+  runtime.connectorSession = {sessionId: "s-1"};
+  resetEnrollmentLineages();
+  try {
+    for (let round = 0; round < 3; round += 1) {
+      // An unconfirmed idle activity frame is owed every tick; it must not hold the heartbeat.
+      runtime.pendingPresence = {version: 1, kind: "heartbeat", runId: "r", streamSeq: 1};
+      assert.equal(await within(runtime.maintainPresence(undefined, {heartbeat: true})), "done", `tick ${round} is not held`);
+    }
+    assert.equal(runtime.participation.paused, true, "the muted roster answer pauses the gate");
+    assert.equal(calls.filter((call) => call.endsWith("/connector/sessions/s-1/heartbeat")).length, 3, "every tick heartbeats");
+    assert.equal(calls.filter((call) => call.includes("/connector/enrollments")).length, 1, "the enrollment listing stays paused");
+    assert.equal(calls.filter((call) => call.includes("/activity")).length, 0, "no activity write while muted");
+    assert.equal(await within(runtime.client.readEvents(runtime.state, 0, {wait: 20})), "done", "the event long poll is not held");
+    assert.equal(await within(runtime.client.register(runtime.state, {clientInstanceId: "client-1"})), "done", "registration on reconnect is not held");
+    // Still gated while muted: enrollment, activity and acknowledgement writers.
+    const before = calls.length;
+    const held = [runtime.client.connectorEnrollments(runtime.state), runtime.client.publishActivity(runtime.state, {kind: "heartbeat"}),
+      runtime.client.acknowledge(runtime.state, 3)].map((call) => call.catch(() => {}));
+    await tick();
+    assert.equal(calls.length, before, "enrollment, activity and acknowledgement writers wait while muted");
+    runtime.participation.close();
+    await Promise.all(held);
+  } finally {
+    runtime.participation.close();
+  }
+});
+
+test("PR81-02 controls: active is unchanged, a removed or other non-active status still holds presence, revocation stays terminal", async () => {
+  for (const status of ["removed", "left", "suspended"]) {
+    const {gate} = gateFor(() => status);
+    const {client: room, calls} = client(gate, (url) => Response.json(url.includes("/events") ? {events: []} : {}));
+    gate.observe(status);
+    const pending = [room.heartbeat(SESSION, "s-1"), room.register(SESSION, {}), room.readEvents(SESSION, 0, {wait: 1})].map((call) => call.catch(() => {}));
+    await tick();
+    assert.equal(calls.length, 0, `${status}: presence and the event stream wait`);
+    gate.close();
+    await Promise.all(pending);
+  }
+  const {gate} = gateFor(() => "active");
+  const {client: room, calls} = client(gate, (url) => Response.json({}, {status: url.includes("/activity") ? 202 : 200}));
+  gate.observe("active");
+  await room.heartbeat(SESSION, "s-1");
+  await room.publishActivity(SESSION, {kind: "heartbeat"});
+  assert.equal(calls.length, 2, "active: unchanged");
+  // A left or removed membership is refused on every route with credential_revoked (P2c-3b, P18).
+  const revoked = gateFor(["removed"]);
+  const muted = client(revoked.gate, () => Response.json({code: "credential_revoked"}, {status: 401}));
+  await assert.rejects(muted.client.heartbeat(SESSION, "s-1"), (error) => error.code === "credential_revoked");
+  assert.equal(revoked.probes.length, 0, "a revocation never probes and stays terminal");
 });
