@@ -8,6 +8,7 @@ import {dirname, join} from "node:path";
 import {RETRY_AFTER_MAXIMUM_SECONDS, RoomAPIError, RoomClient, RoomRequestError, RoomResponseError, RoomTransportError, roomErrorDiagnostic} from "./room-client.js";
 import {loadState, migrateStateFile, saveNewState, saveState} from "./state.js";
 import {activateRoomChannel} from "./activation.js";
+import {abandonRevokedPendingWork, abandonableEntries, staleInertState} from "./readmission.js";
 import {ROOM_CONNECTOR_PROVENANCE} from "./release-provenance.js";
 import {renewCredential} from "./credential-renewal.js";
 import {speakerLabel, speakerName} from "./speaker.js";
@@ -602,25 +603,8 @@ const backgroundSleep = (milliseconds, signal) => new Promise((resolve, reject) 
   signal?.addEventListener("abort", () => { clearTimeout(timer); reject(signal.reason ?? new Error("aborted")); }, {once: true});
 });
 
-// Terminal evidence that carries no open or quarantined work.
-const SETTLED_EVIDENCE = new Set(["posted", "skipped", "superseded", "ignored", "cancelled"]);
-
-/**
- * Owner 2026-11-12: an account state a re-admission may replace. Stale: revoked, or its credential expired.
- * Inert: no delivery intent, no credential rotation, and no terminal evidence other than settled outcomes, so
- * replacing it loses no evidence. Parity with the Hermes connector's _stale_inert_binding.
- * @param {object} state - A validated account state.
- * @param {number} [nowMs] - The clock.
- * @returns {boolean} Whether the stored state may be replaced by the fresh credential.
- */
-export function staleInertState(state, nowMs = Date.now()) {
-  const expiresAt = Date.parse(state?.credentialExpiresAt ?? "");
-  const stale = state?.revoked === true || (Number.isFinite(expiresAt) && expiresAt <= nowMs);
-  if (!stale) return false;
-  if (state.credentialRotation) return false;
-  if (Object.keys(state.deliveryIntents ?? {}).length > 0) return false;
-  return Object.values(state.terminalEvidence ?? {}).every((evidence) => SETTLED_EVIDENCE.has(evidence?.status));
-}
+// Owner 2026-11-12 re-admission and contract P18: see readmission.js.
+export {staleInertState};
 
 export class OpenClawRoomRuntime {
   constructor(account, {
@@ -3566,7 +3550,14 @@ export class OpenClawRoomRuntime {
         this.logger?.warn?.(`Room enrollment ${invitationId} skipped: the listing names no Room`);
         continue;
       }
-      const heldForRoom = await this.heldStateForRoom(listedRoom);
+      const heldAccount = await this.heldAccountForRoom(listedRoom);
+      const heldForRoom = heldAccount ? heldAccount.state : heldAccount;
+      if (heldForRoom && !staleInertState(heldForRoom) && abandonableEntries(heldForRoom)) {
+        // Contract P18-5: only while a listed enrollment names this Room and before the claim. A live runtime of
+        // the revoked account is closed first; the claim follows only when the account is inert afterwards.
+        await this.closeRuntimesOf(heldAccount.stateFile);
+        await abandonRevokedPendingWork(heldAccount.stateFile, heldForRoom, {logger: this.logger});
+      }
       if (heldForRoom === false || (heldForRoom && !staleInertState(heldForRoom))) {
         this.logger?.warn?.(`Room ${listedRoom} is already bound and its account is not replaceable; enrollment ${invitationId} left unclaimed`);
         continue;
@@ -3613,9 +3604,7 @@ export class OpenClawRoomRuntime {
           this.logger?.warn?.(`Room ${roomId} was already bound while its enrollment was claimed`);
           continue;
         }
-        for (const other of [...connectorControl.runtimes]) {
-          if (other !== this && !other.closed && other.account?.stateFile === stateFile) await other.close();
-        }
+        await this.closeRuntimesOf(stateFile);
         const latest = await loadState(stateFile).catch(() => null);
         if (!latest || !staleInertState(latest)) {
           this.logger?.warn?.(`Room ${roomId} changed while its re-admission was claimed; kept as stored`);
@@ -3638,6 +3627,17 @@ export class OpenClawRoomRuntime {
    * @returns {Promise<object|null|false>} The held state.
    */
   async heldStateForRoom(roomId) {
+    const held = await this.heldAccountForRoom(roomId);
+    return held ? held.state : held;
+  }
+
+  /**
+   * The stored account of this gateway for a Room on this Room server, read only: null when none is held, false
+   * when one is held but unreadable, else its validated state and state file.
+   * @param {string} roomId - The listed Room.
+   * @returns {Promise<{state: object, stateFile: string}|null|false>} The held account.
+   */
+  async heldAccountForRoom(roomId) {
     const directory = dirname(this.account.stateFile);
     let names;
     try { names = await readdir(directory); } catch { return false; }
@@ -3645,9 +3645,17 @@ export class OpenClawRoomRuntime {
       let raw;
       try { raw = JSON.parse(await readFile(join(directory, name), "utf8")); } catch { continue; }
       if (raw?.roomId !== roomId || raw?.baseUrl !== this.state.baseUrl) continue;
-      try { return await loadState(join(directory, name)); } catch { return false; }
+      const stateFile = join(directory, name);
+      try { return {state: await loadState(stateFile), stateFile}; } catch { return false; }
     }
     return null;
+  }
+
+  // Close every other live runtime of an account state file before that file is rewritten.
+  async closeRuntimesOf(stateFile) {
+    for (const other of [...connectorControl.runtimes]) {
+      if (other !== this && !other.closed && other.account?.stateFile === stateFile) await other.close();
+    }
   }
 
   async publishPresence(signal) {
