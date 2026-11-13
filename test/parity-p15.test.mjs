@@ -442,7 +442,7 @@ test("PR81-P-001 a muted membership with one unread state read at the recheck ke
     for (let round = 0; round < 4; round += 1) results.push(await settlesWithin(runtime.maintainPresence(undefined, {heartbeat: true})));
     assert.deepEqual(results, ["done", "done", "done", "done"], "no tick is held after the unread recheck");
     assert.equal(stateReads >= 1, true, "the recheck read the Room state");
-    assert.equal(calls.filter((call) => call === "POST /connector/sessions").length, 1, "the unread state registers once more");
+    assert.equal(calls.filter((call) => call.startsWith("POST ") && call.endsWith("/connector/sessions")).length, 1, "the unread state registers once more");
     assert.equal(calls.filter((call) => call.endsWith("/connector/sessions/s-1/heartbeat")).length, 3, "every other tick heartbeats");
     assert.equal(calls.filter((call) => call.includes("/connector/enrollments")).length, 0, "no enrollment listing while muted");
     assert.equal(runtime.participation.paused, true, "the gate stays paused as muted");

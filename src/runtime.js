@@ -3648,6 +3648,12 @@ export class OpenClawRoomRuntime {
       lineage.members.delete(this);
       return [];
     }
+    if (this.participation?.paused) {
+      // P2c-3b/P15-2: a muted (paused) membership never lists and never holds the heartbeat behind the listing.
+      lineage.members.delete(this);
+      this.inactiveCheckedAt ||= Date.now();
+      return [];
+    }
     if (!this.enrollmentListingDue(lineage)) return [];
     const listedAt = Date.now();
     lineage.used.set(this, listedAt);
