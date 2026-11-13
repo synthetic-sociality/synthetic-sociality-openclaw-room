@@ -384,7 +384,7 @@ test("PR80-O-014 flat layout: the owner case (revoked held account with pending 
 });
 
 test("PR80-O-014 flat layout: any other unusable *.json still fails the scan closed", async () => {
-  for (const name of ["other.json", "status-copy.json", "Status.json"]) {
+  for (const name of ["other.json", "status-copy.json", "installation-old.json"]) {
     const result = await enrollFlat({extraFiles: {[name]: "not json"}});
     assert.deepEqual(result.claims, [], name);
     assert.ok(result.warnings.some((line) => line.includes(`account file ${name} cannot be read`)), name);

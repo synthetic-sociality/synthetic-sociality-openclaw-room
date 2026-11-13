@@ -3856,8 +3856,12 @@ export class OpenClawRoomRuntime {
     // one link, 0600, schema) before the Room is decided; any failure, or two files naming this Room on this server,
     // refuses with the file name and a code (PR80-O-012).
     const directory = dirname(this.account.stateFile);
+    // PR80-O-014: in the layout whose account files are not in `accounts/`, the connector's own status.json and
+    // installation.json live beside them (roomStateDirectory); exactly those two names are skipped, and only there.
+    const ownMetadata = roomStateDirectory(this.account.stateFile) === resolve(directory)
+      ? new Set(["status.json", "installation.json"]) : new Set();
     let names;
-    try { names = (await readdir(directory)).filter((entry) => entry.endsWith(".json")).sort(); } catch (error) {
+    try { names = (await readdir(directory)).filter((entry) => entry.endsWith(".json") && !ownMetadata.has(entry)).sort(); } catch (error) {
       return {failure: {name: ".", code: scanFailureCode(error)}};
     }
     const matches = [];
