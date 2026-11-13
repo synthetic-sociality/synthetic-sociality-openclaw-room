@@ -23,7 +23,7 @@ const clone = (value) => structuredClone(value);
 const PENDING_KEY = "evt-2646:final";
 const SELECTED = {version: 1, status: "selected", messagePayloadDialect: "v1", identity: {roomId: "room-2", body: "x", sourceEventId: "evt-9"}};
 
-async function claim(stored, {liveRuntime = false, journal = null, prepare = null, mutateHeld = null} = {}) {
+async function claim(stored, {liveRuntime = false, journal = null, prepare = null, mutateHeld = null, accounts = null, onClaim = null} = {}) {
   const directory = await mkdtemp(join(tmpdir(), "openclaw-room-p18-"));
   const sourceFile = join(directory, "default.json");
   const staleFile = join(directory, "member-2.json");
@@ -32,6 +32,8 @@ async function claim(stored, {liveRuntime = false, journal = null, prepare = nul
   await saveState(staleFile, stored);
   if (journal !== null) await writeFile(journalFile, journal, {mode: 0o600});
   if (prepare) await prepare({directory, staleFile, journalFile});
+  // PR80-O-001: the host config's account list (connector control's listedAccounts()).
+  connectorControl.configure(accounts ? {accounts: () => accounts({staleFile, sourceFile})} : {});
   const sourceBefore = await readFile(sourceFile);
   const before = await readFile(staleFile);
   const activations = [];
@@ -44,7 +46,7 @@ async function claim(stored, {liveRuntime = false, journal = null, prepare = nul
   resetEnrollmentLineages();
   runtime.client = {
     connectorEnrollments: async () => [{invitationId: "invite-9", roomId: "room-2"}],
-    claimConnectorEnrollment: async (_state, invitationId) => (claims.push(invitationId), {
+    claimConnectorEnrollment: async (_state, invitationId) => (claims.push(invitationId), onClaim?.(), {
       roomId: "room-2", membershipId: "member-2", credential: "secret-fresh",
       credentialExpiresAt: "2026-12-12T00:00:00Z", identityVersion: 3, headSeq: 2650,
     }),
@@ -68,6 +70,7 @@ async function claim(stored, {liveRuntime = false, journal = null, prepare = nul
       sourceUnchanged: Buffer.compare(sourceBefore, await readFile(sourceFile)) === 0};
   } finally {
     if (old) connectorControl.runtimes.delete(old);
+    connectorControl.configure({});
   }
 }
 
@@ -155,6 +158,13 @@ test("test_p18_04_an_operator_disabled_binding_is_untouched_and_unclaimed", asyn
     await assertUntouched(result, label);
     assert.deepEqual(await journalLines(result.journalFile), [], `${label}: nothing is journaled`);
   }
+  // PR80-O-001: a host-config enabled:false is an operator's disable, even when the state says revoked.
+  for (const [label, stored] of [["config disabled, revoked with pending work", clone(REAL)],
+    ["config disabled, revoked and inert", (() => { const inert = clone(REAL); delete inert.deliveryIntents["evt-2646:final"]; return inert; })()]]) {
+    const result = await claim(stored, {accounts: ({staleFile}) => [{accountId: "member-2", stateFile: staleFile, enabled: false}]});
+    await assertUntouched(result, label);
+    assert.deepEqual(await journalLines(result.journalFile), [], `${label}: nothing is journaled`);
+  }
 });
 
 test("test_p18_05_a_replay_appends_no_duplicate_audit_entry", async () => {
@@ -230,4 +240,28 @@ test("H105-F007 a torn last line stays its own line and new records start on a f
   assert.ok(text.startsWith(`${torn}\n{`), "the torn line is kept unchanged and isolated");
   const lines = await journalLines(result.journalFile);
   assert.equal(lines.filter((line) => line.phase === "recorded").length, 1);
+});
+
+test("PR80-O-001 a config disable that lands before the claim keeps the account and claims nothing", async () => {
+  let calls = 0;
+  const result = await claim(clone(REAL), {accounts: ({staleFile}) => [{accountId: "member-2", stateFile: staleFile, enabled: calls++ < 1}]});
+  assert.deepEqual(result.claims, [], "re-checked immediately before the claim");
+  assert.deepEqual(result.activations, []);
+  assert.equal((await loadState(result.staleFile)).credential, "secret-old", "never replaced or re-enabled");
+});
+
+test("PR80-O-001 a config disable that lands during the claim is never replaced or re-enabled", async () => {
+  let disabled = false;
+  const result = await claim(clone(REAL), {onClaim: () => { disabled = true; },
+    accounts: ({staleFile}) => [{accountId: "member-2", stateFile: staleFile, enabled: !disabled}]});
+  assert.deepEqual(result.claims, ["invite-9"]);
+  assert.deepEqual(result.activations, [], "no enabled:true merge over the operator's false");
+  const persisted = await loadState(result.staleFile);
+  assert.equal(persisted.credential, "secret-old");
+  assert.equal(persisted.revoked, true);
+});
+
+test("PR80-O-001 an unreadable host account list fails closed", async () => {
+  const result = await claim(clone(REAL), {accounts: () => { throw new Error("config unreadable"); }});
+  await assertUntouched(result, "unreadable config");
 });
