@@ -3214,6 +3214,10 @@ export class OpenClawRoomRuntime {
     if (intent.deliveryState !== "posted" || !validCanonicalMessage(message)) {
       throw new Error("Lifecycle completion requires a complete canonical delivery receipt");
     }
+    // P15-2/P2c-3b (0.2.82, Hermes H107-P-005 twin): a paused gate refuses the
+    // lifecycle request locally, without Room contact, so it spends no durable
+    // attempt; the lifecycle stays pending for the next active start.
+    if (this.participation?.paused) return false;
     intent.lifecycleAttempts = Number(intent.lifecycleAttempts ?? 0) + 1;
     intent.lifecycleLastAttemptAt = new Date().toISOString();
     await this.persistState();
