@@ -74,6 +74,8 @@ export function resolveRoomAccount(cfg, accountId = "default", {managedResolver 
   return {
     accountId,
     enabled: raw.enabled !== false && !stateRetired(selected.stateFile),
+    // PR80-O-005, contract P18-1: the operator's own host-config value, without the retirement of a revoked state.
+    configEnabled: raw.enabled !== false,
     configured: accountId === "default" || selected.managed !== null || (typeof raw.baseUrl === "string" && typeof raw.stateFile === "string"),
     baseUrl: selected.baseUrl,
     stateFile: selected.stateFile,

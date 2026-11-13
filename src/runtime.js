@@ -678,16 +678,27 @@ const backgroundSleep = (milliseconds, signal) => new Promise((resolve, reject) 
 export {staleInertState};
 
 /**
- * PR80-O-001, contract P18-1: the host config names this account state file with enabled:false (an operator's
- * disable, whatever the state file says). An unreadable account list counts as disabled (fail closed).
+ * The host config's account list (connector control's listedAccounts(), resolvedRoomAccounts(cfg)), or null when it
+ * cannot be read.
+ * @returns {Array<object>|null} The accounts.
+ */
+export function hostAccountList() {
+  const listed = connectorControl.listedAccounts();
+  return Array.isArray(listed) ? listed : null;
+}
+
+/**
+ * PR80-O-001/O-005, contract P18-1: the host config names this account state file with a RAW `enabled: false` (an
+ * operator's disable, whatever the state file says). The resolved `enabled` is never used: it also folds in the
+ * retirement of a revoked state. An unreadable list counts as disabled (fail closed before a claim).
  * @param {string} stateFile - An account state file.
+ * @param {Array<object>|null} [listed] - The host account list.
  * @returns {boolean} Whether the account must be left untouched.
  */
-export function configDisabledAccount(stateFile) {
-  const listed = connectorControl.listedAccounts();
-  if (!Array.isArray(listed)) return true;
+export function configDisabledAccount(stateFile, listed = hostAccountList()) {
+  if (!listed) return true;
   const target = resolve(stateFile);
-  return listed.some((account) => account?.enabled === false && typeof account?.stateFile === "string" && resolve(account.stateFile) === target);
+  return listed.some((account) => account?.configEnabled === false && typeof account?.stateFile === "string" && resolve(account.stateFile) === target);
 }
 
 export class OpenClawRoomRuntime {
@@ -3649,6 +3660,12 @@ export class OpenClawRoomRuntime {
         this.logger?.warn?.(`Room enrollment ${invitationId} skipped: the listing names no Room`);
         continue;
       }
+      if (!hostAccountList()) {
+        // PR80-O-006: an unreadable host account list refuses before any claim, first-time or held, so no
+        // one-time credential is consumed on uncertain evidence.
+        this.logger?.warn?.(`Room enrollment ${invitationId} left unclaimed: the host account list cannot be read`);
+        continue;
+      }
       const heldAccount = await this.heldAccountForRoom(listedRoom);
       const heldForRoom = heldAccount ? heldAccount.state : heldAccount;
       if (heldAccount && configDisabledAccount(heldAccount.stateFile)) {
@@ -3703,8 +3720,11 @@ export class OpenClawRoomRuntime {
       // configuration hot reload can expose this binding to another runtime.
       let held = null;
       try { held = await loadState(stateFile); } catch (error) { held = error?.code === "ENOENT" ? null : false; }
-      if (configDisabledAccount(stateFile)) {
-        // PR80-O-001: never write over, or merge enabled:true into, an account the operator disabled.
+      const listedNow = hostAccountList();
+      if (held !== null && listedNow && configDisabledAccount(stateFile, listedNow)) {
+        // PR80-O-001/O-006: after the claim, refuse only an explicit host-config enabled:false of an already held
+        // file (never write over, or merge enabled:true into, it); a list read failure here never discards the
+        // consumed one-time credential.
         this.logger?.warn?.(`Room ${roomId} is operator-disabled in the host config; the claimed enrollment is not activated`);
         continue;
       }

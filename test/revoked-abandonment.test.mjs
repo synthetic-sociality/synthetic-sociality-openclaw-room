@@ -161,7 +161,7 @@ test("test_p18_04_an_operator_disabled_binding_is_untouched_and_unclaimed", asyn
   // PR80-O-001: a host-config enabled:false is an operator's disable, even when the state says revoked.
   for (const [label, stored] of [["config disabled, revoked with pending work", clone(REAL)],
     ["config disabled, revoked and inert", (() => { const inert = clone(REAL); delete inert.deliveryIntents["evt-2646:final"]; return inert; })()]]) {
-    const result = await claim(stored, {accounts: ({staleFile}) => [{accountId: "member-2", stateFile: staleFile, enabled: false}]});
+    const result = await claim(stored, {accounts: ({staleFile}) => [{accountId: "member-2", stateFile: staleFile, enabled: false, configEnabled: false}]});
     await assertUntouched(result, label);
     assert.deepEqual(await journalLines(result.journalFile), [], `${label}: nothing is journaled`);
   }
@@ -244,7 +244,7 @@ test("H105-F007 a torn last line stays its own line and new records start on a f
 
 test("PR80-O-001 a config disable that lands before the claim keeps the account and claims nothing", async () => {
   let calls = 0;
-  const result = await claim(clone(REAL), {accounts: ({staleFile}) => [{accountId: "member-2", stateFile: staleFile, enabled: calls++ < 1}]});
+  const result = await claim(clone(REAL), {accounts: ({staleFile}) => [{accountId: "member-2", stateFile: staleFile, configEnabled: calls++ < 1}]});
   assert.deepEqual(result.claims, [], "re-checked immediately before the claim");
   assert.deepEqual(result.activations, []);
   assert.equal((await loadState(result.staleFile)).credential, "secret-old", "never replaced or re-enabled");
@@ -253,7 +253,7 @@ test("PR80-O-001 a config disable that lands before the claim keeps the account 
 test("PR80-O-001 a config disable that lands during the claim is never replaced or re-enabled", async () => {
   let disabled = false;
   const result = await claim(clone(REAL), {onClaim: () => { disabled = true; },
-    accounts: ({staleFile}) => [{accountId: "member-2", stateFile: staleFile, enabled: !disabled}]});
+    accounts: ({staleFile}) => [{accountId: "member-2", stateFile: staleFile, configEnabled: !disabled}]});
   assert.deepEqual(result.claims, ["invite-9"]);
   assert.deepEqual(result.activations, [], "no enabled:true merge over the operator's false");
   const persisted = await loadState(result.staleFile);

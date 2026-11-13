@@ -35,6 +35,7 @@ async function enroll({accountsConfig = undefined, held = FIXTURE, listing = [{i
   const cfg = {channels: {"synthetic-sociality-room": {enabled: true, baseUrl: SOURCE.baseUrl, stateFile: sourceFile,
     ...(accountsConfig ? {accounts: accountsConfig} : {})}}};
   connectorControl.setAccounts(accounts ?? (() => resolvedRoomAccounts(cfg)));
+  const listedBefore = accounts ? null : resolvedRoomAccounts(cfg);
   const claims = [];
   const activations = [];
   const runtime = new OpenClawRoomRuntime({accountId: "default", stateFile: sourceFile, baseUrl: SOURCE.baseUrl},
@@ -53,13 +54,13 @@ async function enroll({accountsConfig = undefined, held = FIXTURE, listing = [{i
   }
   let journal = [];
   try { journal = (await readFile(join(directory, JOURNAL), "utf8")).split("\n").filter(Boolean).map((line) => JSON.parse(line)); } catch {}
-  return {claims, activations, heldFile, before, directory, journal, cfg};
+  return {claims, activations, heldFile, before, directory, journal, cfg, listedBefore};
 }
 
 test("PR80-O-005 (a) the owner case with the real account list: a revoked account, not config-disabled, is claimed, journaled and replaced", async () => {
   const result = await enroll();
-  const listed = resolvedRoomAccounts(result.cfg).find((account) => account.accountId === "member-2");
-  assert.equal(listed?.enabled, false, "the resolved account is not enabled (retired), which is not an operator disable");
+  const listed = result.listedBefore.find((account) => account.accountId === "member-2");
+  assert.equal(listed?.enabled, false, "the resolved account was not enabled (retired), which is not an operator disable");
   assert.deepEqual(result.claims, ["invite-9"]);
   assert.deepEqual(result.activations, ["member-2"]);
   const persisted = await loadState(result.heldFile);
