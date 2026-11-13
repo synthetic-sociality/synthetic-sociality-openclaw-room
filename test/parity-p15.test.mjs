@@ -195,9 +195,10 @@ test(CASES[11], async () => {
   await assert.rejects(room.readEvents(SESSION, 0, {wait: 1}), (error) => error.status === 403);
   assert.equal(probes.length, 1, "the denial probed first");
   assert.equal(gate.paused, true, "only roster evidence paused it");
-  const next = room.heartbeat(SESSION, "s-1").catch(() => {});
+  // P15-13: a muted membership's heartbeat and event stream continue; other background writers wait.
+  const next = room.acknowledge(SESSION, 3).catch(() => {});
   await tick();
-  assert.equal(calls.length, 1, "later background contacts wait");
+  assert.equal(calls.length, 1, "later background writers wait");
   gate.close();
   await next;
 });

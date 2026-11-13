@@ -198,12 +198,13 @@ export class RoomClient {
     return this.contactSuccesses.get(contact) ?? 0;
   }
 
-  async request(path, {method = "GET", body, credential = this.credential, signal, expected = [200], background = false, probe = false} = {}) {
+  async request(path, {method = "GET", body, credential = this.credential, signal, expected = [200], background = false, presence = false, probe = false} = {}) {
     const contact = roomContact(method, path);
     // Contract P15-2: background contacts wait while the membership is paused; every other call fails fast.
+    // P2c-3b (0.2.81): presence contacts (registration, heartbeat, event stream) of a muted membership do not wait.
     const gate = probe ? null : this.participation;
     if (gate) {
-      if (background) await gate.waitOpen(signal);
+      if (background) await gate.waitOpen(signal, {presence});
       else gate.assertActive();
     }
     try {
@@ -314,13 +315,13 @@ export class RoomClient {
   }
 
   register(session, registration, signal) {
-    return this.request(`/rooms/${encodeURIComponent(session.roomId)}/connector/sessions`, {background: true, 
+    return this.request(`/rooms/${encodeURIComponent(session.roomId)}/connector/sessions`, {background: true, presence: true,
       method: "POST", body: registration, credential: session.credential, signal, expected: [200],
     });
   }
 
   heartbeat(session, connectorSessionId, signal) {
-    return this.request(`/rooms/${encodeURIComponent(session.roomId)}/connector/sessions/${encodeURIComponent(connectorSessionId)}/heartbeat`, {background: true, 
+    return this.request(`/rooms/${encodeURIComponent(session.roomId)}/connector/sessions/${encodeURIComponent(connectorSessionId)}/heartbeat`, {background: true, presence: true,
       method: "POST", credential: session.credential, signal, expected: [200],
     });
   }
@@ -406,7 +407,7 @@ export class RoomClient {
   readEvents(session, after, {wait = 0, signal} = {}) {
     const query = new URLSearchParams({after: String(after), limit: "100"});
     if (wait > 0) query.set("waitSeconds", String(wait));
-    return this.request(`/rooms/${encodeURIComponent(session.roomId)}/events?${query}`, {background: true, 
+    return this.request(`/rooms/${encodeURIComponent(session.roomId)}/events?${query}`, {background: true, presence: true,
       credential: session.credential, signal, expected: [200],
     });
   }

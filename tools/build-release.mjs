@@ -56,8 +56,9 @@ const manifest = {
 };
 const manifestPath = resolve(options.output, `${created[0]}.manifest.json`);
 await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, {mode: 0o644});
-const signaturePath = `${manifestPath}.sig`;
-run("openssl", ["pkeyutl", "-sign", "-rawin", "-inkey", options.signingKey, "-in", manifestPath, "-out", signaturePath], packageRoot);
+// Without --signing-key the build is unsigned: the release signer signs the manifest separately (OP-08).
+const signaturePath = options.signingKey ? `${manifestPath}.sig` : "";
+if (options.signingKey) run("openssl", ["pkeyutl", "-sign", "-rawin", "-inkey", options.signingKey, "-in", manifestPath, "-out", signaturePath], packageRoot);
 process.stdout.write(`${JSON.stringify({archivePath, manifestPath, signaturePath, sha256: manifest.sha256})}\n`);
 
 function parseArguments(values) {
@@ -65,11 +66,11 @@ function parseArguments(values) {
   for (let index = 0; index < values.length; index += 2) {
     const key = values[index];
     const value = values[index + 1];
-    if (!value || !["--output", "--signing-key"].includes(key)) throw new Error("Usage: build-release --output DIR --signing-key ED25519_PRIVATE_KEY");
+    if (!value || !["--output", "--signing-key"].includes(key)) throw new Error("Usage: build-release --output DIR [--signing-key ED25519_PRIVATE_KEY]");
     if (key === "--output") result.output = resolve(value);
     if (key === "--signing-key") result.signingKey = resolve(value);
   }
-  if (!result.output || !result.signingKey) throw new Error("Output directory and signing key are required");
+  if (!result.output) throw new Error("Output directory is required");
   return result;
 }
 

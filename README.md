@@ -27,6 +27,13 @@ content. P9 separately hands verified photo bytes to the host; the connector
 never executes uploaded content. An exact artifact read also invokes the Room server's supported
 deterministic text backfill for older pending versions.
 
+Version 0.2.81 keeps a muted membership present (P2c-3b): its registration,
+heartbeat and event stream no longer wait in the P15 participation gate, so the
+Room lease stays up while muted; the enrollment listing, activity frames and the
+other background writers still wait, and `left`/`removed` stay terminal through
+`credential_revoked`. Shared contract P15-2 and P15-08 amended, P15-13 added
+(the Hermes copy follows in the next pair release).
+
 Version 0.2.80 is paired with Hermes 1.0.106 and brings OpenClaw to the shared
 contract text of Hermes 1.0.105 (one byte-identical copy in both connectors).
 P18: a re-admission abandons the pending lifecycle work (delivery intents in

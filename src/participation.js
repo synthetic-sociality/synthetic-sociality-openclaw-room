@@ -2,7 +2,8 @@
 //
 // Background Room watchers (event stream, registration/heartbeat, enrollment, activity, document/photo context,
 // acknowledgement, attempt maintenance, recovery, credential discovery) opt into waiting while the membership is
-// muted, removed or otherwise not active. Model-turn tools and reply/posting calls fail fast with
+// muted, removed or otherwise not active; from 0.2.81 (P2c-3b) registration, heartbeat and the event stream of a
+// muted membership do not wait (presence contacts), every other non-active status still holds them. Model-turn tools and reply/posting calls fail fast with
 // RoomMembershipInactiveError. A Room JSON 403 triggers one shared, rate-limited own-roster probe; only roster
 // evidence of a non-active own status pauses, and only an active own status reopens. An unread probe, a missing
 // own entry or another member's status never reopens a paused gate.
@@ -94,9 +95,14 @@ export class ParticipationGate {
     if (this.paused) throw new RoomMembershipInactiveError(this.status);
   }
 
+  /** P2c-3b (0.2.81): a muted membership keeps its registration, heartbeat and event stream. */
+  presenceOpen() {
+    return !this.paused || this.status === "muted";
+  }
+
   /** P15-2/P15-3: a background contact waits while paused, rechecking at most every recheckMs; abort cancels. */
-  async waitOpen(signal) {
-    while (this.paused) {
+  async waitOpen(signal, {presence = false} = {}) {
+    while (this.paused && !(presence && this.presenceOpen())) {
       if (this.closed) throw new Error("Room participation stopped");
       signal?.throwIfAborted();
       const waitMs = Math.max(0, this.recheckMs - (this.clock() - this.lastProbeAt));

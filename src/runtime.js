@@ -3598,7 +3598,8 @@ export class OpenClawRoomRuntime {
       // P8-2: the listing has its own schedule; P8-4: an idle frame after a
       // registration, else at most once per idleActivityFrameIntervalMs().
       await this.acceptConnectorEnrollments(signal);
-      if (registered || this.idleFrameDue()) await this.publishPresence(signal);
+      // P15-2/P2c-3b (0.2.81): a muted membership's activity frame waits for active; it never holds the heartbeat.
+      if ((registered || this.idleFrameDue()) && !this.participation?.paused) await this.publishPresence(signal);
     });
   }
 
