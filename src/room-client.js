@@ -157,6 +157,10 @@ export function roomErrorDiagnostic(error) {
   return `${status}${code}${fields}`;
 }
 
+// Contract P11b-1: the connector product User-Agent on every Room request (one shared constant; product only,
+// no credential, member, host, profile, model or installation detail).
+export const ROOM_USER_AGENT = "synthetic-sociality-openclaw/1.0";
+
 export class RoomClient {
   constructor({baseUrl, credential = "", fetchImpl = globalThis.fetch}) {
     // Contract P2c-3a: a Room URL the URL parser refuses (no scheme, a broken
@@ -200,7 +204,7 @@ export class RoomClient {
   }
 
   async requestOnce(path, {method, body, credential, signal, expected}) {
-    const headers = {Accept: "application/json"};
+    const headers = {Accept: "application/json", "User-Agent": ROOM_USER_AGENT};
     if (credential) headers.Authorization = `Bearer ${credential}`;
     if (body !== undefined && !(body instanceof FormData)) headers["Content-Type"] = "application/json";
     // The Room never redirects: the runtime refuses a redirect (a failed
@@ -444,7 +448,7 @@ export class RoomClient {
     let response;
     try {
       response = await this.fetch(`${this.baseUrl}${path}`, {method: "GET", redirect: "error", signal,
-        headers: {Accept: mimeType, Authorization: `Bearer ${session.credential}`}});
+        headers: {Accept: mimeType, Authorization: `Bearer ${session.credential}`, "User-Agent": ROOM_USER_AGENT}});
     } catch (error) { throw transportFailure(error, signal); }
     if (response.status !== 200) {
       await response.body?.cancel?.();
