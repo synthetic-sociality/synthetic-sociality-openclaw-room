@@ -3,7 +3,8 @@ import {PHOTO_TYPES, appendPhotoContext, effectivePhotos, hostImageStore, photoC
 import {contributionOutput, frozenContributionType} from "./contribution.js";
 import {createHash, randomUUID} from "node:crypto";
 import {hostname} from "node:os";
-import {readdir, readFile} from "node:fs/promises";
+import {open as openFile, readdir, readFile} from "node:fs/promises";
+import {constants as fsConstants} from "node:fs";
 import {dirname, join, resolve} from "node:path";
 import {RETRY_AFTER_MAXIMUM_SECONDS, RoomAPIError, RoomClient, RoomRequestError, RoomResponseError, RoomTransportError, roomErrorDiagnostic} from "./room-client.js";
 import {loadState, migrateStateFile, saveNewState, saveState} from "./state.js";
@@ -708,6 +709,40 @@ export function configDisabledAccount(stateFile, listed = hostAccountList(), acc
   return listed.some((account) => account?.configEnabled === false && (
     (typeof account?.stateFile === "string" && resolve(account.stateFile) === target)
     || (accountId && account?.accountId === accountId)));
+}
+
+// PR80-O-012: a stable, content-free code for an account file the held scan cannot use.
+function scanFailureCode(error) {
+  if (typeof error?.code === "string" && /^[A-Za-z0-9_]{1,40}$/.test(error.code)) return error.code;
+  if (error instanceof SyntaxError) return "invalid_json";
+  const message = String(error?.message ?? "");
+  if (message.includes("regular file")) return "not_regular_file";
+  if (message.includes("hard-linked")) return "hard_linked";
+  if (message.includes("permissions")) return "group_or_other_access";
+  return "invalid_state";
+}
+
+/**
+ * PR80-O-013: keep a consumed one-time credential privately when the claimed account cannot be written safely. The
+ * file is created exclusively (never overwrites, never follows a link), mode 0600, fsynced, and its name does not
+ * end in .json, so neither the held scan nor account discovery reads it.
+ * @param {string} directory - The accounts directory.
+ * @param {string} name - The rescue file name.
+ * @param {object} state - The claimed account state.
+ * @returns {Promise<string>} The path written.
+ */
+export async function writeClaimedRescue(directory, name, state) {
+  if (!/^[A-Za-z0-9_.:-]{1,200}$/.test(name) || name.endsWith(".json")) throw new Error("rescue file name is invalid");
+  const path = join(directory, name);
+  const handle = await openFile(path, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW, 0o600);
+  try {
+    await handle.chmod(0o600);
+    await handle.writeFile(`${JSON.stringify(state, null, 2)}\n`, "utf8");
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+  return path;
 }
 
 export class OpenClawRoomRuntime {
@@ -3675,7 +3710,14 @@ export class OpenClawRoomRuntime {
         this.logger?.warn?.(`Room enrollment ${invitationId} left unclaimed: the host account list cannot be read`);
         continue;
       }
-      const heldAccount = await this.heldAccountForRoom(listedRoom);
+      const scanned = await this.heldAccountForRoom(listedRoom);
+      if (scanned?.failure) {
+        // PR80-O-010/O-012: one account file the scan cannot use blocks every enrollment until it is repaired
+        // (fail closed by design); the log names the file and a code, never its content.
+        this.logger?.warn?.(`account file ${scanned.failure.name} cannot be read (${scanned.failure.code}); enrollment ${invitationId} left unclaimed`);
+        continue;
+      }
+      const heldAccount = scanned;
       const heldForRoom = heldAccount ? heldAccount.state : heldAccount;
       if (heldAccount && configDisabledAccount(heldAccount.stateFile)) {
         // PR80-O-001: an operator-disabled account is never abandoned, claimed over, replaced or re-enabled.
@@ -3742,20 +3784,37 @@ export class OpenClawRoomRuntime {
       // account the raw host config names enabled:false is never activated, so no enabled:true is merged over it.
       // PAIR-F002: a null post-claim list counts as disabled for activation only; the credential is still saved.
       const configDisabledFresh = held === null && (!listedNow || configDisabledAccount(stateFile, listedNow, accountId));
+      // PR80-O-013: after the claim the one-time credential is consumed; when the held file cannot be loaded,
+      // appeared, or changed meanwhile, it is kept privately in a rescue file and the account is not activated.
+      const rescue = async (why) => {
+        const name = `${accountId}.claimed-${new Date().toISOString().replace(/[^0-9]/g, "")}-${randomUUID().slice(0, 8)}`;
+        try {
+          await writeClaimedRescue(dirname(stateFile), name, nextState);
+          this.logger?.warn?.(`Room ${roomId}: ${why}; the claimed credential is kept privately in ${name} and the account is not activated`);
+        } catch (error) {
+          this.logger?.warn?.(`Room ${roomId}: ${why}; the claimed credential could not be kept (${scanFailureCode(error)})`);
+        }
+      };
       if (held === null) {
-        await saveNewState(stateFile, nextState);
+        try {
+          await saveNewState(stateFile, nextState);
+        } catch (error) {
+          if (error?.code !== "EEXIST") throw error;
+          await rescue("an account file appeared while the enrollment was claimed");
+          continue;
+        }
       } else {
         // Owner 2026-11-12: the Room re-admitted this membership. Replace only a
         // stale, inert account: close any live runtime of it first, re-read the
         // stored state, and keep it byte for byte unless it is still stale and inert.
         if (!held || !staleInertState(held)) {
-          this.logger?.warn?.(`Room ${roomId} was already bound while its enrollment was claimed`);
+          await rescue(held ? "the held account changed while its enrollment was claimed" : "the held account file cannot be loaded after the claim");
           continue;
         }
         await this.closeRuntimesOf(stateFile);
         const latest = await loadState(stateFile).catch(() => null);
         if (!latest || !staleInertState(latest)) {
-          this.logger?.warn?.(`Room ${roomId} changed while its re-admission was claimed; kept as stored`);
+          await rescue(latest ? "the held account changed while its re-admission was claimed" : "the held account file cannot be loaded before the replacement");
           continue;
         }
         await saveState(stateFile, nextState);
@@ -3782,6 +3841,7 @@ export class OpenClawRoomRuntime {
    */
   async heldStateForRoom(roomId) {
     const held = await this.heldAccountForRoom(roomId);
+    if (held?.failure) return false;
     return held ? held.state : held;
   }
 
@@ -3792,20 +3852,27 @@ export class OpenClawRoomRuntime {
    * @returns {Promise<{state: object, stateFile: string}|null|false>} The held account.
    */
   async heldAccountForRoom(roomId) {
+    // PR80-O-010/O-011: every *.json account file goes through the approved state loader (regular file, no symlink,
+    // one link, 0600, schema) before the Room is decided; any failure, or two files naming this Room on this server,
+    // refuses with the file name and a code (PR80-O-012).
     const directory = dirname(this.account.stateFile);
     let names;
-    try { names = await readdir(directory); } catch { return false; }
-    for (const name of names.filter((entry) => entry.endsWith(".json"))) {
-      let raw;
-      // PAIR-F001 (brief A1: directory-wide held-state scan, fail closed on an unreadable file): any account file
-      // that cannot be read or parsed may hold this Room, so the whole scan refuses; no claim on uncertain evidence.
-      try { raw = JSON.parse(await readFile(join(directory, name), "utf8")); } catch { return false; }
-      if (raw?.roomId !== roomId || raw?.baseUrl !== this.state.baseUrl) continue;
-      const stateFile = join(directory, name);
-      try { return {state: await loadState(stateFile), stateFile}; } catch { return false; }
+    try { names = (await readdir(directory)).filter((entry) => entry.endsWith(".json")).sort(); } catch (error) {
+      return {failure: {name: ".", code: scanFailureCode(error)}};
     }
-    return null;
+    const matches = [];
+    for (const name of names) {
+      const stateFile = join(directory, name);
+      let state;
+      try { state = await loadState(stateFile); } catch (error) { return {failure: {name, code: scanFailureCode(error)}}; }
+      if (state.roomId === roomId && state.baseUrl === this.state.baseUrl) matches.push({state, stateFile});
+    }
+    if (matches.length > 1) {
+      return {failure: {name: matches.map((match) => match.stateFile.split("/").at(-1)).join(","), code: "duplicate_room_binding"}};
+    }
+    return matches[0] ?? null;
   }
+
 
   // Close every other live runtime of an account state file before that file is rewritten.
   async closeRuntimesOf(stateFile) {
