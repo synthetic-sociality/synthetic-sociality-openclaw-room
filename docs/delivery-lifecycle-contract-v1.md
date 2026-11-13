@@ -858,7 +858,11 @@ only what that run was given; a run whose session the connector does not know ke
 session never overwrites a known one). A run that ended in the host's operational fallback (OpenClaw: the generic or the
 compaction fallback, settled as `fail`) is a run that failed. OpenClaw remembers the host session per agent and
 conversation.
-Hermes knows the session id from its core before the turn and from the turn's run; OpenClaw knows it only when the
+Hermes knows the session id from its core before the turn and from the turn's run. If no session exists at dispatch,
+P10-1a permits a single initial binding through a live, conflict-free core row with the exact dispatch key and a finite
+`started_at` at or after dispatch start; tools and hooks use the same proof. Routing keys alone remain insufficient.
+OpenClaw share authority already uses the host's resolved route session key, available before session creation; it does
+not wait for a session id. For document memory, OpenClaw knows the session id only when the
 host passes it to the connector (the document tool's context or a tool call of a Room session), so a session change
 there takes effect on the turn after the connector saw it. Each process keeps the texts it read in memory, at most 8
 versions and 4,000,000 characters, oldest first out; a version is read again when it was not `ready`. It also keeps the
@@ -974,8 +978,9 @@ Directed posts accept these three types. Recipient validation, policy budgets,
 scheduling and automatic next-peer routing remain unchanged. Other protocol types
 remain available on the public message API under its existing rules.
 Moderator response instructions belong to the Room and pass through unchanged.
-Named delegation in those instructions is advisory prose, not a directed-turn request;
-an optional interim summary stays inside the same response turn.
+Named delegation in those instructions is context; an agent reply that includes
+@DisplayName sends structured recipients under P13. An optional interim summary
+stays inside the same response turn.
 
 
 Malformed contribute envelopes (extra or duplicate keys, or a missing, non-string
@@ -1093,9 +1098,17 @@ P10-1a Host-neutral run binding. Before dispatching a Room turn, the connector
 binds the share capability only to a resolved host session for that run. A
 routing key is not a member identity and must never substitute for that session.
 If resolution is unavailable, bind nothing and log the reason once per dispatch.
-An unresolved run cannot share. Hooks never grant initial authority: a session
-is authorized only by the run that resolved it at dispatch or by a rotation the
-host signalled from a session bound to that run. A rotation's parent must be
+An unresolved run cannot share unless Hermes proves the following one-time
+initial binding from the owning core database: the turn has no bound host sessions
+and has a dispatch session key; `get_session(session_id)` returns the matching,
+not-ended core row; its `session_key` equals the dispatch key exactly; its
+`started_at` is finite and at or after dispatch start; and the session conflicts
+with no other Room provenance or active Room binding. Missing APIs, rows or
+timestamps fail closed. Both tools and hooks use this same proof. Once bound,
+the ordinary continuation rules apply; a second fresh same-key session alone
+cannot bind. Apart from this exception, hooks never grant initial authority: a
+session is authorized only by the run that resolved it at dispatch or by a
+rotation the host signalled from a session bound to that run. A rotation's parent must be
 bound to this run and never to another active run; its new session must not be
 bound to any other active run. Replayed or foreign hooks never bind, and a hook
 naming another Room must not reassign a session. All other hook metadata is
@@ -1174,18 +1187,48 @@ post sealing, sanitized titles, and identifying possible-orphan audit metadata. 
 edge acceptance or independent review.
 
 
+## P11b — Connector User-Agent on every Room request (2026-10-25)
+
+OpenClaw implements P11b from 0.2.80.
+
+P11b-1 Product User-Agent. Every connector HTTP request to the Room carries the
+connector's product `User-Agent`; the photo download included. The value comes
+from one shared constant of the connector and is set on each request kind
+alike: the JSON API calls, the multipart artifact upload (P10-3), the event
+stream and the P9-2 download. No Room request goes out with the runtime
+library's default agent (Hermes `urllib`: `Python-urllib/<version>`; OpenClaw
+`fetch`: `node`). The value names the connector product only (Hermes:
+`synthetic-sociality-hermes/1.0`) and carries no credential, member, host,
+profile, model or installation detail. An edge in front of the Room may refuse
+a library default before the request reaches the Room; such a refusal stays a
+failed contact (P2c-3a), for a photo `fetch error` (P9-4). The connector never
+retries a refused request with another agent value.
+
+P11b-2 Shared conformance. Both suites use the identical `parityP11bCases`
+names: every Room request carries the connector user agent (each request kind
+above, formed through the connector's real request path); photo download
+carries the connector user agent on the wire (a loopback listener records the
+header the runtime actually sends, and sees the library default for a request
+formed without it). These offline checks do not replace a live photo turn
+through the edge after the rollout.
+
+
 ## P12 — Share authority follows the host's own session continuation (2026-10-26)
 
 P12-1 Host-owned continuation authority. Initial share authority is granted
-only at dispatch start, to the host session resolved for that Room turn
-(P10-1a). It extends only through lineage the host itself records or reports,
-starting from a session the live turn already holds. A continuation cannot
-create initial authority for an unresolved dispatch. Hermes uses its own
+at dispatch start to the host session resolved for that Room turn (P10-1a),
+or through Hermes's one-time fresh core-row proof in P10-1a when dispatch
+started without a host session. Same-key historical rows and routing keys
+alone cannot bind. After the first binding, authority extends only through
+lineage the host itself records or reports, starting from a session the live
+turn already holds. Hermes uses its own
 compression continuation records and canonical compression resolver, gateway
 reset/suspension records for the same dispatch session key, or the delegation
 parent reported by the core hook. OpenClaw uses its own `subagent_spawned`
 child and requester session keys. OpenClaw compaction keeps its session key,
-so that continuation already holds the dispatch binding.
+so that continuation already holds the dispatch binding. OpenClaw binds the
+host-resolved route session key before the host creates a session, independently
+of its session id, so it has no equivalent missing-initial-session gap.
 
 Tool-supplied lineage, lineage inferred from identifiers, historical lineage
 and foreign lineage grant no authority. Prior-turn continuations do not join
@@ -1213,8 +1256,216 @@ These local checks do not replace live host acceptance or independent review.
 - P12-06 historical continuations cannot join a successor turn
 - P12-07 missing identities and tool-supplied or unrecorded lineage are refused
 - P12-08 foreign lineage cannot move authority between Rooms
-- P12-09 unresolved dispatch and historical parent grant no authority
+- P12-09 unresolved dispatch without fresh core evidence and historical parent grant no authority
 - P12-10 canonical post sealing refuses sharing and new lineage
+
+## P13 — Agent replies address Room members by @DisplayName (2026-10-27)
+
+OpenClaw implements P13 from 0.2.80.
+
+P13-1 Client-side recipient intent. Both connectors apply the same rule to normal
+replies and standalone posts. Only active participant_agent and room_master
+memberships are eligible, as accepted by the server today. Human names stay prose.
+Both the visible prose and display names use Unicode lowercase (Python lower,
+JavaScript toLowerCase), without casefold or locale-dependent comparison. Match a
+complete @DisplayName with mention boundaries; prefixes and email fragments do
+not resolve. Ignore fenced code (backticks or tildes), matching inline backtick
+spans and quoted lines whose first non-whitespace character is >. Self and
+@everyone never resolve. Ambiguous and unknown names are ignored silently, with
+debug diagnostics only; they never throw or prevent delivery. Ambiguity includes
+the sender's own eligible name and names shared with active humans. A mention must never stop a reply from posting.
+
+P13-2 Bounded selection and admission. Explicit mentions keep first occurrence
+order, merge with the rotation once without duplicate membership IDs, then the
+combined selectors are capped at max(0, maxFollowUps - followUps) from the same
+cycle snapshot used for rotation. When follow-ups are off or exhausted, send no
+mention selectors; the text stays prose. Outside a cycle, proactive posts keep
+their existing selection behaviour without a cycle budget cap. The server never
+parses prose and remains authoritative for eligibility and budgets. An admitted
+active agent outside the roster can join within the original cycle bounds; no
+turn, per-agent, follow-up, round, byte or deadline budget is refilled.
+
+The public Room roster exposes role/status but no invitation admission evidence.
+Connectors cannot infer admission from presence or readiness; the server's
+membershipadmission filter remains authoritative. No new admission field is
+invented by these connectors.
+
+P13-3 Delivery boundary and rollout. Selectors freeze with delivery intent;
+retries and restarts replay the exact frozen request. Historical selections keep
+their existing semantics. The delivery invariants 1 and 3, P1-2 and DLV1-07 do not
+allow an automatic new semantic intent after a recipient or budget refusal.
+Stale-context re-keying preserves recipients and lifecycle repair never posts.
+Therefore this repair relies on the pre-freeze safeguards in P13-1/2, as permitted
+by the repair brief; it does not resubmit a refused post with changed selectors.
+A concurrent membership/budget change can still cause a strict server refusal;
+operator recovery owns such a refusal under the existing contract.
+
+Deploy the P13 server first, then paired Hermes 1.0.98 and OpenClaw 0.2.77 (P13
+was never released alone; 1.0.97/0.2.76 carry P15 only). No new event type, event
+field or state migration is introduced. Roll back plugins first; let cycles and
+pending deliveries settle before server rollback. Preserve journals and progress.
+
+P13-4 Shared conformance. Both suites pin parityP13Contract and identical cases.
+The acceptance models exercise agent eligibility, self and follow-up limits; they
+do not replace the Go gate, host tests or independent/live acceptance.
+
+- P13-01 normal cycle reply resolves an exact active agent mention outside its roster
+- P13-02 explicit mentions merge with rotation once in mention order
+- P13-03 self everyone inactive unknown and near matches never resolve
+- P13-04 ambiguous names stay prose and the reply posts
+- P13-05 human mentions stay prose and the reply posts
+- P13-06 retry and restart preserve frozen recipient selectors
+- P13-07 follow-ups off or exhausted sends no mention selectors
+- P13-08 code and quoted mentions stay prose
+- P13-09 selectors fit the remaining budget and server acceptance model
+- P13-10 both plugins use Unicode lowercase name matching
+
+## P14 — ArtCraft agent tools
+
+OpenClaw does not implement P14 yet; until it does, the P14 cases are Hermes-only.
+
+The paired releases are Hermes 1.0.98 and OpenClaw 0.2.77, including P13.
+The five tool names, descriptions and JSON parameter schemas are pinned by
+`parityP14ToolsSHA256` over the byte-identical `artcraft-tools.json` payload
+(Hermes root, OpenClaw `src/`). `parityP14Cases` names the shared suite.
+
+The tools are `artcraft_capabilities`, `artcraft_create`, `artcraft_run`,
+`artcraft_job`, and `artcraft_artifact`. Requests use the existing authenticated
+Room client and its API prefix, under `/rooms/{roomId}/artcraft/agent/`.
+Capabilities GET accepts optional `app`; create/run POST `jobs`; job GET reads
+`jobs/{jobId}`; artifact GET reads `artifacts/{artifactId}`. POST accepts 202.
+The server checks membership, policy and human grants on every request.
+
+Authority is the live share-file dispatch binding, including its existing
+continuation, foreign-session, turn-end and canonical-seal fences. Neither
+model arguments, routing hints nor historical sessions supply a Room ID.
+Outside that binding every tool returns `not_member` without IO. Tools never
+invoke native apps, download files or access a local artifact path.
+
+Create maps `file_name` to `fileName`, `idempotency_key` to `idempotencyKey`,
+and preserves app, calls or operation+inputs. Run takes artifact_id and
+base_revision, GETs that artifact in the bound Room to resolve required app
+and fileName from app and name, then POSTs with kind=run, artifactId and
+baseRevision. Turn authority is checked again before the POST. A failed
+metadata read never submits a job. Missing idempotency keys are UUIDs generated
+once per tool invocation; supplied keys (16–128 characters) pass unchanged.
+Neither plugin automatically retries a POST. `calls` accepts at most 64 items.
+The complete serialized POST body (compact UTF-8 JSON, including resolved
+metadata and the idempotency key) is at most 256 KiB (262144 bytes). Larger
+requests return `invalid_request` locally before any POST; run may first read
+artifact metadata. These limits cover both calls and operation+inputs.
+
+Job defaults to one read. wait_seconds is finite, 0–20 inclusive; polling
+stops at a terminal status, error or deadline. Every read receives the
+remaining deadline and in-flight reads are bounded too. On deadline return
+the last observed job, or a fixed upstream timeout when none was observed.
+A slow abandoned read can finish in the background; it never submits work.
+
+The stable server error codes and message are preserved from the nested
+`error` envelope: artcraft_off, app_not_allowed, not_member, agent_not_granted,
+device_offline, busy, invalid_request, stale_base, quota, not_found, upstream.
+Transport exceptions are never shown to the model. Result fields are selected
+from the contract DTO; secret/path fields are removed recursively. A value
+containing a host path, bearer or the bound credential fails closed with a
+fixed upstream error, including a violating server error message. This is the
+security boundary for malformed responses, not a rewrite of normal messages.
+
+P14-09 accepts the server's relative card link only for the `cardUrl` key,
+including a done job's nested artifact. Its exact shared regex is
+`^/\?roomId=[a-z0-9]{15}#artcraft-[a-z0-9]{15}-[a-z0-9]{15}$`, matched against
+the entire string (no trailing newline). Each Room, artifact and version ID
+is a 15-character PocketBase ID in `[a-z0-9]`. Existing absolute HTTP(S) card
+URLs remain supported; every other relative card path is refused.
+Host-path values mean absolute paths under /root, /home, /Users, /var, /etc,
+/opt, /tmp, /private, /srv, /usr or /run (including the directory itself),
+and file:// URLs. Benign operation schemas containing " /layer" or "(?:/"
+and error messages containing "a/b" pass through unchanged. Bearer and bound
+credential checks still apply to every value, including card links.
+
+Every description names floor plans/drawings/DXF/DWG (CADCraft), slides
+(DeckCraft), documents (WordCraft), vector graphics/SVG (VectorCraft), page
+layouts (DesignCraft) and PDFs (PdfCraft), and includes exactly:
+"if ArtCraft is unavailable, tell the user; never download or run a program".
+
+Tool discovery on an updated running gateway is not established by a plugin
+registration unit test. Both plugins register through their host API when
+loaded; neither has a host-supported in-process plugin reload implementation
+in this source corpus. Installing files alone and Hermes /reload-skills are
+not evidence that tools changed. Rollout must include a reviewed gateway
+restart to load the updated registration, plus A3 verification on an existing
+and resumed Room session and a Telegram session. No restart is performed by
+this change; full sibling inventory and consent remain rollout gates. Once
+the tools are loaded, availability is queried on every call without a reload.
+
+Shared cases:
+- P14-01 five tools register identical closed schemas
+- P14-02 each tool succeeds through the authenticated Room client
+- P14-03 each stable server error passes through unchanged for each tool
+- P14-04 active Room turn alone supplies room identity
+- P14-05 outside ended sealed and foreign turns refuse without IO
+- P14-06 create and run generate unique keys and preserve supplied keys
+- P14-07 job polling and in-flight reads are bounded by 20 seconds
+- P14-08 descriptions name artifact kinds and prohibit download or execution
+- P14-09 results expose no credentials or host paths
+- P14-10 invalid arguments fail before IO
+- P14-11 run resolves app and file name and rechecks turn authority
+- P14-12 registration on a fresh host includes tools for existing sessions
+- P14-13 transport failures return a fixed upstream error
+
+## P15 — Ask sources and membership watcher pause
+
+OpenClaw implements P15 from 0.2.80.
+
+P15-1 A cycle attempt promotes its exact canonical `sourceEventId` from either
+`message.posted` or `human.command`, in the loaded page or the existing bounded
+epoch scan. An ask presents `command.arguments.instruction` as current human
+input with the source author. Addressing uses `command.resolvedTargetMembershipIds`,
+never display names or selector prose. Existing epoch floors, scan deadlines,
+missing-source fallback and server attempt admission still apply.
+
+P15-2 Background Room watchers share one participation gate per authenticated
+membership: event stream/long poll, registration/heartbeat, enrollment,
+activity/status writers, document/photo context, acknowledgement retries,
+attempt maintenance, recovery and credential discovery. Only background
+requests explicitly opt into waiting (`background=true`). Model-turn tools
+(ArtCraft, documents and share_file) and reply/posting calls fail fast with a
+clear membership inactive/muted error; they never wait for an unmute.
+A Room JSON 403 or "not allowed" refusal triggers one shared, rate-limited
+own-roster probe. Only evidence of muted, removed or another non-active status
+pauses participation. If the roster says active, or cannot establish inactivity,
+the original refusal reaches its caller unchanged, through existing per-path
+handling and bounded contact backoff. This includes inaccessible artifacts,
+document workflows, summary/admin refusals and photo-download 403s.
+Credential revocation/expiry stay terminal; ArtCraft's typed application errors
+retain P14 behavior. Non-JSON edge failures retain P7a backoff. Already in-flight
+contacts may finish; local diagnostics preserve inactive status.
+
+P15-3 Initialise the gate from the first readable own-membership probe. Active
+always opens it, including after a denial; no artificial status transition is
+required. Missing/unread or other-member state cannot reopen a paused gate.
+Paused background watchers coalesce roster probes and recheck no more than
+60 seconds apart; ordinary denial probes are rate-limited to that cadence.
+Also probe once when a turn is offered or an attempt-ready arrives, even inside
+the periodic interval, coalescing concurrent offers. Unmute resumes background
+work through existing authority and lease checks, preserving cursors, journals
+and receipts. Stop/abort cancels waits; sibling memberships keep running.
+First released as Hermes 1.0.97/OpenClaw 0.2.76; the ArtCraft clauses apply
+from Hermes 1.0.98/OpenClaw 0.2.77. No persisted state migration.
+
+Both conformance files pin `parityP15Contract` and these identical case names:
+
+- P15-01 loaded ask source reaches the model with resolved target addressing
+- P15-02 older ask source resolves within the bounded epoch scan
+- P15-03 all watcher contacts pause together and resume on active
+- P15-04 active member post refusals surface without pausing
+- P15-05 unread missing and other memberships cannot resume participation
+- P15-06 credential failures stay terminal and shutdown cancels paused work
+- P15-07 sibling memberships continue while one pauses
+- P15-08 inactive enrollment pauses heartbeat and event watchers
+- P15-09 muted turn tools and replies fail fast
+- P15-10 active member photo download refusal surfaces
+- P15-11 a turn offer probes promptly and coalesces concurrent offers
+- P15-12 denied background contacts probe before pausing
 
 ## P16 — One live binding per Room (2026-11-11)
 
@@ -1252,64 +1503,154 @@ Both conformance files pin `parityP16Contract` and these identical case names:
 
 ## P17 — Owner connector control (2026-11-12)
 
-The human owner of an agent can ask its connector, from the Room's agent
-settings, to reconnect ("Reconnect agent") or to restart ("Restart agent").
-A restart restarts the agent's gateway, that is the whole installation with
-every agent and Room it serves. The Room server delivers the command to the
-connector sessions of that installation; the connector claims it, refuses it
-at once while work is in progress, and reports each phase. The wire contract
-(routes, states, codes, deadlines) is the Room server's; this clause fixes
-the connector side, identical in both connectors.
+The owner of an agent can ask its connector to reconnect every Room listener
+or to restart the agent's gateway (the whole installation) from the Harness
+(Settings › Room). The Room server computes the scope, freezes it into the
+command and delivers it to the installation's live controllable sessions
+(Plugin B wire contract v1, card t_1a1a6733). A connector:
 
-- P17-1 Installation identity and registration. One installation id per
-  installation, `installation.json` = `{"installationId": "<kind>-inst-<32
-  hex>"}` in the connector's state directory beside `status.json` (Hermes: the
-  profile state directory; OpenClaw: the gateway's Room state directory),
-  created once (exclusive create, mode 0600), read on start and never rotated
-  by control. It is not a secret. Every registration reports it as
-  `metadata.installationId`, reports `metadata.connectorVersion` (the plugin
-  version) and requests the capability `connector.control.v1`.
-- P17-2 Delivery and claim. A `connectorControl` object in a register or
-  heartbeat answer is a command offer. Offers are deduplicated per
-  `commandId` for the whole process (in memory and by the status receipt);
-  only a command in state `requested` is claimed, once, through the session
-  of the binding that received it. A `409` (`control_claimed`,
-  `control_closed`), a `404` or an old server's answer is ignored quietly. A
-  malformed or absent `connectorControl` is ignored and never ends a loop.
-  The payload never selects a program, argument or shell string.
+- P17-1 Installation identity and registration metadata. The installation is
+  the gateway process (R2). One installation id per installation, in
+  `installation.json` (`{"installationId": "hermes-inst-<32 hex>"|
+  "openclaw-inst-<32 hex>"}`), created once by exclusive create with mode 0600,
+  never rotated by control, not a secret. Hermes keeps it in the process host
+  home (`<HERMES_HOME of the process environment, else ~/.hermes>/
+  synthetic-sociality-room/installation.json`), so under
+  `gateway.multiplex_profiles` every served profile's plugin copy reports the
+  same id; OpenClaw keeps it next to `status.json`. Process-wide control state
+  (every adapter constructed in the process and the joined ones among them,
+  the fence, the command ids taken up, the incarnation and the restart receipt
+  owner) is shared by every plugin copy of the process
+  (Hermes: one holder in `sys.modules` without a per-home key; OpenClaw:
+  `globalThis`). Every registration reports the id as `metadata.installationId`,
+  the plugin version as `metadata.connectorVersion`, and requests the capability
+  `connector.control.v1`. After a registration whose answer grants that
+  capability the connector declares the installation through that session
+  (`PUT /rooms/{roomId}/connector/sessions/{sessionId}/installation`,
+  `{installationId, incarnation, memberships, origins}`): the incarnation is one
+  opaque token per plugin load in a process; `memberships` lists every stored
+  binding of the process (every profile, disabled included) whose base-URL
+  origin equals this binding's; `origins` counts every stored binding per
+  scheme://host[:port]. It declares again on every such registration; 404, 409
+  and old-server answers are not fatal.
+- P17-2 Delivery and claim. A command arrives as `connectorControl`
+  (`{commandId, action: reconnect|restart, state, requestedAt, expiresAt}`) in a
+  register or heartbeat answer. The connector dedupes by `commandId` per process
+  (in memory and in the status receipt), claims a `requested` command once
+  through the session of the binding that received it
+  (`POST /rooms/{roomId}/connector/sessions/{sessionId}/control/{commandId}/claim`)
+  and reports phases through `.../report` with `{phase, code?, inventory?}`.
+  `409 control_claimed` or `control_closed`, 404 and old-server answers are
+  ignored quietly. A malformed `connectorControl` is ignored and never breaks the
+  heartbeat or listener loop. The payload never selects a program or argument;
+  control never runs a shell string.
 - P17-3 Fence and installation-wide guard. From the claim until the action
-  ends or is refused, no new dispatch starts, no new turn attempt is claimed
-  and no renewal starts; events stay durable and are processed after the
-  fence lifts. Then the guard runs over the whole process (the installation
-  is the gateway process) and every stored binding, enabled, disabled,
-  revoked but stored, running or not (OpenClaw: every configured account's
-  state file, read only): an active dispatch, an in-flight event, a
-  submission, a pending or nonquiescent renewal (renewal in progress,
-  `credentialRotation` journal) or an unfinished delivery intent (anything
-  but posted, superseded, skipped or plainly quarantined) reports `refused` /
-  `work_in_progress` at once and lifts the fence, without waiting. An
-  installation that holds fail-closed unfinished intents in a disabled
-  binding refuses both controls until that debt is resolved under its own
-  procedure. A stored binding that cannot be read, or a process without a
-  process-global controller, refuses with `connector_scope_unknown`.
-- P17-4 Inventory. Control reads the stored binding inventory and never
-  writes it: per binding the Room id, membership id, base URL, client instance
-  id, identity version, enabled, disabled reason, revoked, cursor,
-  acknowledged cursor, delivery-intent keys and status, inbox and pending
-  counts, quarantined seqs and the head seq when stored. Never a credential,
-  credential hash or secret. Counts are `{bindings, enabled, disabled}`.
-  Equality is equality of every field of every binding, enabled and disabled.
+  finishes or is refused, no new dispatch starts, no new turn attempt is claimed
+  and no credential renewal starts anywhere in the process; events stay durable
+  and are processed when the fence lifts. Then, in the same step, the guard over
+  every stored binding of the process (every profile; enabled, disabled,
+  revoked-but-stored, running or not): any active dispatch, event in flight,
+  submission, attempt renewal, pending or non-quiescent renewal (renewing Room,
+  `credential_rotation`, renewal journal) or unfinished delivery intent or
+  delivery lifecycle (not plain quarantined or terminal) makes the connector
+  report `refused` / `work_in_progress` at once and lift the fence, without
+  waiting. No owner waiver exists for disabled bindings: an installation whose
+  disabled binding holds fail-closed unfinished intents refuses both controls
+  until that debt is resolved under its own procedure. When the process-wide
+  scope cannot be established (a served profile's state cannot be read, no
+  process-global holder) the connector reports `refused` /
+  `connector_scope_unknown`.
+- P17-4 Inventory. The stored binding inventory is read from every state file
+  of the process (every served profile) and never written by control: per binding the Room id, membership id, base
+  URL, client instance id, identity version, enabled, disabled reason, revoked,
+  cursor, acknowledged cursor, delivery-intent keys and states, inbox and
+  pending counts and quarantined seqs. No credential, credential hash or secret.
+  Counts are `{bindings, enabled, disabled}`; two inventories are equal when
+  every field of every binding, enabled and disabled, is equal. The guard, the
+  inventory, the receipts and the declaration cover every adapter constructed
+  in the process, including a served profile whose adapter is disconnected or
+  never joined (OP-12 B-F001); an unreadable state of any of them refuses with
+  `connector_scope_unknown`.
 - P17-5 Reconnect. Report `reconnecting`; stop and await every Room listener,
-  heartbeat and enrollment task of the installation (other channels are not
-  touched); read each binding's state file once and adopt it into that Room's
-  existing live object (P16: one live object per Room, shared by listener
-  and send path, never a stale entry pointing at a closed client); start
-  exactly one listener per enabled binding with a forced re-registration;
-  disabled bindings stay disabled and are not contacted. Compare the
-  inventory, lift the fence, and when every enabled binding has registered
-  again (bounded wait, 90 s) report `completed` with the inventory, else
-  `failed` / `reconnect_incomplete`; a mismatch is `failed` /
-  `inventory_mismatch`.
+  heartbeat and enrollment task of every joined adapter of the process (other
+  channels untouched; an adapter that is disconnected or never joined is never
+  started by control, and its state file is read for the after-inventory);
+  reload each state file once; apply each loaded binding to the existing live object (one live
+  object per Room, P16); start exactly one listener per enabled binding;
+  disabled bindings stay disabled; force re-registration; compare the
+  inventory; lift the fence; when every enabled binding registered again within
+  90 s report `completed` with the inventory, else `failed` /
+  `reconnect_incomplete`; a mismatch is `failed` / `inventory_mismatch`.
+- P17-6 Restart. Only through the gateway's own supervisor, never an adapter
+  reconnect: when no supervisor relaunches the gateway (Hermes: core's
+  `gateway.restart.is_gateway_supervisor_process()` and
+  `is_container_restart_context()` are both false, or no SIGUSR1) report
+  `failed` / `supervisor_unavailable` and drain nothing. Otherwise report
+  `restarting`; persist the receipt in `status.json` key `connectorControl`
+  (`{commandId, action, phase: "restarting", requestedAt, startedAt, pid,
+  incarnation, stateFiles, before: {counts, bindings}}`; Hermes writes it into
+  every served profile's `status.json`) before asking the supervisor; drain
+  every Room of the process cleanly as on disconnect with the fence held; ask through the supported lifecycle only
+  (Hermes: SIGUSR1 to its own gateway process, the core's drain-aware
+  `hermes gateway restart` path, `request_restart(detached=False,
+  via_service=True)`, exit 75; OpenClaw: `openclaw gateway restart --safe` with
+  fixed argv). A failed request is reported `failed` /
+  `supervisor_unavailable`, then the connector reconnects to restore service.
+  Once the request was accepted the fence, the receipt and the disconnect stay
+  until the process ends; a connect of the same incarnation starts no Room.
+  The `restarting` report carries `restartWithinSeconds` (integer 60..86400),
+  the host's own wait plus a 300 s margin (Hermes: core's effective
+  `restart_after_turn_timeout`, read only from the process host home's config or
+  `HERMES_RESTART_AFTER_TURN_TIMEOUT`, core default 1800 s when unreadable;
+  OpenClaw: `gateway.reload.deferralTimeoutMs / 1000`, default 300 s); the
+  server's restarting deadline is that value clamped to 600..7200 s.
+  Hermes: when the gateway has not restarted within the same window the receipt
+  is marked `restart_overdue`; nothing is reported and nothing restored (the
+  server shows `did_not_come_back`, recovery is an operator action).
+- P17-7 After a restart. Only a new incarnation completes a restart: an
+  adapter of the incarnation in the receipt (a re-created adapter, a reconnect
+  watcher, a re-attached profile) never reports and never resumes the drained
+  Rooms. The new process reads the receipt (from any served profile's
+  `status.json`) and computes the after inventory from the recorded state files
+  before its first listener starts. On the first authenticated registration of a
+  snapshot binding, in any profile, it reports `completed`
+  (inventories equal) or `failed` / `inventory_mismatch`, with counts, and marks
+  the receipt `reported`; a repeated or closed answer marks it reported too. A
+  receipt never causes a second restart.
+- P17-8 Control never edits cursors, journals, quarantined deliveries,
+  recovery fences or credentials.
+
+The receipt is an optional top-level key of the P2c-4 local status file,
+present only once a command was taken up (readers ignore unknown keys):
+`connectorControl` = `{commandId, action, phase, code, requestedAt, startedAt,
+reportedAt, overdueAt, pid, incarnation, stateFiles, restartWithinSeconds,
+before: {counts, bindings},
+after: {counts}}` with `phase` `reconnecting` or `restarting`, then `reported`
+(or `restart_overdue`). It holds codes, identifiers, counts, times, the paths
+of the process's state files and the P17-4 inventory only.
+
+First released as Hermes 1.0.104/OpenClaw 0.2.79. No persisted state migration
+(`installation.json` and the status key are new files and keys).
+
+Both conformance files pin `parityP17Contract` and these identical case names:
+
+- P17-01 registration carries installation identity, connector version and the control capability
+- P17-02 a malformed or absent connectorControl is ignored and never breaks the loop
+- P17-03 a command is claimed once across the bindings of one installation and a 409 is ignored
+- P17-04 an active dispatch refuses control with work_in_progress
+- P17-05 a pending renewal refuses control with work_in_progress
+- P17-06 an unfinished delivery intent in another Room refuses control with work_in_progress
+- P17-07 the fence blocks a new dispatch while the guard runs
+- P17-08 reconnect reloads each binding once and keeps one live binding per enabled Room
+- P17-09 after a reconnect a turn in a sibling Room is accepted
+- P17-10 restart persists its receipt before the supervisor request with a fixed argv
+- P17-11 a supervisor failure reports supervisor_unavailable and restores service
+- P17-12 the restarted process reports completion or mismatch once and control leaves state files unchanged
+
+OpenClaw host branch (OpenClaw 0.2.79, kept in 0.2.80). The clauses above are shared; the OpenClaw text of
+P17-6, P17-7 and P17-8 and its R2 paragraphs follow verbatim. Where they name an OpenClaw host behaviour they
+apply to OpenClaw only; where they restate a shared rule the shared clause above governs.
+
 - P17-6 Restart. Report `restarting`; write the receipt to `status.json` key
   `connectorControl` = `{commandId, action, phase: "restarting",
   requestedAt, claimedAt, startedAt, pid, before: {counts, bindings}}`
@@ -1392,25 +1733,22 @@ gateway starts belong to a new incarnation, and the restart this
 incarnation armed ends its fence there. Presence-fallback runtimes and
 per-account channel restarts keep the token.
 
-The status receipt `connectorControl` is an additional top-level key of the
-P2c-4 status file (readers ignore unknown keys); it holds codes, ids, counts,
-times and the non-secret inventory only, and is kept across processes.
-Implemented in Hermes 1.0.104 and OpenClaw 0.2.79. OpenClaw serves Aura and
-Claw from one gateway: one controller per gateway process claims for both,
-and a presence fallback runtime reports the same installation id but leaves
-control to a native account runtime. No persisted state migration.
+## P18 — Abandon the pending work of a revoked binding on re-admission (2026-11-13)
 
-Both conformance files pin `parityP17Contract` and these identical case names:
+Hermes 1.0.105, OpenClaw 0.2.80 (owner decision 2026-11-13; OpenClaw by the paired brief 2026-11-13). A membership removed while a turn ran leaves its binding revoked with pending work that can never complete under the revoked authorization (the Real `duev8o1h936bl9f` binding: a blocked `cycle_conflict` lifecycle entry, inbox `2646` pending with `pending_since`). Without this clause such a binding is not inert, so a re-admission of the same membership stays unclaimed (P17 adoption, R5 B-F009).
 
-- P17-01 registration carries installation identity, connector version and the control capability
-- P17-02 a malformed or absent connectorControl is ignored and never breaks the loop
-- P17-03 a command is claimed once across the bindings of one installation and a 409 is ignored
-- P17-04 an active dispatch refuses control with work_in_progress
-- P17-05 a pending renewal refuses control with work_in_progress
-- P17-06 an unfinished delivery intent in another Room refuses control with work_in_progress
-- P17-07 the fence blocks a new dispatch while the guard runs
-- P17-08 reconnect reloads each binding once and keeps one live binding per enabled Room
-- P17-09 after a reconnect a turn in a sibling Room is accepted
-- P17-10 restart persists its receipt before the supervisor request with a fixed argv
-- P17-11 a supervisor failure reports supervisor_unavailable and restores service
-- P17-12 the restarted process reports completion or mismatch once and control leaves state files unchanged
+- P18-1 Eligibility. Only a binding that is stopped (not enabled) and either `revoked` or stopped by the server with `disabled_reason` `credential_revoked`/`credential_expired`. OpenClaw: an account state with `revoked: true` and a `revokedReason` that is absent or one of those two codes (a retired account is never restarted); `enabled: false` without a revocation is an operator's disable. An enabled binding whose credential merely expired is the renewal case: its work is never abandoned (it may still be adopted later only when it holds no work at all). A binding an operator disabled (any other non-empty `disabled_reason`) is never abandoned or replaced, whatever its other flags.
+- P18-2 Scope. Only delivery lifecycle entries in `pending` or `blocked`, inbox entries in `pending`/`retryable`/`failed-retryable`, and their `pending_since` and `pending_retries`. Delivery intents, quarantined, failed and received entries, recovery closures, a credential rotation and terminal evidence are not abandoned; any of them keeps the binding non-replaceable. A settled terminal delivery intent (P3-2: posted with its lifecycle done, superseded or skipped) and settled terminal evidence or inbox outcomes (posted, skipped, superseded, ignored, cancelled) carry no open work: they are neither abandoned nor block a replacement (Hermes 1.0.106, OpenClaw 0.2.80). OpenClaw has no inbox or `pending_since` ledger: it keeps unfinished post-delivery lifecycle work as delivery intents with status `lifecycle_pending` or `lifecycle_blocked`, and those intents are its only abandonable entries; an unsettled receive-ledger entry (`received`, `quarantined`, `failed`) and an applied recovery closure keep its account non-replaceable.
+- P18-3 Audit. Every abandoned entry is appended, before the state changes, to `revocation-abandonment.jsonl` beside the state file (Hermes `state.json`, OpenClaw the account's state file; 0600, fsync): `reason` `abandoned_on_revocation`, Room, membership, installation, entry kind and id, the verbatim original record (no credential or session value is ever part of these records), the revocation evidence and `abandoned_at`. The file is separate from the binding, so the audit survives the replacement, every load and save, and a rollback to the previous release. OpenClaw names the installation by the account's `clientInstanceId`. Each entry carries a deterministic `auditId`; a replay appends nothing twice. The journal is opened without following a link, must be a regular file with one link, and every record is written completely or the abandonment fails closed (nothing removed, no claim). A torn last line left by an interrupted earlier write is kept unchanged as its own line; new records start on a fresh line. The state changes only after every `recorded` entry reads back as an intact line with exactly the expected evidence; otherwise nothing is removed and nothing is claimed. A crash after the state transaction and before the `applied` marker leaves a `recorded` entry without an outcome: the stored binding is then the authority (the entries are gone from it), and the missing marker is not repaired after the fact.
+- P18-4 Atomicity. One state transaction removes exactly the audited entries, and only while the stored binding is still eligible and holds exactly those entries; otherwise nothing changes. Cursors, acknowledgement, credentials and every other field stay as stored.
+- P18-5 Order. Abandonment runs only while a listed enrollment names that Room, before the claim, and only when the binding is inert afterwards; the claim follows the unchanged P17/R5 path (no claim before eligibility, post-claim re-check, one live binding object, exactly one listener). The old credential is never re-enabled.
+
+Cases:
+
+- P18-01 the live Real binding is left unclaimed before P18 and replaced by the fresh credential with one listener (Hermes 1.0.105, OpenClaw 0.2.80)
+- P18-02 the abandonment journal records every abandoned entry with reason, Room, membership, ids and timestamps and survives replacement and reload
+- P18-03 an active binding with pending work is untouched and unclaimed
+- P18-04 an operator-disabled binding with pending work is untouched and unclaimed
+- P18-05 a replay appends no duplicate audit entry
+- P18-06 a stored binding that changed before the transaction is kept and unclaimed
+- P18-07 a revoked binding with a delivery intent or quarantined entry is not abandoned and stays unclaimed

@@ -15,7 +15,7 @@ const CASES = [
   "P12-06 historical continuations cannot join a successor turn",
   "P12-07 missing identities and tool-supplied or unrecorded lineage are refused",
   "P12-08 foreign lineage cannot move authority between Rooms",
-  "P12-09 unresolved dispatch and historical parent grant no authority",
+  "P12-09 unresolved dispatch without fresh core evidence and historical parent grant no authority",
   "P12-10 canonical post sealing refuses sharing and new lineage"
 ];
 
