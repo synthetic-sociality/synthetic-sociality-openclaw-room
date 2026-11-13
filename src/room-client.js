@@ -161,8 +161,19 @@ export function roomErrorDiagnostic(error) {
 // no credential, member, host, profile, model or installation detail).
 export const ROOM_USER_AGENT = "synthetic-sociality-openclaw/1.0";
 
+// Contract P15-2: a Room JSON refusal that may mean the membership is not active. Credential revocation/expiry stay
+// terminal and never probe.
+function participationDenial(error) {
+  if (!(error instanceof RoomAPIError)) return false;
+  const code = error.code || error.refusalCode;
+  if (["credential_revoked", "credential_expired"].includes(code)) return false;
+  return error.status === 403 || ["not_allowed", "forbidden"].includes(code);
+}
+
 export class RoomClient {
   constructor({baseUrl, credential = "", fetchImpl = globalThis.fetch}) {
+    // Contract P15-2: the membership participation gate, attached by the runtime (null: no gating).
+    this.participation = null;
     // Contract P2c-3a: a Room URL the URL parser refuses (no scheme, a broken
     // IPv6 bracket; its error quotes the URL) or whose scheme fetch does not
     // support is the plugin's own error, before any I/O.
@@ -187,8 +198,14 @@ export class RoomClient {
     return this.contactSuccesses.get(contact) ?? 0;
   }
 
-  async request(path, {method = "GET", body, credential = this.credential, signal, expected = [200]} = {}) {
+  async request(path, {method = "GET", body, credential = this.credential, signal, expected = [200], background = false, probe = false} = {}) {
     const contact = roomContact(method, path);
+    // Contract P15-2: background contacts wait while the membership is paused; every other call fails fast.
+    const gate = probe ? null : this.participation;
+    if (gate) {
+      if (background) await gate.waitOpen(signal);
+      else gate.assertActive();
+    }
     try {
       const decoded = await this.requestOnce(path, {method, body, credential, signal, expected});
       this.contactSuccesses.set(contact, this.contactSucceeded(contact) + 1);
@@ -199,6 +216,7 @@ export class RoomClient {
       } catch {
         // A frozen error keeps no contact; only a full pass resets then.
       }
+      if (gate && participationDenial(error)) await gate.denied(signal).catch(() => {});
       throw error;
     }
   }
@@ -296,13 +314,13 @@ export class RoomClient {
   }
 
   register(session, registration, signal) {
-    return this.request(`/rooms/${encodeURIComponent(session.roomId)}/connector/sessions`, {
+    return this.request(`/rooms/${encodeURIComponent(session.roomId)}/connector/sessions`, {background: true, 
       method: "POST", body: registration, credential: session.credential, signal, expected: [200],
     });
   }
 
   heartbeat(session, connectorSessionId, signal) {
-    return this.request(`/rooms/${encodeURIComponent(session.roomId)}/connector/sessions/${encodeURIComponent(connectorSessionId)}/heartbeat`, {
+    return this.request(`/rooms/${encodeURIComponent(session.roomId)}/connector/sessions/${encodeURIComponent(connectorSessionId)}/heartbeat`, {background: true, 
       method: "POST", credential: session.credential, signal, expected: [200],
     });
   }
@@ -310,7 +328,7 @@ export class RoomClient {
   // Contract P17-2: claim an owner connector control command through this
   // binding's own connector session (agent credential).
   claimConnectorControl(session, connectorSessionId, commandId, signal) {
-    return this.request(`/rooms/${encodeURIComponent(session.roomId)}/connector/sessions/${encodeURIComponent(connectorSessionId)}/control/${encodeURIComponent(commandId)}/claim`, {
+    return this.request(`/rooms/${encodeURIComponent(session.roomId)}/connector/sessions/${encodeURIComponent(connectorSessionId)}/control/${encodeURIComponent(commandId)}/claim`, {background: true, 
       method: "POST", body: {}, credential: session.credential, signal, expected: [200],
     });
   }
@@ -318,7 +336,7 @@ export class RoomClient {
   // Contract P17: report a phase (refused, reconnecting, restarting,
   // completed, failed) with codes and counts only.
   reportConnectorControl(session, connectorSessionId, commandId, report, signal) {
-    return this.request(`/rooms/${encodeURIComponent(session.roomId)}/connector/sessions/${encodeURIComponent(connectorSessionId)}/control/${encodeURIComponent(commandId)}/report`, {
+    return this.request(`/rooms/${encodeURIComponent(session.roomId)}/connector/sessions/${encodeURIComponent(connectorSessionId)}/control/${encodeURIComponent(commandId)}/report`, {background: true, 
       method: "POST", body: report, credential: session.credential, signal, expected: [200],
     });
   }
@@ -326,51 +344,51 @@ export class RoomClient {
   // Contract R2-3: the installation declaration of this connector session
   // (memberships of the same origin and per-origin counts; no secret).
   declareConnectorInstallation(session, connectorSessionId, declaration, signal) {
-    return this.request(`/rooms/${encodeURIComponent(session.roomId)}/connector/sessions/${encodeURIComponent(connectorSessionId)}/installation`, {
+    return this.request(`/rooms/${encodeURIComponent(session.roomId)}/connector/sessions/${encodeURIComponent(connectorSessionId)}/installation`, {background: true, 
       method: "PUT", body: declaration, credential: session.credential, signal, expected: [200],
     });
   }
 
     connectorEnrollments(session, signal) {
     const query = new URLSearchParams({clientInstanceId: session.clientInstanceId});
-    return this.request(`/connector/enrollments?${query}`, {
+    return this.request(`/connector/enrollments?${query}`, {background: true, 
       credential: session.credential, signal, expected: [200],
     });
   }
 
   credentialRenewalIntent(session, signal) {
     const query = new URLSearchParams({clientInstanceId: session.clientInstanceId});
-    return this.request(`/rooms/${encodeURIComponent(session.roomId)}/credential-renewal-intent?${query}`, {
+    return this.request(`/rooms/${encodeURIComponent(session.roomId)}/credential-renewal-intent?${query}`, {background: true, 
       credential: session.credential, signal,
     });
   }
 
   requestCredentialRenewal(session, request, signal) {
-    return this.request(`/rooms/${encodeURIComponent(session.roomId)}/credential-renewal-requests`, {
+    return this.request(`/rooms/${encodeURIComponent(session.roomId)}/credential-renewal-requests`, {background: true, 
       method: "POST", body: request, credential: session.credential, signal, expected: [200, 201],
     });
   }
 
   redeemCredentialRenewal(session, grantId, body, signal) {
-    return this.request(`/rooms/${encodeURIComponent(session.roomId)}/credential-renewal-grants/${encodeURIComponent(grantId)}/redeem`, {
+    return this.request(`/rooms/${encodeURIComponent(session.roomId)}/credential-renewal-grants/${encodeURIComponent(grantId)}/redeem`, {background: true, 
       method: "POST", body, credential: session.credential, signal,
     });
   }
 
   verifyCredentialRenewal(session, grantId, signal) {
-    return this.request(`/rooms/${encodeURIComponent(session.roomId)}/credential-renewal-grants/${encodeURIComponent(grantId)}/verify`, {
+    return this.request(`/rooms/${encodeURIComponent(session.roomId)}/credential-renewal-grants/${encodeURIComponent(grantId)}/verify`, {background: true, 
       credential: session.credential, signal,
     });
   }
 
   confirmCredentialRenewal(session, grantId, signal) {
-    return this.request(`/rooms/${encodeURIComponent(session.roomId)}/credential-renewal-grants/${encodeURIComponent(grantId)}/confirm`, {
+    return this.request(`/rooms/${encodeURIComponent(session.roomId)}/credential-renewal-grants/${encodeURIComponent(grantId)}/confirm`, {background: true, 
       method: "POST", credential: session.credential, signal,
     });
   }
 
   claimConnectorEnrollment(session, invitationId, signal) {
-    return this.request(`/connector/enrollments/${encodeURIComponent(invitationId)}/claim`, {
+    return this.request(`/connector/enrollments/${encodeURIComponent(invitationId)}/claim`, {background: true, 
       method: "POST",
       body: {clientInstanceId: session.clientInstanceId},
       credential: session.credential,
@@ -380,7 +398,7 @@ export class RoomClient {
   }
 
   publishActivity(session, activity, signal) {
-    return this.request(`/rooms/${encodeURIComponent(session.roomId)}/activity`, {
+    return this.request(`/rooms/${encodeURIComponent(session.roomId)}/activity`, {background: true, 
       method: "POST", body: activity, credential: session.credential, signal, expected: [202],
     });
   }
@@ -388,7 +406,7 @@ export class RoomClient {
   readEvents(session, after, {wait = 0, signal} = {}) {
     const query = new URLSearchParams({after: String(after), limit: "100"});
     if (wait > 0) query.set("waitSeconds", String(wait));
-    return this.request(`/rooms/${encodeURIComponent(session.roomId)}/events?${query}`, {
+    return this.request(`/rooms/${encodeURIComponent(session.roomId)}/events?${query}`, {background: true, 
       credential: session.credential, signal, expected: [200],
     });
   }
@@ -397,31 +415,32 @@ export class RoomClient {
   // never advances the member's delivered seq on the Room.
   readEpochEvents(session, after, epochId, signal) {
     const query = new URLSearchParams({after: String(Math.max(0, after)), limit: "10", epochId: String(epochId)});
-    return this.request(`/rooms/${encodeURIComponent(session.roomId)}/events?${query}`, {
+    return this.request(`/rooms/${encodeURIComponent(session.roomId)}/events?${query}`, {background: true, 
       credential: session.credential, signal, expected: [200],
     });
   }
 
   acknowledge(session, acknowledgedSeq, signal) {
-    return this.request(`/rooms/${encodeURIComponent(session.roomId)}/acknowledgements`, {
+    return this.request(`/rooms/${encodeURIComponent(session.roomId)}/acknowledgements`, {background: true, 
       method: "POST", body: {acknowledgedSeq}, credential: session.credential, signal, expected: [200],
     });
   }
 
   acknowledgePeerContribution(session, sourceEventId, signal) {
-    return this.request(`/rooms/${encodeURIComponent(session.roomId)}/peer-acknowledgements`, {
+    return this.request(`/rooms/${encodeURIComponent(session.roomId)}/peer-acknowledgements`, {background: true, 
       method: "POST", body: {sourceEventId}, credential: session.credential, signal, expected: [200, 201],
     });
   }
 
-  roomState(session, signal) {
-    return this.request(`/rooms/${encodeURIComponent(session.roomId)}/state`, {
+  roomState(session, signal, {probe = false} = {}) {
+    // Contract P15-2: the own-roster probe itself never waits on, nor feeds, the participation gate.
+    return this.request(`/rooms/${encodeURIComponent(session.roomId)}/state`, {probe, 
       credential: session.credential, signal, expected: [200],
     });
   }
 
   roomPolicy(session, signal) {
-    return this.request(`/rooms/${encodeURIComponent(session.roomId)}/policy`, {
+    return this.request(`/rooms/${encodeURIComponent(session.roomId)}/policy`, {background: true, 
       credential: session.credential, signal, expected: [200],
     });
   }
@@ -437,13 +456,25 @@ export class RoomClient {
   }
 
   getArtifact(session, artifactId, signal) {
-    return this.request(`/rooms/${encodeURIComponent(session.roomId)}/artifacts/${encodeURIComponent(artifactId)}`, {
+    return this.request(`/rooms/${encodeURIComponent(session.roomId)}/artifacts/${encodeURIComponent(artifactId)}`, {background: true, 
       credential: session.credential, signal, expected: [200],
     });
   }
 
   // P9: exact-version binary read; redirects never receive the credential.
   async downloadArtifact(session, artifactId, versionId, mimeType, signal) {
+    // Contract P15-2: photo/document context is a background contact; a denial probes the own roster once.
+    const gate = this.participation;
+    if (gate) await gate.waitOpen(signal);
+    try {
+      return await this.downloadArtifactOnce(session, artifactId, versionId, mimeType, signal);
+    } catch (error) {
+      if (gate && (participationDenial(error) || error?.status === 403)) await gate.denied(signal).catch(() => {});
+      throw error;
+    }
+  }
+
+  async downloadArtifactOnce(session, artifactId, versionId, mimeType, signal) {
     const path = `/rooms/${encodeURIComponent(session.roomId)}/artifacts/${encodeURIComponent(artifactId)}/versions/${encodeURIComponent(versionId)}/download`;
     let response;
     try {
@@ -452,7 +483,7 @@ export class RoomClient {
     } catch (error) { throw transportFailure(error, signal); }
     if (response.status !== 200) {
       await response.body?.cancel?.();
-      throw new Error("Photo fetch failed");
+      throw Object.assign(new Error("Photo fetch failed"), {status: response.status});
     }
     const reader = response.body?.getReader?.();
     if (!reader) throw new Error("Photo stream unavailable");
@@ -474,7 +505,7 @@ export class RoomClient {
   }
 
   listArtifacts(session, signal) {
-    return this.request(`/rooms/${encodeURIComponent(session.roomId)}/artifacts`, {
+    return this.request(`/rooms/${encodeURIComponent(session.roomId)}/artifacts`, {background: true, 
       credential: session.credential, signal, expected: [200],
     });
   }
@@ -483,7 +514,7 @@ export class RoomClient {
     // Additive server route; older servers answer 404 or through their SPA
     // fallback. Callers treat any failure as "route unavailable" and fall
     // back to scanning discussion.started events.
-    return this.request(`/rooms/${encodeURIComponent(session.roomId)}/epochs`, {
+    return this.request(`/rooms/${encodeURIComponent(session.roomId)}/epochs`, {background: true, 
       credential: session.credential, signal, expected: [200],
     });
   }
@@ -495,13 +526,13 @@ export class RoomClient {
   }
 
   getDiscussionCycle(session, cycleId, signal) {
-    return this.request(`/rooms/${encodeURIComponent(session.roomId)}/cycles/${encodeURIComponent(cycleId)}`, {
+    return this.request(`/rooms/${encodeURIComponent(session.roomId)}/cycles/${encodeURIComponent(cycleId)}`, {background: true, 
       credential: session.credential, signal, expected: [200],
     });
   }
 
   claimDiscussionAttempt(session, cycleId, signal) {
-    return this.request(`/rooms/${encodeURIComponent(session.roomId)}/cycles/${encodeURIComponent(cycleId)}/claim`, {
+    return this.request(`/rooms/${encodeURIComponent(session.roomId)}/cycles/${encodeURIComponent(cycleId)}/claim`, {background: true, 
       method: "POST", credential: session.credential, signal, expected: [200],
     });
   }

@@ -8,6 +8,7 @@ import {dirname, join} from "node:path";
 import {RETRY_AFTER_MAXIMUM_SECONDS, RoomAPIError, RoomClient, RoomRequestError, RoomResponseError, RoomTransportError, roomErrorDiagnostic} from "./room-client.js";
 import {loadState, migrateStateFile, saveNewState, saveState} from "./state.js";
 import {activateRoomChannel} from "./activation.js";
+import {ParticipationGate} from "./participation.js";
 import {abandonRevokedPendingWork, abandonableEntries, staleInertState} from "./readmission.js";
 import {ROOM_CONNECTOR_PROVENANCE} from "./release-provenance.js";
 import {renewCredential} from "./credential-renewal.js";
@@ -753,6 +754,8 @@ export class OpenClawRoomRuntime {
     // P2c-3b: when an inactive membership's Room state was last read (0: active).
     this.inactiveRecheckMs = INACTIVE_RECHECK_MS;
     this.inactiveCheckedAt = 0;
+    // Contract P15-2/P15-3: one participation gate for this authenticated membership.
+    this.participation = new ParticipationGate({probe: (signal) => this.ownMembershipStatus(signal), recheckMs: () => this.inactiveRecheckMs});
     // Full passes of the event scan completed without a failure (P2c-3a reset).
     this.scanPasses = 0;
   }
@@ -814,6 +817,7 @@ export class OpenClawRoomRuntime {
     }
     await this.consumeEpochSessionRotation();
     this.client = new RoomClient({baseUrl: this.state.baseUrl, credential: this.state.credential, fetchImpl: this.fetchImpl});
+    this.client.participation = this.participation;
     rememberSecrets(this.state);
     this.reportStatus({connection: "connecting"});
     try {
@@ -1752,7 +1756,7 @@ export class OpenClawRoomRuntime {
       // one scan per turn under the P5-2 time bound; a found source and
       // not_found are remembered.
       const scan = await this.rememberedEpochScan("turnSourceEvents", turnSourceId, turnSourceId, Number(event?.seq),
-        contextEpoch.startsAtSeq, new Set(["message.posted"]), signal);
+        contextEpoch.startsAtSeq, MISSED_SOURCE_EVENT_TYPES, signal);
       if (scan.reason && scan.reason !== "not_found") {
         this.logger?.warn?.(`Room ${this.state.roomId} cycle source unavailable: ${scan.error?.message ?? scan.reason}`);
       }
@@ -1770,6 +1774,8 @@ export class OpenClawRoomRuntime {
       this.state.membershipId);
     const answered = new Set([String(event?.id ?? ""), String(sourceMessage?.id ?? ""), String(eventPayload(event?.payload).sourceEventId ?? "")]);
     const attemptReady = event?.type === "discussion.cycle_attempt_ready";
+    // Contract P15-3: an attempt-ready probes the own roster promptly while participation is paused.
+    if (attemptReady && this.participation?.paused) this.participation.probeOffer().catch(() => {});
     // Without a known start the durable missed sources and kept reply are
     // neither offered nor cleared (P6-2).
     const missed = startKnown
@@ -3532,10 +3538,13 @@ export class OpenClawRoomRuntime {
   // Contract P2c-3b: this membership's status in the Room roster, or "".
   async ownMembershipStatus(signal) {
     try {
-      const state = await this.client.roomState(this.state, signal);
+      const state = await this.client.roomState(this.state, signal, {probe: true});
       const entry = (Array.isArray(state?.roster) ? state.roster : [])
         .find((item) => item && typeof item === "object" && item.membershipId === this.state.membershipId);
-      return typeof entry?.status === "string" ? entry.status : "";
+      const status = typeof entry?.status === "string" ? entry.status : "";
+      // Contract P15-3: only this membership's own readable status moves the gate.
+      this.participation?.observe(status);
+      return status;
     } catch {
       return "";
     }
@@ -3831,6 +3840,8 @@ export class OpenClawRoomRuntime {
 
   async close() {
     this.closed = true;
+    // Contract P15-3: stop cancels paused background waits of this membership only.
+    this.participation?.close();
     connectorControl.detach(this);
     // A listener paused by connector control ends with the runtime.
     this.controlPause?.resume.resolve();
@@ -4322,7 +4333,7 @@ export function cycleSourceMessage(event, events) {
   const sourceEventId = String(eventPayload(event.payload).sourceEventId ?? "").trim();
   if (!sourceEventId) return null;
   return (Array.isArray(events) ? events : [])
-    .find((item) => item?.type === "message.posted" && String(item.id ?? "") === sourceEventId) ?? null;
+    .find((item) => MISSED_SOURCE_EVENT_TYPES.has(item?.type) && String(item.id ?? "") === sourceEventId) ?? null;
 }
 
 // The source message of a cycle attempt that is older than the loaded page.
@@ -4330,7 +4341,7 @@ export function cycleSourceMessage(event, events) {
 // walked backwards in pages of CONTEXT_SCAN_CHUNK, at most CONTEXT_SCAN_LIMIT
 // sequence numbers, never before the epoch start; the walk ends at the event
 // with that id, which counts only when it is a message (Hermes: same limits).
-export async function scanCycleSourceMessage(event, epochStartsAtSeq, readPage, types = new Set(["message.posted"])) {
+export async function scanCycleSourceMessage(event, epochStartsAtSeq, readPage, types = MISSED_SOURCE_EVENT_TYPES) {
   if (event?.type !== "discussion.cycle_attempt_ready") return null;
   const sourceEventId = String(eventPayload(event.payload).sourceEventId ?? "").trim();
   return scanEpochEvent(sourceEventId, event.seq, epochStartsAtSeq, readPage, types);
@@ -4401,7 +4412,8 @@ export async function countMessagesBetween(fromSeq, toSeq, readPage) {
 // "#<seq> <speaker label>: <body>", the body verbatim and unshortened.
 export function currentItemLine(message, label) {
   const payload = eventPayload(message?.payload);
-  const body = String(payload.body ?? payload.text ?? "").trim();
+  // Contract P15-1: an ask presents its instruction as current human input.
+  const body = message?.type === "human.command" ? commandInstruction(payload) : String(payload.body ?? payload.text ?? "").trim();
   if (!body) return "";
   const number = Number.isSafeInteger(message?.seq) && message.seq > 0 ? `#${message.seq} ` : "";
   return `${number}${label}: ${body}`;

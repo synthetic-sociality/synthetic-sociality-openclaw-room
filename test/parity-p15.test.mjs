@@ -56,7 +56,7 @@ test(CASES[0], () => {
 
 test(CASES[1], async () => {
   const reads = [];
-  const readPage = async (after) => (reads.push(after), {events: after < 40 && after >= 30 ? [ASK] : []});
+  const readPage = async (after) => (reads.push(after), {events: [ASK].filter((item) => item.seq > after)});
   const found = await scanCycleSourceMessage({...READY, seq: 90}, 10, readPage);
   assert.equal(found?.id, "evt-ask", "the bounded epoch scan finds an older ask");
   assert.ok(reads.every((after) => after >= 9), "never before the epoch floor");
@@ -67,7 +67,7 @@ test(CASES[2], async () => {
   const {gate} = gateFor(() => status);
   const {client: room, calls} = client(gate, (url) => Response.json(url.includes("/events") ? {events: []} : {}));
   gate.observe("muted");
-  const pending = Promise.all([room.readEvents(SESSION, 0, {wait: 1}), room.heartbeat(SESSION, "s-1"),
+  const pending = Promise.allSettled([room.readEvents(SESSION, 0, {wait: 1}), room.heartbeat(SESSION, "s-1"),
     room.publishActivity(SESSION, {kind: "heartbeat"}), room.acknowledge(SESSION, 3)]);
   await tick();
   assert.equal(calls.length, 0, "every background watcher waits while paused");
