@@ -86,6 +86,9 @@ export class LocalStatus {
     // membership's own connection state under that mark (P2c-4).
     this.inactive = new Set();
     this.connection = new Map();
+    // Contract P2c-4 (tkw-049 B01): the (Room, membership) pairs this process
+    // retired with forget; a later write for one of them is ignored.
+    this.retired = new Set();
     // Contract P17: the owner connector control receipt survives the process
     // (a restart reads it back); every other value starts fresh.
     try {
@@ -186,10 +189,14 @@ export class LocalStatus {
   // Contract P2c-4: a binding replaced by another membership (a re-admission
   // under a new membership id) or removed drops its entry and marks; the Room
   // summary is recomputed from the remaining entries, or dropped with the last.
+  // The membership stays retired: a late write for it, such as the old
+  // channel's teardown, never recreates the entry or moves the summary.
   forget(roomId, membershipId) {
     const roomKey = String(roomId ?? "");
     const key = String(membershipId ?? "");
-    if (!roomKey || !key || this.entries.get(key)?.roomId !== roomKey) return;
+    if (!roomKey || !key) return;
+    this.retired.add(JSON.stringify([roomKey, key]));
+    if (this.entries.get(key)?.roomId !== roomKey) return;
     this.entries.delete(key);
     delete this.data.memberships[key];
     this.outageStarted.delete(key);
@@ -206,6 +213,7 @@ export class LocalStatus {
     gateWaitSeconds, gateWaitReason, ledger} = {}) {
     if (!roomId) return;
     const roomKey = String(roomId);
+    if (membershipId && this.retired.has(JSON.stringify([roomKey, String(membershipId)]))) return;
     const key = this.entryKey(roomKey, String(membershipId ?? ""));
     if (key === null) return;
     let entry = this.entries.get(key);

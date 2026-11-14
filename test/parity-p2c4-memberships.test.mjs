@@ -252,8 +252,11 @@ test(CASES["P2c-4-M7"], async () => {
   data = await read(shared.path);
   assert.deepEqual(Object.keys(data.memberships), [AURA]);
   assert.deepEqual([data.rooms[ROOM].membershipId, data.rooms[ROOM].connection, data.rooms[ROOM].membershipIds], [AURA, "connected", [AURA]]);
+  assert.ok(![shared.status.inactive, shared.status.connection, shared.status.outageStarted].some((marks) => marks.has(CLAW)),
+    "the marks were dropped with the entry");
+  // P2c-4-M8: the retired membership does not come back.
   shared.status.room(ROOM, CLAW, {connected: true});
-  assert.equal((await read(shared.path)).memberships[CLAW].connection, "connected", "the inactive mark was dropped with the entry");
+  assert.equal((await read(shared.path)).memberships[CLAW], undefined);
   shared.status.forget(ROOM, CLAW);
   shared.status.forget(ROOM, AURA);
   data = await read(shared.path);
