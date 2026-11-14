@@ -4,11 +4,14 @@
 // (conformance parityP2c4MembershipCases).
 import assert from "node:assert/strict";
 import test from "node:test";
-import {mkdtemp, readFile, readdir} from "node:fs/promises";
+import {mkdir, mkdtemp, readFile, readdir} from "node:fs/promises";
 import {tmpdir} from "node:os";
 import {join} from "node:path";
 import {LocalStatus} from "../src/local-status.js";
-import {OpenClawRoomRuntime} from "../src/runtime.js";
+import {OpenClawRoomRuntime, resetEnrollmentLineages} from "../src/runtime.js";
+import {connectorControl} from "../src/connector-control.js";
+import {saveState} from "../src/state.js";
+import {resolvedRoomAccounts} from "../src/account-discovery.js";
 
 const conformance = JSON.parse(await readFile(new URL("../conformance.json", import.meta.url), "utf8"));
 const CASES = conformance.parityP2c4MembershipCases;
@@ -37,7 +40,7 @@ function account(accountId, membershipId, status) {
 
 test("conformance P2c-4 membership case names resolve to tests in this suite", async () => {
   const entries = Object.entries(CASES ?? {});
-  assert.deepEqual(entries.map(([id]) => id), ["P2c-4-M1", "P2c-4-M2", "P2c-4-M3", "P2c-4-M4", "P2c-4-M5", "P2c-4-M6"]);
+  assert.deepEqual(entries.map(([id]) => id), ["P2c-4-M1", "P2c-4-M2", "P2c-4-M3", "P2c-4-M4", "P2c-4-M5", "P2c-4-M6", "P2c-4-M7"]);
   const directory = new URL("./", import.meta.url);
   const sources = await Promise.all((await readdir(directory)).filter((name) => name.endsWith(".test.mjs"))
     .map((name) => readFile(new URL(name, directory), "utf8")));
@@ -185,4 +188,74 @@ test(CASES["P2c-4-M6"], async () => {
   data = await read(shared.path);
   assert.deepEqual(data.memberships, before.memberships);
   assert.deepEqual(data.rooms, before.rooms);
+});
+
+test(CASES["P2c-4-M7"], async () => {
+  // Re-admission under a new membership id (contract P2c-4, P18): the Room revoked member-2; the owner re-admits and
+  // the server returns member-3 for the same Room. member-2's stopped entry and its ledger are dropped, member-3
+  // starts its own entry and alone represents the Room.
+  const root = await mkdtemp(join(tmpdir(), "openclaw-room-members-readmit-"));
+  const previous = process.env.OPENCLAW_STATE_DIR;
+  process.env.OPENCLAW_STATE_DIR = root;
+  const directory = join(root, "synthetic-sociality-room", "accounts");
+  await mkdir(directory, {recursive: true, mode: 0o700});
+  const source = {version: 1, baseUrl: "https://room.example/api", roomId: "room-1", membershipId: "member-1",
+    credential: "secret-1", identityVersion: 3, clientInstanceId: "client-1", cursor: 5};
+  const sourceFile = join(directory, "default.json");
+  await saveState(sourceFile, source);
+  await saveState(join(directory, "member-2.json"), {...source, roomId: "room-2", membershipId: "member-2", credential: "secret-old",
+    cursor: 2645, revoked: true, revokedReason: "credential_revoked", revokedAt: "2026-11-12T09:40:00.000Z"});
+  const {path, status} = await freshStatus();
+  status.room("room-2", "member-2", {connected: true, registered: true});
+  status.room("room-2", "member-2", {ledger: {acknowledgedSeq: 40, holeSeqs: [42], quarantinedSeqs: [], ledgerCode: "ack_hole"}});
+  status.room("room-2", "member-2", {connection: "stopped", errorCode: "credential_revoked"});
+  const cfg = {channels: {"synthetic-sociality-room": {enabled: true, baseUrl: source.baseUrl, stateFile: sourceFile}}};
+  connectorControl.setAccounts(() => resolvedRoomAccounts(cfg));
+  const activations = [];
+  const runtime = new OpenClawRoomRuntime({accountId: "default", stateFile: sourceFile, baseUrl: source.baseUrl},
+    {status, activateEnrollment: async (activation) => { activations.push(activation.accountId); }});
+  runtime.state = {...source};
+  runtime.logger = {warn: () => {}, info: () => {}};
+  resetEnrollmentLineages();
+  runtime.client = {
+    connectorEnrollments: async () => [{invitationId: "invite-9", roomId: "room-2"}],
+    claimConnectorEnrollment: async () => ({roomId: "room-2", membershipId: "member-3", credential: "secret-fresh",
+      credentialExpiresAt: "2026-12-12T00:00:00Z", identityVersion: 3, headSeq: 2650}),
+  };
+  try {
+    await runtime.acceptConnectorEnrollments();
+  } finally {
+    connectorControl.setAccounts(() => []);
+    if (previous === undefined) delete process.env.OPENCLAW_STATE_DIR;
+    else process.env.OPENCLAW_STATE_DIR = previous;
+  }
+  assert.deepEqual(activations, ["member-3"]);
+  let data = await read(path);
+  assert.equal(data.memberships["member-2"], undefined, "the replaced membership's entry is dropped");
+  assert.equal(data.rooms["room-2"], undefined, "no entry remains, so no summary");
+  // The new membership's runtime reports: its own fresh values, and a Room-only value is attributed to it again.
+  status.room("room-2", "member-3", {connected: true, registered: true});
+  status.room("room-2", "", {gateWaitSeconds: 1.5});
+  data = await read(path);
+  assert.deepEqual(Object.keys(data.memberships), ["member-3"]);
+  const room = data.rooms["room-2"];
+  assert.deepEqual([room.membershipId, room.connection, room.lastErrorCode, room.acknowledgedSeq, room.holeSeqs, room.lastGateWaitSeconds,
+    room.membershipIds], ["member-3", "connected", "", 0, [], 1.5, ["member-3"]]);
+
+  // A removed binding: the summary is recomputed from the remaining entries and its marks go with the entry.
+  const shared = await freshStatus();
+  shared.status.room(ROOM, AURA, {connected: true, registered: true});
+  shared.status.room(ROOM, CLAW, {connected: true, registered: true});
+  shared.status.room(ROOM, CLAW, {connection: "inactive", inactive: true, errorCode: "connector_not_active"});
+  assert.equal((await read(shared.path)).rooms[ROOM].membershipId, CLAW);
+  shared.status.forget(ROOM, CLAW);
+  data = await read(shared.path);
+  assert.deepEqual(Object.keys(data.memberships), [AURA]);
+  assert.deepEqual([data.rooms[ROOM].membershipId, data.rooms[ROOM].connection, data.rooms[ROOM].membershipIds], [AURA, "connected", [AURA]]);
+  shared.status.room(ROOM, CLAW, {connected: true});
+  assert.equal((await read(shared.path)).memberships[CLAW].connection, "connected", "the inactive mark was dropped with the entry");
+  shared.status.forget(ROOM, CLAW);
+  shared.status.forget(ROOM, AURA);
+  data = await read(shared.path);
+  assert.deepEqual([data.memberships, data.rooms[ROOM]], [{}, undefined]);
 });
