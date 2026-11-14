@@ -30,6 +30,7 @@ deterministic text backfill for older pending versions.
 Version 0.2.83 (contract P2c-4, tkw-049): `status.json` keeps each (Room,
 membership) in its own `memberships` entry; the `rooms` entry is a deterministic
 per-Room summary, advisory when one gateway holds several memberships in a Room.
+A re-admission under a new membership id drops the old membership's entry.
 
 Version 0.2.82 (parity with Hermes H107-P-005): a muted start no longer spends a
 durable lifecycle retry attempt that the participation gate refuses without Room
