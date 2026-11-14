@@ -40,7 +40,7 @@ function account(accountId, membershipId, status) {
 
 test("conformance P2c-4 membership case names resolve to tests in this suite", async () => {
   const entries = Object.entries(CASES ?? {});
-  assert.deepEqual(entries.map(([id]) => id), ["P2c-4-M1", "P2c-4-M2", "P2c-4-M3", "P2c-4-M4", "P2c-4-M5", "P2c-4-M6", "P2c-4-M7"]);
+  assert.deepEqual(entries.map(([id]) => id), ["P2c-4-M1", "P2c-4-M2", "P2c-4-M3", "P2c-4-M4", "P2c-4-M5", "P2c-4-M6", "P2c-4-M7", "P2c-4-M8"]);
   const directory = new URL("./", import.meta.url);
   const sources = await Promise.all((await readdir(directory)).filter((name) => name.endsWith(".test.mjs"))
     .map((name) => readFile(new URL(name, directory), "utf8")));
