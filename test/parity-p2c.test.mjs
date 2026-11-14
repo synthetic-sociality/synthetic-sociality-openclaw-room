@@ -71,6 +71,7 @@ function appendixKeys() {
 function flattenKeys(value) {
   const keys = new Set(Object.keys(value));
   for (const entry of Object.values(value.rooms ?? {})) for (const key of Object.keys(entry)) keys.add(`rooms.<id>.${key}`);
+  for (const entry of Object.values(value.memberships ?? {})) for (const key of Object.keys(entry)) keys.add(`memberships.<id>.${key}`);
   return keys;
 }
 
