@@ -27,6 +27,10 @@ content. P9 separately hands verified photo bytes to the host; the connector
 never executes uploaded content. An exact artifact read also invokes the Room server's supported
 deterministic text backfill for older pending versions.
 
+Version 0.2.83 (contract P2c-4, tkw-049): `status.json` keeps each (Room,
+membership) in its own `memberships` entry; the `rooms` entry is a deterministic
+per-Room summary, advisory when one gateway holds several memberships in a Room.
+
 Version 0.2.82 (parity with Hermes H107-P-005): a muted start no longer spends a
 durable lifecycle retry attempt that the participation gate refuses without Room
 contact; the pending turn or cycle lifecycle completes at the next active start.
