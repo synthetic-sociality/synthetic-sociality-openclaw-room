@@ -183,6 +183,23 @@ export class LocalStatus {
     this.data.rooms[roomId] = {...fields, membershipIds: entries.map((entry) => entry.membershipId).filter(Boolean).sort()};
   }
 
+  // Contract P2c-4: a binding replaced by another membership (a re-admission
+  // under a new membership id) or removed drops its entry and marks; the Room
+  // summary is recomputed from the remaining entries, or dropped with the last.
+  forget(roomId, membershipId) {
+    const roomKey = String(roomId ?? "");
+    const key = String(membershipId ?? "");
+    if (!roomKey || !key || this.entries.get(key)?.roomId !== roomKey) return;
+    this.entries.delete(key);
+    delete this.data.memberships[key];
+    this.outageStarted.delete(key);
+    this.connection.delete(key);
+    this.inactive.delete(key);
+    delete this.data.rooms[roomKey];
+    this.summarize(roomKey);
+    this.write();
+  }
+
   // Update one membership's entry and its Room summary; write only when
   // something changed.
   room(roomId, membershipId = "", {connection, errorCode, connected = false, registered = false, inactive,

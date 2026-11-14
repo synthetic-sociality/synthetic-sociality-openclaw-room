@@ -3836,6 +3836,11 @@ export class OpenClawRoomRuntime {
         await saveState(stateFile, nextState);
         this.logger?.info?.(`Replaced the stale binding of re-admitted Room ${roomId}`);
       }
+      // Contract P2c-4: a re-admission under a new membership id replaces the
+      // held binding; its status entry no longer represents the Room.
+      if (heldForRoom?.membershipId && heldForRoom.membershipId !== membershipId) {
+        this.status?.forget(String(heldForRoom.roomId ?? roomId), String(heldForRoom.membershipId));
+      }
       if (configDisabledFresh) {
         this.logger?.warn?.(listedNow
           ? `Room ${roomId} is operator-disabled in the host config; the claimed credential is saved privately and the account is not activated`
