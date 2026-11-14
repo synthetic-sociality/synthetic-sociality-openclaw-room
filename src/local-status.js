@@ -11,6 +11,9 @@ import {dirname, join, resolve} from "node:path";
 
 export const STATUS_SCHEMA = "synthetic-sociality-room-status-v1";
 const CONNECTION_STATES = new Set(["connecting", "connected", "reconnecting", "inactive", "stopped"]);
+// Contract P2c-4 (tkw-049): the `rooms` summary takes the membership whose
+// connection is worst in this order, ties by the smallest membership id.
+const CONNECTION_ORDER = ["stopped", "reconnecting", "connecting", "inactive", "connected"];
 // Contract P2c-6: the tool names that count as web reading (Hermes
 // WEB_READ_TOOL_NAMES, the same list).
 export const WEB_READ_TOOL_NAMES = Object.freeze(["browser", "browser_navigate", "web_extract", "web_fetch", "web_search"]);
@@ -70,12 +73,17 @@ export class LocalStatus {
       webReadTools: [],
       documentTool: "unknown",
       rooms: {},
+      memberships: {},
     };
-    // Contract P2c-3a: when the current outage of a Room began (process
-    // memory only; never written).
+    // Contract P2c-4 (tkw-049): one entry per (Room, membership), keyed by
+    // membership id; an entry whose membership is not known yet is kept
+    // under "room:<roomId>" and never written to `memberships`.
+    this.entries = new Map();
+    // Contract P2c-3a: when the current outage of a membership began
+    // (process memory only; never written).
     this.outageStarted = new Map();
-    // Contract P2c-3b: Rooms whose membership is inactive (muted), and each
-    // Room's own connection state under that mark (P2c-4).
+    // Contract P2c-3b: memberships that are inactive (muted), and each
+    // membership's own connection state under that mark (P2c-4).
     this.inactive = new Set();
     this.connection = new Map();
     // Contract P17: the owner connector control receipt survives the process
@@ -137,30 +145,77 @@ export class LocalStatus {
     this.write();
   }
 
-  // Update one Room entry; write only when something changed.
+  // The internal key of a (Room, membership): the membership id, or, while
+  // no membership is known for that Room, a provisional "room:<roomId>".
+  entryKey(roomId, membershipId) {
+    if (membershipId) {
+      const provisional = `room:${roomId}`;
+      const adopted = this.entries.get(provisional);
+      if (adopted && !this.entries.has(membershipId)) {
+        // The provisional entry becomes the membership's own.
+        this.entries.delete(provisional);
+        adopted.membershipId = membershipId;
+        this.entries.set(membershipId, adopted);
+        this.data.memberships[membershipId] = adopted;
+        for (const map of [this.outageStarted, this.connection]) {
+          if (map.has(provisional)) map.set(membershipId, map.get(provisional));
+          map.delete(provisional);
+        }
+        if (this.inactive.delete(provisional)) this.inactive.add(membershipId);
+      }
+      return membershipId;
+    }
+    // A value without a membership id belongs to the Room's only membership;
+    // with several it is not attributed (null).
+    const known = [...this.entries.entries()].filter(([, entry]) => entry.roomId === roomId);
+    if (known.length > 1) return null;
+    return known[0]?.[0] ?? `room:${roomId}`;
+  }
+
+  // Contract P2c-4 (tkw-049): the `rooms` entry, derived from that Room's
+  // membership entries alone, never from the order of writes.
+  summarize(roomId) {
+    const entries = [...this.entries.values()].filter((entry) => entry.roomId === roomId).sort((a, b) =>
+      CONNECTION_ORDER.indexOf(a.connection) - CONNECTION_ORDER.indexOf(b.connection)
+      || (a.membershipId < b.membershipId ? -1 : a.membershipId > b.membershipId ? 1 : 0));
+    if (!entries.length) return;
+    const {roomId: _room, ...fields} = structuredClone(entries[0]);
+    this.data.rooms[roomId] = {...fields, membershipIds: entries.map((entry) => entry.membershipId).filter(Boolean).sort()};
+  }
+
+  // Update one membership's entry and its Room summary; write only when
+  // something changed.
   room(roomId, membershipId = "", {connection, errorCode, connected = false, registered = false, inactive,
     gateWaitSeconds, gateWaitReason, ledger} = {}) {
     if (!roomId) return;
-    const entry = this.data.rooms[roomId] ??= {
-      membershipId: String(membershipId ?? ""),
-      connection: "connecting",
-      lastConnectedAt: null,
-      lastErrorCode: "",
-      lastErrorAt: null,
-      lastGateWaitSeconds: 0,
-      lastGateWaitAt: null,
-      lastGateWaitReason: "",
-      lastReconnectedAt: null,
-      lastOutageSeconds: 0,
-      acknowledgedSeq: 0,
-      holeSeqs: [],
-      quarantinedSeqs: [],
-      ledgerCode: "",
-    };
-    const before = JSON.stringify({...entry, lastConnectedAt: null});
+    const roomKey = String(roomId);
+    const key = this.entryKey(roomKey, String(membershipId ?? ""));
+    if (key === null) return;
+    let entry = this.entries.get(key);
+    if (!entry) {
+      entry = {
+        roomId: roomKey,
+        membershipId: key.startsWith("room:") ? "" : key,
+        connection: "connecting",
+        lastConnectedAt: null,
+        lastErrorCode: "",
+        lastErrorAt: null,
+        lastGateWaitSeconds: 0,
+        lastGateWaitAt: null,
+        lastGateWaitReason: "",
+        lastReconnectedAt: null,
+        lastOutageSeconds: 0,
+        acknowledgedSeq: 0,
+        holeSeqs: [],
+        quarantinedSeqs: [],
+        ledgerCode: "",
+      };
+      this.entries.set(key, entry);
+      if (entry.membershipId) this.data.memberships[key] = entry;
+    }
+    const unstamped = () => JSON.stringify([{...entry, lastConnectedAt: null}, {...this.data.rooms[roomKey], lastConnectedAt: null}]);
+    const before = unstamped();
     const connectedBefore = entry.lastConnectedAt;
-    if (membershipId) entry.membershipId = String(membershipId);
-    const key = String(roomId);
     // Contract P2c-4: `connection` is the connection's own state, with
     // `inactive` shown over `connected` only while the membership is muted
     // (P2c-3b); `stopped` and `reconnecting` win over it. A stop or a new
@@ -203,7 +258,8 @@ export class LocalStatus {
       entry.lastGateWaitAt = now();
       entry.lastGateWaitReason = GATE_WAIT_REASONS.has(gateWaitReason) ? gateWaitReason : "";
     }
-    if (JSON.stringify({...entry, lastConnectedAt: null}) !== before) this.write();
+    this.summarize(roomKey);
+    if (unstamped() !== before) this.write();
     else if (entry.lastConnectedAt !== connectedBefore) this.writeConnectedAt();
   }
 

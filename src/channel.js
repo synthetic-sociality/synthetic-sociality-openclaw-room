@@ -345,7 +345,7 @@ export function createRoomChannel({makeClient}) {
             // P2c-4 (ISSUE-023): the coded reason when the event arrived while an
             // earlier host run of this account still held the session.
             const waitedOnHost = Number.isFinite(event.occurredAt) && event.occurredAt < lastHostRunEndedAt;
-            localStatus.room(String(event.roomId ?? ""), "", {gateWaitSeconds: sinceRoomEvent, gateWaitReason: waitedOnHost ? "host_run_busy" : ""});
+            localStatus.room(String(event.roomId ?? ""), String(client?.state?.membershipId ?? ""), {gateWaitSeconds: sinceRoomEvent, gateWaitReason: waitedOnHost ? "host_run_busy" : ""});
             try {
               await runtime.inbound.run({
               channel: ID,
@@ -547,7 +547,7 @@ export function createRoomChannel({makeClient}) {
         } catch (error) {
           if (!ctx.abortSignal.aborted) {
             ctx.setStatus({...ctx.getStatus(), connected: false, lastError: `Room channel stopped unexpectedly${roomErrorDiagnostic(error)}`});
-            if (client?.state?.roomId) localStatus.room(String(client.state.roomId), "", {errorCode: statusErrorCode(error)});
+            if (client?.state?.roomId) localStatus.room(String(client.state.roomId), String(client.state.membershipId ?? ""), {errorCode: statusErrorCode(error)});
             throw error;
           }
         } finally {
