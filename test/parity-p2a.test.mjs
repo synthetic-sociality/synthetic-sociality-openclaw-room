@@ -28,6 +28,9 @@ const {RoomAPIError} = await import("../src/room-client.js");
 
 const conformance = JSON.parse(await readFile(new URL("../conformance.json", import.meta.url), "utf8"));
 const home = await mkdtemp(join(tmpdir(), "openclaw-room-p2a-"));
+// Remedy r1 (N2 item 4): the channel starts below write under the OpenClaw
+// state directory; keep it inside this suite's own home.
+process.env.OPENCLAW_STATE_DIR = join(home, ".openclaw");
 after(() => rm(home, {recursive: true, force: true}));
 // The P1a-01 deny-list: connector-authored text never carries these.
 const DENY = ["consensus", "common ground", "synthes", "otherwise pass", "only if", "meaningful", "manufacture", "do not repeat", "force", "agree"];
