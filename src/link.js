@@ -107,10 +107,13 @@ export class LinkError extends Error {
   }
 }
 
+// `reason`, when set, is the open-failure reason that overrides the one the
+// code maps to (contract: open-failure reason), e.g. `open_timeout`.
 export class LocalGatewayError extends Error {
-  constructor(code) {
+  constructor(code, reason = "") {
     super(code);
     this.code = code;
+    this.reason = reason;
   }
 }
 
@@ -752,7 +755,9 @@ export async function openLocalGateway({cfg, env = process.env, maxDataBytes = F
     socket = await connect(`ws://${hostUrl(host)}:${port}/`, {maxMessageBytes: Math.max(maxDataBytes, GATEWAY_PREAUTH_BYTES), timeoutMs});
   } catch (error) {
     const status = error instanceof WebSocketRefused ? error.status : 0;
-    throw new LocalGatewayError(status === 401 || status === 403 || (status >= 300 && status < 400) ? "local_gateway_refused" : "local_gateway_unavailable");
+    const timedOut = error instanceof WebSocketRefused && status === 0 && error.reason === "timeout";
+    throw new LocalGatewayError(status === 401 || status === 403 || (status >= 300 && status < 400) ? "local_gateway_refused" : "local_gateway_unavailable",
+      timedOut ? "open_timeout" : "");
   }
   return await new Promise((resolve, reject) => {
     const id = `link-connect-${randomUUID()}`;
@@ -794,7 +799,7 @@ export async function openLocalGateway({cfg, env = process.env, maxDataBytes = F
       }
     };
     const onClose = (code) => finish(new LocalGatewayError(code === 1008 || code === 4401 || code === 4403 ? "local_gateway_refused" : "local_gateway_unavailable"));
-    const timer = setTimeout(() => finish(new LocalGatewayError("local_gateway_unavailable")), timeoutMs);
+    const timer = setTimeout(() => finish(new LocalGatewayError("local_gateway_unavailable", "open_timeout")), timeoutMs);
     timer.unref?.();
     socket.on("message", onMessage);
     socket.on("close", onClose);
@@ -818,6 +823,25 @@ export function readLimits(complete) {
     }
   }
   return {limits, source: used ? "advertised" : "fallback"};
+}
+
+// Contract, open-failure reason: a Harness that accepts `reason` in
+// openclaw-open-failed advertises `limits.openFailedReason: 1`. Any other
+// value or none (an older Harness with a strict schema) means no `reason`.
+export function readOpenFailedReason(complete) {
+  const advertised = isObject(complete) ? complete.limits : undefined;
+  return isObject(advertised) && advertised.openFailedReason === 1;
+}
+
+// The closed list of the contract, in its order.
+export const OPEN_FAILED_REASONS = Object.freeze(["local_gateway_refused", "local_gateway_auth_unavailable", "local_gateway_unavailable",
+  "link_blocked_by_site_protection", "channel_limit", "open_timeout", "unknown"]);
+
+// One code of the closed list for a failed local open; never upstream text.
+export function openFailedReasonFor(error) {
+  if (!(error instanceof LocalGatewayError)) return "unknown";
+  const reason = error.reason || error.code;
+  return OPEN_FAILED_REASONS.includes(reason) ? reason : "unknown";
 }
 
 // The fixed close table of contract L1-8: [status code, action].
@@ -998,7 +1022,7 @@ class LinkChannel {
     const opening = Promise.resolve().then(() => this.bridge.localOpener(limits));
     let timer;
     const timeout = new Promise((_, reject) => {
-      timer = setTimeout(() => reject(new LocalGatewayError("local_gateway_unavailable")), limits.openTimeoutMs);
+      timer = setTimeout(() => reject(new LocalGatewayError("local_gateway_unavailable", "open_timeout")), limits.openTimeoutMs);
       timer.unref?.();
     });
     let opened;
@@ -1008,7 +1032,7 @@ class LinkChannel {
       opening.then((late) => late?.socket?.terminate(), () => {});
       if (this.ended) return;
       this.bridge.channelError(error instanceof LocalGatewayError ? error.code : "local_gateway_unavailable");
-      this.bridge.end(this, "openclaw-open-failed");
+      this.bridge.end(this, "openclaw-open-failed", openFailedReasonFor(error));
       return;
     } finally {
       clearTimeout(timer);
@@ -1112,10 +1136,11 @@ class LinkChannel {
 
 // The channels of one authenticated device socket (L1-6, L1o-4).
 export class LinkBridge {
-  constructor(socket, limits, localOpener, {onChange = () => {}, onChannelError = () => {}} = {}) {
+  constructor(socket, limits, localOpener, {onChange = () => {}, onChannelError = () => {}, openFailedReason = false} = {}) {
     this.socket = socket;
     this.limits = limits;
     this.localOpener = localOpener;
+    this.openFailedReason = openFailedReason;
     this.channels = new Map();
     this.onChange = onChange;
     this.onChannelError = onChannelError;
@@ -1135,15 +1160,22 @@ export class LinkBridge {
     return true;
   }
 
+  // openclaw-open-failed, with `reason` only when the Harness advertised it.
+  openFailedFrame(channelId, reason) {
+    const value = frame("openclaw-open-failed", channelId);
+    if (this.openFailedReason) value.reason = OPEN_FAILED_REASONS.includes(reason) ? reason : "unknown";
+    return value;
+  }
+
   // End a channel from this side, telling the server once.
-  end(channel, kind) {
+  end(channel, kind, reason) {
     if (channel.ended) return;
     channel.ended = true;
     if (this.channels.get(channel.id) === channel) {
       this.channels.delete(channel.id);
       this.onChange();
     }
-    try { this.send(frame(kind, channel.id)); } catch {}
+    try { this.send(kind === "openclaw-open-failed" ? this.openFailedFrame(channel.id, reason) : frame(kind, channel.id)); } catch {}
     channel.closeLocal();
   }
 
@@ -1170,7 +1202,7 @@ export class LinkBridge {
       }
       if (this.channels.size >= this.limits.maxChannels) {
         this.channelError("channel_cap");
-        this.send(frame("openclaw-open-failed", channelId));
+        this.send(this.openFailedFrame(channelId, "channel_limit"));
         return;
       }
       const opened = new LinkChannel(this, channelId);
@@ -1618,6 +1650,7 @@ export class LinkService {
         this.bridge = new LinkBridge(socket, limits, this.localOpener, {
           onChange: () => this.set({channels: this.bridge ? this.bridge.channels.size : 0}),
           onChannelError: (code) => this.set({lastChannelErrorCode: code}),
+          openFailedReason: readOpenFailedReason(value),
         });
         phase = "serving";
         serve(limits);
