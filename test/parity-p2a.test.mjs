@@ -478,3 +478,11 @@ test("L1-25 a 401 or 403 cycle-start refusal is a session failure, never a skipp
   const {MISSED_SOURCE_EVENT_TYPES} = await import("../src/runtime.js");
   assert.equal(MISSED_SOURCE_EVENT_TYPES.has("discussion.started"), false);
 });
+
+// Remedy r1 (N2 item 4): the channel starts above write the status file
+// under the OpenClaw state directory; never under the real ~/.openclaw.
+test("the suite's Room status and link store stay inside its own home", async () => {
+  const {roomStatusPath} = await import("../src/channel.js");
+  const {linkPath} = await import("../src/link.js");
+  for (const path of [roomStatusPath(ISOLATED_HOST_CONFIG), linkPath()]) assert.ok(path.startsWith(home), path);
+});
