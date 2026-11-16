@@ -33,7 +33,13 @@ OpenClaw card; the gateway dials out (no inbound port, Tailscale or tunnel) and
 serves their seats through its own loopback connection, admitting only
 `sessions.list`, `chat.history`, `chat.send` and `chat.abort`. Shared cases
 L1-01 to L1-14, L1-20 and L1-21 are implemented. See "Link OpenClaw to your
-Harness" below.
+Harness" below. Contract P11b-3 (the Cloudflare 1010 lesson): the link sends
+`User-Agent: openclaw-room-link/<version>` on the pairing confirmation and the
+device socket (the Room client keeps `synthetic-sociality-openclaw/1.0`); a
+refusal by the site's bot protection is reported as
+`link_blocked_by_site_protection` with a plain reason and stays pending; a
+pairing 404 after a lost confirmation links when a signed connect with the
+pending key completes.
 
 Version 0.2.83 (contract P2c-4, tkw-049): `status.json` keeps each (Room,
 membership) in its own `memberships` entry; the `rooms` entry is a deterministic
