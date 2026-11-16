@@ -1276,3 +1276,11 @@ test("P7d round 3 (OpenClaw): account ids compare in the host's normalised form;
     assert.ok(!(outside.choices ?? []).some((item) => ["throws", "empty"].includes(item.accountId)));
   }
 });
+
+// Remedy r1 (N2 item 4): the full registrations above start the status file
+// and the link service; neither lands under the real ~/.openclaw, also when
+// the environment names a state directory.
+test("the suite's Room status and link store stay inside its own home", async () => {
+  const {linkPath} = await import("../src/link.js");
+  for (const path of [channelModule.roomStatusPath(ISOLATED_HOST_CONFIG), linkPath()]) assert.ok(path.startsWith(home), path);
+});

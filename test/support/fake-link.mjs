@@ -43,16 +43,25 @@ function verifySignature(spkiBase64, bytes, signatureBase64) {
 
 // The Harness side. `confirmation(request)` returns {status, body} for a
 // pairing confirmation; `connectStatus` refuses the upgrade with that status.
+// `edge(request)` stands in front of both (a site's bot protection): it
+// returns {status, headers, text} to answer instead of the Harness, or null.
 export async function fakeHarness({limits = {maxDataBytes: 4096, openTimeoutMs: 2000, maxChannels: 2}, confirmation, connectStatus = 0,
-  connectHeaders = {}, challenge = (fields) => fields, autoPong = true, completeExtra = {}} = {}) {
+  connectHeaders = {}, challenge = (fields) => fields, autoPong = true, completeExtra = {}, edge} = {}) {
   const sockets = new Set();
-  const state = {confirmations: [], upgrades: [], devices: [], keys: new Map(), connectStatus, connectHeaders};
+  const state = {confirmations: [], upgrades: [], devices: [], keys: new Map(), connectStatus, connectHeaders, edge, edged: []};
   const server = http.createServer((request, response) => {
     const chunks = [];
     request.on("data", (chunk) => chunks.push(chunk));
     request.on("end", () => {
       const raw = Buffer.concat(chunks).toString("utf8");
       const entry = {method: request.method, url: request.url, headers: request.headers, raw};
+      const blocked = state.edge?.(request) ?? null;
+      if (blocked) {
+        state.edged.push({kind: "http", headers: request.headers});
+        response.writeHead(blocked.status, blocked.headers ?? {});
+        response.end(blocked.text ?? "");
+        return;
+      }
       state.confirmations.push(entry);
       let body = null;
       try { body = JSON.parse(raw); } catch {}
@@ -79,6 +88,14 @@ export async function fakeHarness({limits = {maxDataBytes: 4096, openTimeoutMs: 
   });
   server.on("upgrade", (request, socket, head) => {
     const url = new URL(request.url, "http://127.0.0.1");
+    const blocked = state.edge?.(request) ?? null;
+    if (blocked) {
+      state.edged.push({kind: "upgrade", headers: request.headers});
+      const text = blocked.text ?? "";
+      const headers = Object.entries(blocked.headers ?? {}).map(([key, value]) => `${key}: ${value}\r\n`).join("");
+      socket.end(`HTTP/1.1 ${blocked.status} Forbidden\r\n${headers}Content-Length: ${Buffer.byteLength(text)}\r\nConnection: close\r\n\r\n${text}`);
+      return;
+    }
     state.upgrades.push({url: request.url, headers: request.headers});
     if (state.connectStatus) {
       const headers = Object.entries(state.connectHeaders).map(([key, value]) => `${key}: ${value}\r\n`).join("");

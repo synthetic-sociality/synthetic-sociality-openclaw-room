@@ -43,6 +43,7 @@ registerHooks({
 });
 const {createRoomChannel} = await import("../src/channel.js");
 
+
 const conformance = JSON.parse(await readFile(new URL("../conformance.json", import.meta.url), "utf8"));
 // Room-supplied text: the Open Exchange preamble as an owner would save it.
 const PREAMBLE = await readFile(new URL("./fixtures/open-exchange-preamble/v1.txt", import.meta.url), "utf8");
@@ -832,4 +833,12 @@ test("a failed old-source read leaves the turn without the current item and lose
   // One warning, Hermes' wording, the safe diagnostic and never a body.
   assert.deepEqual(warnings, ["Room room-1 cycle source unavailable: Room API request failed (status=503)"]);
   assert.ok(!warnings.join("").includes("@Zurie"));
+});
+
+// Remedy r1 (N2 item 4): no status or link store of this suite lands under
+// the real ~/.openclaw; the channel's start writes the status file.
+test("the suite's Room status and link store stay inside its own state directory", async () => {
+  const {roomStatusPath} = await import("../src/channel.js");
+  const {linkPath} = await import("../src/link.js");
+  for (const path of [roomStatusPath(ISOLATED_HOST_CONFIG), linkPath()]) assert.ok(path.startsWith(TEST_STATE_DIRECTORY), path);
 });
