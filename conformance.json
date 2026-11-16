@@ -179,6 +179,8 @@
     }
   },
   "parityL1Contract": "docs/delivery-lifecycle-contract-v1.md#l1--device-link-2026-10-03",
+  "parityL1oContract": "docs/delivery-lifecycle-contract-v1.md#l1o--openclaw-device-link-2026-11-16",
+  "parityL1oAdmittedMethods": ["sessions.list", "chat.history", "chat.send", "chat.abort"],
   "parityL1Specs": {
     "SPEC-20261003-hermes-link-L1.md": "3bc145d2e0c40f56c4af091d52cbd13977133b75181ad2f8483251cadb17186d",
     "SPEC-20261003-hermes-link-L1-addendum-G2-G8-G10.md": "c22acadc72e95c168456a745468a18c47e6f5c5a40545093e3c782dbd9d27c64"
@@ -1330,7 +1332,8 @@
     "Appendix": "3184213bcf7df5a6c9d01602e1ff48d36584f447ad2a09bcf3307b2bf89d2315",
     "P7c": "4919916e3f97e48c9f1e39f6e990eeba4ea80ee11e40e894396664a8445441cc",
     "P7d": "a6f2bfb6f38ab2e01cb0879bc8d7f576cf83c87b31cbe14dbb7468237d9b3c44",
-    "P8": "7a73e25bf27415134b884bfa18affcda6f0f8fb692bee1f9058ac6a1542f289d"
+    "P8": "7a73e25bf27415134b884bfa18affcda6f0f8fb692bee1f9058ac6a1542f289d",
+    "L1o": "115973d9666e53f0df7b6dc929e08258ec62be55fd638bc06fd7c7f6a07d70ab"
   },
   "issue106Cases": {
     "fixture": "test/fixtures/issue-106.json",
@@ -1648,5 +1651,5 @@
   "statusReadinessCases": [
     "STATUS-01 status.json carries every updater readiness field with the shared names and types"
   ],
-  "contractSha256": "5ac819a7417660018177e0a635215110457cb6c6eea1e1d0abab33924f968260"
+  "contractSha256": "6c0ad2f06747e8dee62200c03f03de4d75e4f7dfa9d33287419e348a089482a8"
 }
