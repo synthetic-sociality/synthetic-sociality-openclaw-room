@@ -29,6 +29,7 @@ import {dirname, join} from "node:path";
 import {assertStateDirectoryPath, openClawStateDirectory} from "./state.js";
 import {STORE_DIRECTORY_NAME, rememberSecretValues, scrubbingLogger} from "./secret-isolation.js";
 import {WebSocketRefused, connectWebSocket} from "./link-socket.js";
+import {ROOM_CONNECTOR_PROVENANCE} from "./release-provenance.js";
 
 export const TOKEN_PREFIX = "twoc1.";
 export const MAX_TOKEN_LENGTH = 4096;
@@ -478,6 +479,36 @@ export function pendingRecord(token, {label = deviceLabel(), seed = newPrivateSe
   };
 }
 
+// --- P11b-3: the link's User-Agent and the site's bot protection ------------------------
+
+// Every link request to the Harness origin names the link product and its
+// version, never the runtime library's default (Cloudflare's Browser
+// Integrity Check refuses that with 403 `error code: 1010`). The loopback
+// requests to the local Gateway are unchanged.
+export function linkUserAgent(version = ROOM_CONNECTOR_PROVENANCE.version) {
+  return `openclaw-room-link/${String(version || ROOM_CONNECTOR_PROVENANCE.version)}`;
+}
+
+// A 403 from the site's bot protection rather than from the Harness: the
+// 1010 body, or a Cloudflare 403 without the Harness JSON error.
+export function blockedBySiteProtection(status, headers = {}, text = "") {
+  if (status !== 403) return false;
+  const body = String(text ?? "");
+  if (body.includes("error code: 1010")) return true;
+  const header = (name) => {
+    const value = headers?.[name] ?? headers?.[name.toLowerCase()];
+    return Array.isArray(value) ? value.join(",") : String(value ?? "");
+  };
+  const cloudflare = /cloudflare/iu.test(header("server")) || Boolean(header("cf-ray"));
+  if (!cloudflare) return false;
+  try {
+    const parsed = JSON.parse(body);
+    return !(isObject(parsed) && typeof parsed.error === "string" && parsed.error);
+  } catch {
+    return true;
+  }
+}
+
 // --- L1-2: pairing confirmation ---------------------------------------------------------
 
 // 404: the token is spent, expired or invalid; never retried.
@@ -505,8 +536,9 @@ export function confirmationBody(record) {
   return body;
 }
 
-// One POST, no redirect, no proxy, no cookie, no Authorization: {status, payload}.
-export function postJson(url, body, {timeoutMs = 15_000} = {}) {
+// One POST, no redirect, no proxy, no cookie, no Authorization, the link's
+// own User-Agent (P11b-3): {status, headers, payload}.
+export function postJson(url, body, {timeoutMs = 15_000, userAgent = linkUserAgent()} = {}) {
   return new Promise((resolve, reject) => {
     const target = new URL(url);
     const secure = target.protocol === "https:";
@@ -517,7 +549,7 @@ export function postJson(url, body, {timeoutMs = 15_000} = {}) {
       path: target.pathname,
       method: "POST",
       agent: false,
-      headers: {"Content-Type": "application/json", Accept: "application/json", "Content-Length": String(body.length)},
+      headers: {"Content-Type": "application/json", Accept: "application/json", "Content-Length": String(body.length), "User-Agent": userAgent},
     }, (response) => {
       const chunks = [];
       let size = 0;
@@ -525,7 +557,7 @@ export function postJson(url, body, {timeoutMs = 15_000} = {}) {
         if (size < 65_536) chunks.push(chunk);
         size += chunk.length;
       });
-      response.on("end", () => resolve({status: response.statusCode ?? 0, payload: Buffer.concat(chunks).subarray(0, 65_536)}));
+      response.on("end", () => resolve({status: response.statusCode ?? 0, headers: response.headers, payload: Buffer.concat(chunks).subarray(0, 65_536)}));
       response.on("error", () => reject(new Error("response")));
     });
     const timer = setTimeout(() => request.destroy(new Error("timeout")), timeoutMs);
@@ -537,15 +569,20 @@ export function postJson(url, body, {timeoutMs = 15_000} = {}) {
 }
 
 // POST the signed confirmation once. 201 → the server's view.
-export async function sendConfirmation(record, {post = postJson} = {}) {
+export async function sendConfirmation(record, {post = postJson, version} = {}) {
   const [, url] = deriveUrls(record.audience, record.deviceId);
   let status;
+  let headers;
   let payload;
   try {
-    ({status, payload} = await post(url, confirmationBody(record)));
+    ({status, headers, payload} = await post(url, confirmationBody(record), {userAgent: linkUserAgent(version)}));
   } catch (error) {
     if (error instanceof LinkError) throw error;
     throw new ConfirmationRetry("link_connection_lost");
+  }
+  // P11b-3: refused by the site's bot protection before the Harness; stays pending.
+  if (blockedBySiteProtection(status, headers, Buffer.isBuffer(payload) ? payload.toString("utf8") : String(payload ?? ""))) {
+    throw new ConfirmationRetry("link_blocked_by_site_protection");
   }
   if (status === 404) throw new ConfirmationRefused();
   // A redirect is answered as the refusal it is, never followed (L1-1).
@@ -590,7 +627,8 @@ function retire(record, state, path) {
 // `active`, `pending` (retry later), `refused`, `expired`, or `none` when
 // nothing is pending. link.json is replaced only after the 201, so a failed
 // re-link leaves a working link as it was (L1-9).
-export async function confirmPending({path = linkPath(), now = Date.now, sender = sendConfirmation, blocking = true} = {}) {
+export async function confirmPending({path = linkPath(), now = Date.now, sender = sendConfirmation, blocking = true,
+  prober = sender === sendConfirmation ? probeActive : null} = {}) {
   const result = await withLinkLock(path, async () => {
     const record = readLink(pendingPath(path));
     if (!record) return {state: "none", code: ""};
@@ -602,12 +640,19 @@ export async function confirmPending({path = linkPath(), now = Date.now, sender 
     try {
       view = await sender(record);
     } catch (error) {
-      if (error instanceof ConfirmationRefused) {
+      // P11b-3: after a lost 201 the server holds the device active and
+      // answers a repeated confirmation 404; a signed connect with the
+      // pending key that completes proves it, and the link becomes active.
+      if (error instanceof ConfirmationRefused && prober && await prober(record).catch(() => false)) {
+        view = {};
+      } else if (error instanceof ConfirmationRefused) {
         retire(record, "refused", path);
         return {state: "refused", code: "link_pairing_refused"};
+      } else if (error instanceof ConfirmationRetry) {
+        return {state: "pending", code: error.code};
+      } else {
+        return {state: "pending", code: "link_pairing_unavailable"};
       }
-      if (error instanceof ConfirmationRetry) return {state: "pending", code: error.code};
-      return {state: "pending", code: "link_pairing_unavailable"};
     }
     const {pairingSecret: _secret, expiresAt: _expires, ...active} = record;
     writeLink({...active, state: "active", confirmedAt: String(view?.confirmedAt || isoNow(now))}, path);
@@ -1175,6 +1220,67 @@ export class LinkBridge {
 
 const HANDSHAKE_FIELDS = ["handshakeId", "connectionId", "deviceId", "audience", "nonce", "expiresAt"];
 
+// L1-4: the proof for one challenge, or "protocol" for a malformed challenge
+// and "mismatch" for a challenge naming another device or audience.
+function handshakeProof(value, record, seed, version) {
+  if (!isObject(value) || value.type !== "authentication-challenge" || value.version !== 1
+    || !HANDSHAKE_FIELDS.every((name) => typeof value[name] === "string")) return "protocol";
+  // L1o-7: a challenge for another device is not answered.
+  if (value.audience !== record.audience || value.deviceId !== record.deviceId) return "mismatch";
+  const proof = {version: 1};
+  for (const name of HANDSHAKE_FIELDS) proof[name] = value[name];
+  proof.signatureBase64 = sign(seed, handshakeProofBytes(value));
+  proof.pluginVersion = version;
+  return proof;
+}
+
+// P11b-3: one signed L1-4 connect with the pending key, closed right after
+// authentication-complete. True only when the handshake completed.
+export async function probeActive(record, {connect = connectWebSocket, timeoutMs = HANDSHAKE_TIMEOUT_MS, version = ROOM_CONNECTOR_PROVENANCE.version} = {}) {
+  let socket;
+  try {
+    const [url] = deriveUrls(record.audience, record.deviceId);
+    const seed = seedOf(record);
+    socket = await connect(url, {headers: {"User-Agent": linkUserAgent(version)}, maxMessageBytes: CLIENT_MAX_MESSAGE_BYTES, timeoutMs});
+    return await new Promise((resolve) => {
+      let phase = "challenge";
+      const finish = (value) => {
+        clearTimeout(timer);
+        resolve(value);
+        socket.close(1000);
+      };
+      const timer = setTimeout(() => finish(false), timeoutMs);
+      timer.unref?.();
+      socket.on("close", () => finish(false));
+      socket.on("message", (message, binary) => {
+        let value;
+        try {
+          if (binary) throw new Error("binary");
+          value = JSON.parse(message);
+        } catch {
+          finish(false);
+          return;
+        }
+        if (phase === "challenge") {
+          const proof = handshakeProof(value, record, seed, version);
+          if (!isObject(proof)) {
+            finish(false);
+            return;
+          }
+          socket.send(JSON.stringify(proof));
+          phase = "complete";
+          return;
+        }
+        finish(isObject(value) && value.type === "authentication-complete" && value.version === 1);
+      });
+      socket.start();
+    });
+  } catch {
+    socket?.terminate();
+    return false;
+  }
+}
+
 // One outbound device socket for this installation while it is linked (L1-4).
 export class LinkService {
   constructor({pluginVersion = "", status = null, recordPath = linkPath(), localOpener, connect = connectWebSocket, sender = sendConfirmation,
@@ -1383,12 +1489,14 @@ export class LinkService {
     let socket;
     try {
       socket = await this.connect(url, {
-        headers: {"User-Agent": `synthetic-sociality-room-openclaw/${this.pluginVersion}`},
+        headers: {"User-Agent": linkUserAgent(this.pluginVersion)},
         maxMessageBytes: CLIENT_MAX_MESSAGE_BYTES,
         timeoutMs: this.handshakeTimeoutMs,
       });
     } catch (error) {
       const status = error instanceof WebSocketRefused ? error.status : 0;
+      // P11b-3: the site's bot protection refused the upgrade; reconnect.
+      if (error instanceof WebSocketRefused && blockedBySiteProtection(status, error.headers, error.body)) return ["link_blocked_by_site_protection", RECONNECT];
       // A redirect is never followed.
       const refused = [400, 401, 403, 404].includes(status) || (status >= 300 && status < 400);
       return [refused ? "link_route_refused" : "link_connection_lost", RECONNECT];
@@ -1486,21 +1594,16 @@ export class LinkService {
         }
         if (phase === "challenge") {
           // L1-4: one proof per socket, echoing the challenge.
-          if (!isObject(value) || value.type !== "authentication-challenge" || value.version !== 1
-            || !HANDSHAKE_FIELDS.every((name) => typeof value[name] === "string")) {
+          const proof = handshakeProof(value, record, seed, this.pluginVersion);
+          if (proof === "protocol") {
             protocolError();
             return;
           }
-          if (value.audience !== record.audience || value.deviceId !== record.deviceId) {
-            // L1o-7: a challenge for another device is not answered.
+          if (proof === "mismatch") {
             done(["link_audience_mismatch", RECONNECT]);
             socket.close(1000);
             return;
           }
-          const proof = {version: 1};
-          for (const name of HANDSHAKE_FIELDS) proof[name] = value[name];
-          proof.signatureBase64 = sign(seed, handshakeProofBytes(value));
-          proof.pluginVersion = this.pluginVersion;
           socket.send(JSON.stringify(proof));
           phase = "complete";
           return;

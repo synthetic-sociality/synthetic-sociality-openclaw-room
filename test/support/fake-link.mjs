@@ -43,12 +43,13 @@ function verifySignature(spkiBase64, bytes, signatureBase64) {
 
 // The Harness side. `confirmation(request)` returns {status, body} for a
 // pairing confirmation; `connectStatus` refuses the upgrade with that status.
+// `verifyProofs` refuses a proof that the confirmed key does not verify.
 // `edge(request)` stands in front of both (a site's bot protection): it
 // returns {status, headers, text} to answer instead of the Harness, or null.
 export async function fakeHarness({limits = {maxDataBytes: 4096, openTimeoutMs: 2000, maxChannels: 2}, confirmation, connectStatus = 0,
-  connectHeaders = {}, challenge = (fields) => fields, autoPong = true, completeExtra = {}, edge} = {}) {
+  connectHeaders = {}, challenge = (fields) => fields, autoPong = true, completeExtra = {}, edge, verifyProofs = false} = {}) {
   const sockets = new Set();
-  const state = {confirmations: [], upgrades: [], devices: [], keys: new Map(), connectStatus, connectHeaders, edge, edged: []};
+  const state = {confirmations: [], upgrades: [], devices: [], keys: new Map(), connectStatus, connectHeaders, edge, edged: [], verifyProofs};
   const server = http.createServer((request, response) => {
     const chunks = [];
     request.on("data", (chunk) => chunks.push(chunk));
@@ -125,6 +126,11 @@ export async function fakeHarness({limits = {maxDataBytes: 4096, openTimeoutMs: 
         const input = Buffer.from(JSON.stringify({version: fields.version, handshakeId: fields.handshakeId, connectionId: fields.connectionId,
           deviceId: fields.deviceId, audience: fields.audience, nonce: fields.nonce, expiresAt: fields.expiresAt}), "utf8");
         device.proofVerified = verifySignature(state.keys.get(deviceId) ?? "", input, value.signatureBase64 ?? "");
+        if (state.verifyProofs && !device.proofVerified) {
+          // As the device ingress: a key the server does not hold active.
+          ws.close(1008, "authentication-failed");
+          return;
+        }
         device.authenticated = true;
         const complete = {version: 1, type: "authentication-complete", ...completeExtra};
         if (limits) complete.limits = limits;

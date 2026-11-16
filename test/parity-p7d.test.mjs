@@ -30,6 +30,9 @@ registerHooks({
 });
 const home = await mkdtemp(join(tmpdir(), "openclaw-room-p7d-"));
 process.env.HOME = home;
+// Remedy r1 (N2 item 4): never the real ~/.openclaw, also when the
+// environment names a state directory.
+process.env.OPENCLAW_STATE_DIR = join(home, ".openclaw");
 after(() => rm(home, {recursive: true, force: true}));
 const {OpenClawRoomRuntime, epochConversationId} = await import("../src/runtime.js");
 // Imported, not required: on a connector without P7d each case fails on its own.

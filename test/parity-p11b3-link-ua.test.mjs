@@ -97,7 +97,7 @@ test("P11b-3 the device socket upgrade sends openclaw-room-link/<version> throug
     running = service(paths, gateway);
     await harness.waitDevice();
     assert.equal(harness.upgrades[0].headers["user-agent"], LINK_AGENT);
-    assert.equal(harness.edged.length, 0);
+    assert.deepEqual(harness.edged.map((item) => [item.kind, item.headers["user-agent"]]), []);
     // The loopback requests to the local Gateway are unchanged (no link agent).
     const device = harness.devices[0];
     const channelId = device.open();

@@ -20,10 +20,14 @@ export function acceptKey(key) {
 
 // An upgrade that did not open: `status` is the HTTP status (0 when none).
 export class WebSocketRefused extends Error {
-  constructor(status, reason = "refused") {
+  constructor(status, reason = "refused", {headers = {}, body = ""} = {}) {
     super(`websocket ${reason}${status ? ` (HTTP ${status})` : ""}`);
     this.status = status;
     this.reason = reason;
+    // The refusal's headers and the first 4 KiB of its body (P11b-3: a site's
+    // bot protection is told apart from the Harness by them).
+    this.headers = headers;
+    this.body = body;
   }
 }
 
@@ -285,9 +289,19 @@ export function connectWebSocket(url, {headers = {}, maxMessageBytes, timeoutMs 
     }, timeoutMs);
     timer.unref?.();
     request.on("response", (response) => {
-      response.resume();
-      request.destroy();
-      fail(new WebSocketRefused(response.statusCode ?? 0));
+      const chunks = [];
+      let size = 0;
+      const done = () => {
+        request.destroy();
+        fail(new WebSocketRefused(response.statusCode ?? 0, "refused", {headers: response.headers, body: Buffer.concat(chunks).toString("utf8").slice(0, 4096)}));
+      };
+      response.on("data", (chunk) => {
+        if (size < 4096) chunks.push(chunk);
+        size += chunk.length;
+      });
+      response.on("end", done);
+      response.on("error", done);
+      response.on("close", done);
     });
     request.on("upgrade", (response, socket, head) => {
       if (settled) {

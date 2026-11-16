@@ -13,6 +13,11 @@ import {
 
 const USAGE = "Usage: openclaw-room-link [link | status | unlink]  (the link token is asked for at a hidden prompt)";
 const CARD = "Settings > Plugins > OpenClaw > Link";
+// P11b-3: codes the person reads with a plain reason.
+const REASONS = {
+  link_blocked_by_site_protection: "The request was blocked by the site's bot protection before it reached the Harness",
+};
+const plain = (code) => (REASONS[code] ? `${REASONS[code]} (${code})` : code);
 
 // Lines from the input stream; a hidden read on a terminal turns echo off.
 class Prompter {
@@ -125,13 +130,15 @@ async function link({prompter, out, path, sender, now, label}) {
     return 0;
   }
   if (result.state === "pending" && !working) {
-    out(`Not confirmed yet (${result.code}). The running OpenClaw gateway retries until the token expires at ${token.expiresAt}.\n`);
+    out(REASONS[result.code]
+      ? `Not confirmed yet. ${plain(result.code)}. The running OpenClaw gateway retries until the token expires at ${token.expiresAt}.\n`
+      : `Not confirmed yet (${result.code}). The running OpenClaw gateway retries until the token expires at ${token.expiresAt}.\n`);
     out("Check it with: openclaw-room-link status\n");
     return 0;
   }
   if (result.state === "pending") {
     await discardPending(path);
-    out(`The new link was not confirmed (${result.code}). Your working link is unchanged. Run openclaw-room-link again to retry.\n`);
+    out(`The new link was not confirmed (${plain(result.code)}). Your working link is unchanged. Run openclaw-room-link again to retry.\n`);
     return 1;
   }
   const reason = result.state === "expired" ? "The link token expired before the server confirmed it." : "The server refused the link token: it is spent, expired or invalid.";

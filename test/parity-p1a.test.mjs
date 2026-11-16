@@ -25,6 +25,9 @@ import {join as joinState} from "node:path";
 import {ISOLATED_HOST_CONFIG} from "./support/isolated-host.mjs";
 const TEST_STATE_DIRECTORY = await mkdtempState(joinState(tmpdirState(), "openclaw-room-test-state-"));
 const UNUSED_STATE_FILE = joinState(TEST_STATE_DIRECTORY, "state.json");
+// Remedy r1 (N2 item 4): the channel start writes its status file under the
+// OpenClaw state directory; this suite keeps it inside its own directory.
+process.env.OPENCLAW_STATE_DIR = joinState(TEST_STATE_DIRECTORY, "openclaw");
 afterStateTests(() => rmState(TEST_STATE_DIRECTORY, {recursive: true, force: true}));
 
 // Host SDK stand-ins; the tool-error warning marker is host-private metadata,

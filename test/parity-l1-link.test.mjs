@@ -135,7 +135,8 @@ test("L1-01 a link token is read at a hidden prompt and accepted only as v1 with
 test("L1-02 the pairing confirmation is sent to the derived URL with the signed body and only 201 links", async () => {
   const paths = await scratch("l1-02");
   let status = 200;
-  const harness = await fakeHarness({confirmation: () => (status === 201 ? null : {status, body: {}})});
+  // P11b-3: a 404 links only when a signed connect with the pending key completes; this ingress verifies proofs.
+  const harness = await fakeHarness({confirmation: () => (status === 201 ? null : {status, body: {}}), verifyProofs: true});
   try {
     const token = parseToken(makeToken({audience: harness.audience}));
     writeLink(pendingRecord(token, {label: "Mac test · OpenClaw default"}), pendingPath(paths.recordPath));
@@ -158,7 +159,8 @@ test("L1-02 the pairing confirmation is sent to the derived URL with the signed 
     const key = createPublicKey({key: Buffer.from(sent.body.publicKeySpkiBase64, "base64"), format: "der", type: "spki"});
     assert.ok(verify(null, pairingProofBytes(sent.body.deviceId, sent.body.pairingSecret, sent.body.deviceLabel, sent.body.publicKeySpkiBase64),
       key, Buffer.from(sent.body.signatureBase64, "base64")));
-    // 404: the token is spent; the pending record is retired, never retried.
+    // 404: the token is spent (the signed connect with the pending key is
+    // refused too); the pending record is retired, never retried.
     status = 404;
     const second = await scratch("l1-02b");
     try {
@@ -209,7 +211,8 @@ test("L1-04 the connect handshake echoes the challenge in one signed proof and r
     for (const name of ["handshakeId", "connectionId", "deviceId", "audience", "nonce", "expiresAt"]) assert.equal(proof[name], device.challenge[name]);
     assert.equal(proof.pluginVersion, "0.2.84");
     assert.ok(device.proofVerified);
-    assert.match(String(harness.upgrades[0].headers["user-agent"]), /^synthetic-sociality-room-openclaw\/0\.2\.84$/);
+    // P11b-3: the link's own User-Agent on the device socket.
+    assert.equal(harness.upgrades[0].headers["user-agent"], "openclaw-room-link/0.2.84");
     await waitFor(() => link.instance.snapshot().state === "connected", {label: "connected"});
     await link.stop();
     // A challenge for another audience, or another device, is not answered.
@@ -644,7 +647,8 @@ test("L1-14 the local Gateway is reached with the loopback dashboard's session t
 test("L1-20 a failed re-link leaves the working link and its key unchanged", async () => {
   const paths = await scratch("l1-20");
   let status = 201;
-  const harness = await fakeHarness({confirmation: () => (status === 201 ? null : {status, body: {}})});
+  // P11b-3: the 404 re-link's signed connect is refused by an ingress that verifies proofs.
+  const harness = await fakeHarness({confirmation: () => (status === 201 ? null : {status, body: {}}), verifyProofs: true});
   try {
     await linked(harness, paths.recordPath);
     const before = await readFile(paths.recordPath, "utf8");
