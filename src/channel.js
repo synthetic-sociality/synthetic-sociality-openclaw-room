@@ -26,6 +26,7 @@ import {BLOCK_MESSAGE, REFUSAL_CODE, TOOLS_NOT_GRANTED, agentWorkspace, roomTool
 import {WEB_READ_TOOL_NAMES, localStatusFor} from "./local-status.js";
 import {ROOM_CONNECTOR_PROVENANCE} from "./release-provenance.js";
 import {connectorControl} from "./connector-control.js";
+import {startRoomLink, stopRoomLink} from "./link.js";
 import {
   roomReplyDeliveryPolicy,
 } from "./reply-policy.js";
@@ -594,6 +595,8 @@ export function createRoomChannel({makeClient}) {
         api.on("tool_result_persist", roomToolResultScrub);
         if (gatewayLoad) {
           api.on("gateway_stop", () => {
+            // Contract L1o-3: the link service stops with the gateway.
+            try { stopRoomLink(); } catch {}
             // R2-7: the next gateway start in this process is a new incarnation.
             try { connectorControl.gatewayStopped(); } catch {}
             roomLocalStatus(api?.logger, api?.runtime?.config?.current?.() ?? api?.config).setLoaded(false);
@@ -601,6 +604,17 @@ export function createRoomChannel({makeClient}) {
         }
       } else {
         api?.logger?.warn?.("Room connector: this OpenClaw host offers no tool hooks; the start gate still applies");
+      }
+      // Contract L1o-3: the device link runs in the gateway's own registration
+      // only, one service per process; a failure never stops the gateway.
+      if (gatewayLoad) {
+        const currentConfig = () => api?.runtime?.config?.current?.() ?? api?.config;
+        startRoomLink({
+          pluginVersion: ROOM_CONNECTOR_PROVENANCE.version,
+          config: currentConfig,
+          logger: api?.logger,
+          status: {setLink: (link) => roomLocalStatus(api?.logger, currentConfig()).setLink(link)},
+        });
       }
       registerRoomCommands(api);
       registerPresenceFallback(api, {makeClient});

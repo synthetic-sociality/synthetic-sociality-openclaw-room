@@ -20,6 +20,9 @@ export const WEB_READ_TOOL_NAMES = Object.freeze(["browser", "browser_navigate",
 // Contract P2c-4 (ISSUE-023): why a dispatch waited on the host.
 export const GATE_WAIT_REASONS = new Set(["", "host_run_busy", "host_session_unobservable", "held_by_moderator"]);
 const CODE = /^[A-Za-z0-9_.:-]{1,64}$/;
+// Contract L1-11: the link states.
+const LINK_STATES = new Set(["not_linked", "pending", "connecting", "connected", "reconnecting", "stopped"]);
+const LINK_DEVICE_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 // Contract P8-5: a change of lastConnectedAt alone is written at most this
 // often per installation; every other change is written at once.
 export const CONNECTED_AT_WRITE_MS = 60_000;
@@ -146,6 +149,24 @@ export class LocalStatus {
   setLoaded(loaded) {
     this.data.pluginLoaded = Boolean(loaded);
     this.write();
+  }
+
+  // Contract L1-11 and L1o-8: the device link, codes only. Written when a
+  // value changed; `updatedAt` is the time of that change.
+  setLink(link) {
+    const next = {
+      state: LINK_STATES.has(link?.state) ? link.state : "stopped",
+      code: code(link?.code),
+      deviceId: typeof link?.deviceId === "string" && LINK_DEVICE_ID.test(link.deviceId) ? link.deviceId : "",
+      channels: Number.isSafeInteger(link?.channels) && link.channels >= 0 ? link.channels : 0,
+      limits: link?.limits === "advertised" ? "advertised" : "fallback",
+      lastConnectedAt: typeof link?.lastConnectedAt === "string" && link.lastConnectedAt ? link.lastConnectedAt : null,
+      lastChannelErrorCode: code(link?.lastChannelErrorCode),
+    };
+    const prior = this.data.link;
+    if (prior && Object.keys(next).every((key) => prior[key] === next[key])) return true;
+    this.data.link = {...next, updatedAt: now()};
+    return this.write();
   }
 
   // The internal key of a (Room, membership): the membership id, or, while

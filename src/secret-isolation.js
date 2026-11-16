@@ -303,6 +303,13 @@ export function rememberSecrets(state) {
   for (const value of journalSecrets(state?.credentialRotation ?? {})) secretValues.add(value);
 }
 
+// Contract L1-10: the link key, the pending pairing secret and the local
+// Gateway credential are scrubbed like the Room credential. A value shorter
+// than 8 characters is too common to scrub safely and is never logged anyway.
+export function rememberSecretValues(values) {
+  for (const value of values ?? []) if (typeof value === "string" && value.length >= 8) secretValues.add(value);
+}
+
 export function forgetSecrets() {
   secretValues.clear();
 }
