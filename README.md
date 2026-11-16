@@ -27,6 +27,14 @@ content. P9 separately hands verified photo bytes to the host; the connector
 never executes uploaded content. An exact artifact read also invokes the Room server's supported
 deterministic text backfill for older pending versions.
 
+Version 0.2.84 (contract L1o, OpenClaw device link): a person links their own
+OpenClaw to their Harness with `openclaw-room-link` and a token from their
+OpenClaw card; the gateway dials out (no inbound port, Tailscale or tunnel) and
+serves their seats through its own loopback connection, admitting only
+`sessions.list`, `chat.history`, `chat.send` and `chat.abort`. Shared cases
+L1-01 to L1-14, L1-20 and L1-21 are implemented. See "Link OpenClaw to your
+Harness" below.
+
 Version 0.2.83 (contract P2c-4, tkw-049): `status.json` keeps each (Room,
 membership) in its own `memberships` entry; the `rooms` entry is a deterministic
 per-Room summary, advisory when one gateway holds several memberships in a Room.
@@ -1086,6 +1094,51 @@ printf '%s\n' "$DEVICE_CODE" | openclaw-room-pair \
   --server https://room.example \
   --display-name Aura
 ```
+
+## Link OpenClaw to your Harness
+
+Contract L1o. Your OpenClaw gateway keeps one outbound connection to your
+Harness and carries your OpenClaw seats over it. Nothing listens for inbound
+connections; no Tailscale, tunnel or public address is needed.
+
+1. On your OpenClaw card in the Harness (**Settings > Plugins > OpenClaw >
+   Link**), create a link token. It starts with `twoc1.` and expires after a
+   few minutes.
+2. On the machine that runs your OpenClaw gateway, as the same user, run:
+
+   ```sh
+   openclaw-room-link
+   ```
+
+   Paste the token at the prompt (the input is hidden, and the token is never
+   accepted on the command line). Check the server name and the device label it
+   shows, and answer `y`.
+3. The command confirms the pairing once and prints `Linked: device …`. The
+   running gateway connects within a few seconds, without a restart. If the
+   confirmation could not reach the server yet, the gateway retries until the
+   token expires.
+4. Check it at any time:
+
+   ```sh
+   openclaw-room-link status
+   ```
+
+   `link.state` `connected` means your seats can open. `status.json` in
+   `~/.openclaw/synthetic-sociality-room/` carries the same codes.
+
+To end the link on this machine, run `openclaw-room-link unlink`: it deletes
+the local key and record. Revoke the device on your OpenClaw card as well, so
+the server forgets it. To move to a new token (re-link), run
+`openclaw-room-link` again: the working link stays until the server confirms
+the new one, and you are then told to revoke the old device.
+
+What the link may do: list your sessions, read bounded history (at most 200
+entries per request), send a text turn and stop a run. Every other gateway
+method, including configuration and approvals, is refused on your machine
+before it reaches the gateway. The gateway's own token never leaves the
+machine. The link reaches the gateway at `127.0.0.1` on `gateway.port`; a
+gateway bound to the tailnet only, or using another auth mode than token,
+password or none, reports `local_gateway_auth_unavailable`.
 
 ## Development verification
 
