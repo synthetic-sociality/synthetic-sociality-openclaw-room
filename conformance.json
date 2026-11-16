@@ -188,73 +188,59 @@
   "parityL1Cases": {
     "L1-01": {
       "name": "L1-01 a link token is read at a hidden prompt and accepted only as v1 with every field, an https audience and an unexpired expiry",
-      "status": "planned",
-      "reason": "OpenClaw translation in a later release (owner: Hermes first, OpenClaw next)"
+      "status": "implemented"
     },
     "L1-02": {
       "name": "L1-02 the pairing confirmation is sent to the derived URL with the signed body and only 201 links",
-      "status": "planned",
-      "reason": "OpenClaw translation in a later release (owner: Hermes first, OpenClaw next)"
+      "status": "implemented"
     },
     "L1-03": {
       "name": "L1-03 the signature inputs equal JavaScript JSON.stringify bytes for the shared vector",
-      "status": "planned",
-      "reason": "OpenClaw translation in a later release (owner: Hermes first, OpenClaw next)"
+      "status": "implemented"
     },
     "L1-04": {
       "name": "L1-04 the connect handshake echoes the challenge in one signed proof and refuses a foreign audience",
-      "status": "planned",
-      "reason": "OpenClaw translation in a later release (owner: Hermes first, OpenClaw next)"
+      "status": "implemented"
     },
     "L1-05": {
       "name": "L1-05 limits are read from authentication-complete and fall back per value when absent",
-      "status": "planned",
-      "reason": "OpenClaw translation in a later release (owner: Hermes first, OpenClaw next)"
+      "status": "implemented"
     },
     "L1-06": {
       "name": "L1-06 hermes-opened is sent when the local Gateway opens and frames pass verbatim both ways until close",
-      "status": "planned",
-      "reason": "OpenClaw translation in a later release (owner: Hermes first, OpenClaw next)"
+      "status": "implemented"
     },
     "L1-07": {
       "name": "L1-07 an oversize frame or a channel above the cap ends only that channel",
-      "status": "planned",
-      "reason": "OpenClaw translation in a later release (owner: Hermes first, OpenClaw next)"
+      "status": "implemented"
     },
     "L1-08": {
       "name": "L1-08 an unknown channel ends that channel and an unknown type or version closes the socket",
-      "status": "planned",
-      "reason": "OpenClaw translation in a later release (owner: Hermes first, OpenClaw next)"
+      "status": "implemented"
     },
     "L1-09": {
       "name": "L1-09 revoked and replaced stop the link and keep the key while a pending link retries until the token expires",
-      "status": "planned",
-      "reason": "OpenClaw translation in a later release (owner: Hermes first, OpenClaw next)"
+      "status": "implemented"
     },
     "L1-10": {
       "name": "L1-10 reconnects use bounded backoff with jitter and the device sends its own keepalive",
-      "status": "planned",
-      "reason": "OpenClaw translation in a later release (owner: Hermes first, OpenClaw next)"
+      "status": "implemented"
     },
     "L1-11": {
       "name": "L1-11 unlink deletes the local key and record and leaves the server revoke to the Harness",
-      "status": "planned",
-      "reason": "OpenClaw translation in a later release (owner: Hermes first, OpenClaw next)"
+      "status": "implemented"
     },
     "L1-12": {
       "name": "L1-12 the link key, pairing secret and local Gateway credential are not readable through agent tools and never appear in prompt, tool result, log or status",
-      "status": "planned",
-      "reason": "OpenClaw translation in a later release (owner: Hermes first, OpenClaw next)"
+      "status": "implemented"
     },
     "L1-13": {
       "name": "L1-13 link status is written to the status file as codes only, following the fixed close table",
-      "status": "planned",
-      "reason": "OpenClaw translation in a later release (owner: Hermes first, OpenClaw next)"
+      "status": "implemented"
     },
     "L1-14": {
       "name": "L1-14 the local Gateway is reached with the loopback dashboard's session token and a gated dashboard fails the open with a code",
-      "status": "planned",
-      "reason": "OpenClaw translation in a later release (owner: Hermes first, OpenClaw next)"
+      "status": "implemented"
     },
     "L1-15": {
       "name": "L1-15 a message_too_large refusal is terminal in open and coordinated Rooms, acknowledged, and its reply is offered once with the limit",
@@ -278,13 +264,11 @@
     },
     "L1-20": {
       "name": "L1-20 a failed re-link leaves the working link and its key unchanged",
-      "status": "planned",
-      "reason": "OpenClaw translation in a later release (owner: Hermes first, OpenClaw next)"
+      "status": "implemented"
     },
     "L1-21": {
       "name": "L1-21 the pairing confirmation, the device socket and both local Gateway requests never follow a redirect",
-      "status": "planned",
-      "reason": "OpenClaw translation in a later release (owner: Hermes first, OpenClaw next)"
+      "status": "implemented"
     },
     "L1-22": {
       "name": "L1-22 a discussion start in a coordinated Room starts no cycle and is acknowledged",

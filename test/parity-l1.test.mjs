@@ -1,9 +1,9 @@
 // Shared conformance cases for the device link L1 (delivery contract section
 // "L1 — Device link"). The case names are identical in the Hermes and OpenClaw
-// conformance.json files. Hermes implements them first (1.0.78); in OpenClaw
-// every case is planned until the translation in a later release, so this
-// suite checks the planned marking, the contract pins and the shared signature
-// vector only.
+// conformance.json files. Hermes implemented them first (1.0.78); OpenClaw
+// implements the translation in 0.2.84 (contract section "L1o — OpenClaw
+// device link", tests in parity-l1-link.test.mjs). This suite checks the
+// marking, the contract pins and the shared signature vector.
 import assert from "node:assert/strict";
 import test from "node:test";
 import {createHash, createPrivateKey, createPublicKey, sign, verify} from "node:crypto";
@@ -35,7 +35,6 @@ test("conformance L1 cases: planned ones carry the owner's reason and no test, i
       // A planned case has no implementing test yet.
       assert.equal(implementing, 0, entry.name);
     } else {
-      // Contract L1-12, L1-13 and L1-15 are implemented in this release.
       assert.deepEqual(entry, {name: entry.name, status: "implemented"});
       assert.equal(implementing, 1, entry.name);
     }
@@ -107,9 +106,12 @@ test("L1-17 a host whose tool selection cannot be read counts as reaching the st
 });
 
 test("the planned and implemented L1 cases are the ones this release names", () => {
+  // OpenClaw 0.2.84 (contract L1o): every shared L1 case is implemented.
   const status = Object.fromEntries(Object.entries(conformance.parityL1Cases).map(([id, entry]) => [id, entry.status]));
-  const implemented = Object.keys(status).filter((id) => status[id] === "implemented");
-  assert.deepEqual(implemented, ["L1-15", "L1-16", "L1-17", "L1-18", "L1-19", "L1-22", "L1-23", "L1-24", "L1-25"]);
+  assert.deepEqual(Object.keys(status).filter((id) => status[id] !== "implemented"), []);
+  assert.equal(conformance.parityL1oContract, "docs/delivery-lifecycle-contract-v1.md#l1o--openclaw-device-link-2026-11-16");
+  assert.ok(contract.includes("\n## L1o — OpenClaw device link (2026-11-16)\n"));
+  assert.match(conformance.parityContractSectionSha256.L1o, /^[0-9a-f]{64}$/);
 });
 
 // OP-12 P4 r1 item 9: the P3 and L1 sections are pinned (the same hashes in
