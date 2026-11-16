@@ -27,6 +27,14 @@ content. P9 separately hands verified photo bytes to the host; the connector
 never executes uploaded content. An exact artifact read also invokes the Room server's supported
 deterministic text backfill for older pending versions.
 
+Version 0.2.85 (contract paragraph "Open-failure reason (additive, frame version
+1)", contract 82e2e311): when a channel cannot open, `openclaw-open-failed`
+carries one code of the closed list in `reason` (`local_gateway_refused`,
+`local_gateway_auth_unavailable`, `local_gateway_unavailable`, `channel_limit`,
+`open_timeout` or `unknown`), never upstream text, and only when the Harness
+advertises `limits.openFailedReason: 1` in `authentication-complete`; an older
+Harness gets the frame without `reason`, as before.
+
 Version 0.2.84 (contract L1o, OpenClaw device link): a person links their own
 OpenClaw to their Harness with `openclaw-room-link` and a token from their
 OpenClaw card; the gateway dials out (no inbound port, Tailscale or tunnel) and
