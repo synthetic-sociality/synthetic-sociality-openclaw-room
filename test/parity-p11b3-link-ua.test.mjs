@@ -190,6 +190,16 @@ test("P11b-3 a pairing 404 after a lost 201 links when a signed connect with the
     await refusing.close();
     await refusedPaths.cleanup();
   }
+  // Only authentication-complete proves it: any other answer stays refused.
+  const otherPaths = await scratch("p11b3-404o");
+  const answering = await fakeHarness({confirmation: () => ({status: 404, body: {error: "not_found"}}), completeExtra: {type: "authentication-failed"}});
+  try {
+    pending(answering, otherPaths.recordPath);
+    assert.deepEqual(await link.confirmPending({path: otherPaths.recordPath}), {state: "refused", code: "link_pairing_refused"});
+  } finally {
+    await answering.close();
+    await otherPaths.cleanup();
+  }
 });
 
 test("P11b-3 the Room API client keeps its P11b-1 value", () => {
