@@ -21,6 +21,7 @@ const CASES = [
   "RRB-02 a membership's recovery delay grows across consecutive failed registrations and heartbeats and resets only after an accepted heartbeat",
   "RRB-03 an HTTP 429 delays that membership at least by its Retry-After",
   "RRB-04 heartbeats of current sessions are never delayed by the budget, and a membership stopped by the Room does not use it",
+  "RRB-05 a 429 on a heartbeat of a current session is retried after Retry-After and, while the lease holds, is not counted as a failure",
 ];
 const conformance = JSON.parse(await readFile(new URL("../conformance.json", import.meta.url), "utf8"));
 const contract = await readFile(new URL("../docs/delivery-lifecycle-contract-v1.md", import.meta.url), "utf8");
@@ -114,11 +115,13 @@ async function closeAll(room) {
   for (const runtime of room.runtimes.values()) await runtime.close().catch(() => {});
 }
 
-test("conformance parityP2c3eCases carries the four shared cases, each a test of this suite, and the contract carries P2c-3e", () => {
+test("conformance parityP2c3eCases carries the five shared cases, each a test of this suite, and the contract carries P2c-3e", () => {
   assert.deepEqual(conformance.parityP2c3eCases, CASES);
   assert.ok(contract.includes("\nP2c-3e Recovery budget (2026-11-17). All memberships of one connector installation share one recovery budget: across\n"), "P2c-3e paragraph");
   assert.ok(contract.indexOf("The per-Room summary follows the membership entries (P2c-4).\n\nP2c-3e ") > 0, "P2c-3e directly after P2c-3d");
   assert.ok(contract.indexOf("does not use it.\n\nP2c-4 Local status.") > 0, "P2c-4 follows P2c-3e");
+  // Paula's final text (common brief Addendum 1): a 429 to a registration and a 429 to a heartbeat differ.
+  assert.ok(contract.includes("An HTTP 429 answer to a registration\ndelays that membership's next registration at least by its `Retry-After` (or `retryAfterSeconds`); an HTTP 429 answer\nto a heartbeat of a current session is retried after its `Retry-After` and does not count as a failed heartbeat unless\nthe lease expires first."), "P2c-3e final text");
   assert.equal(sha256(contract), conformance.contractSha256);
 });
 
@@ -255,6 +258,58 @@ test(CASES[3], async (t) => {
     }
     const entry = room.status.snapshot().memberships[STOPPED];
     assert.deepEqual([entry.connection, entry.lastErrorCode], ["stopped", "credential_expired"]);
+    await closeAll(room);
+  });
+});
+
+test(CASES[4], async (t) => {
+  // A: a current session (lease 45 s from each accepted contact, the Room's fallback); its heartbeat answers 429 twice,
+  // once with Retry-After: 5, once with only the Room's retryAfterSeconds 5; then accepted; then a 503.
+  // B: its heartbeat answers 429 with Retry-After: 20 until the lease (45 s after the last accepted heartbeat) expires.
+  const A = "ratelimitedhb01", B = "ratelimitedhb02";
+  const scripts = {[A]: ["ok", "429h", "429d", "ok", 503], [B]: ["ok", "429l", "429l", "429l", "ok"]};
+  const room = await installation([A, B], ({kind, membershipId}) => {
+    if (kind !== "heartbeat") return null;
+    const runtime = room.runtimes.get(membershipId);
+    const entry = room.status.snapshot().memberships[membershipId];
+    // What this membership made of the previous answer, seen at the next contact.
+    seen[membershipId].push({step: runtime.recoveryStep, connection: entry?.connection});
+    const next = scripts[membershipId].shift();
+    if (next === undefined || next === "ok") return null;
+    if (next === "429h") return json({code: "rate_limited", retryable: true}, 429, {"Retry-After": "5"});
+    if (next === "429d") return json({code: "rate_limited", retryable: true, details: {retryAfterSeconds: 5}}, 429);
+    if (next === "429l") return json({code: "rate_limited", retryable: true, details: {retryAfterSeconds: 20}}, 429, {"Retry-After": "20"});
+    return json({code: "unavailable"}, next);
+  });
+  const seen = {[A]: [], [B]: []};
+  await withClock(async ({stop, t0}) => {
+    await room.runtimes.get(A).initialize(stop.signal);
+    await room.runtimes.get(B).initialize(stop.signal);
+    await advance(2 * 60_000);
+    const beats = (membershipId) => room.contacts.filter((contact) => contact.membershipId === membershipId && contact.kind === "heartbeat").map((contact) => contact.at - t0);
+    const a = beats(A), b = beats(B);
+    t.diagnostic(`A heartbeats ${a}; seen ${JSON.stringify(seen[A].slice(0, 6))}`);
+    t.diagnostic(`B heartbeats ${b}; seen ${JSON.stringify(seen[B].slice(0, 6))}`);
+    // A: hb ok, 429 (header), 429 (detail), ok, 503, retry.
+    assert.ok(a.length >= 6, String(a));
+    // Each 429 is retried after its Retry-After (5 s), not later than the first schedule step would add.
+    assert.ok(a[2] - a[1] >= 5_000 && a[2] - a[1] <= 5_200, `after the 429 with Retry-After ${a[2] - a[1]}`);
+    assert.ok(a[3] - a[2] >= 5_000 && a[3] - a[2] <= 5_200, `after the 429 with retryAfterSeconds ${a[3] - a[2]}`);
+    // While the lease holds a 429 is not a failed heartbeat: the step stays, the membership stays connected.
+    assert.deepEqual(seen[A][2], {step: 0, connection: "connected"}, "after the first 429");
+    assert.deepEqual(seen[A][3], {step: 0, connection: "connected"}, "after the second 429");
+    // The 503 that follows is the outage's first failure: the first step (0.8-1 s).
+    assert.ok(a[5] - a[4] >= 800 && a[5] - a[4] <= 1_100, `after the 503 ${a[5] - a[4]}`);
+    assert.deepEqual(seen[A][5], {step: 1, connection: "reconnecting"}, "after the 503");
+    // B: hb ok at 12 s (lease to 57 s), 429 at 24 s and 44 s within the lease; the 429 at 64 s comes after it expired.
+    assert.ok(b.length >= 5, String(b));
+    assert.ok(b[2] - b[1] >= 20_000 && b[3] - b[2] >= 20_000, `B retries ${b[2] - b[1]}, ${b[3] - b[2]}`);
+    assert.deepEqual(seen[B][2], {step: 0, connection: "connected"}, "B after the first 429");
+    assert.deepEqual(seen[B][3], {step: 0, connection: "connected"}, "B after the second 429, lease still held");
+    // Lease expired: the normal recovery path (a failed heartbeat, the step advances), still after its Retry-After.
+    assert.ok(b[3] - b[0] > 45_000, "the third 429 comes after the lease");
+    assert.deepEqual(seen[B][4], {step: 1, connection: "reconnecting"}, "B after the 429 past the lease");
+    assert.ok(b[4] - b[3] >= 20_000, `B retry after the expired lease ${b[4] - b[3]}`);
     await closeAll(room);
   });
 });
