@@ -29,9 +29,21 @@ const ROOM_CREDENTIAL = "room-credential-0123456789abcdef";
 const NOTE = /gateway has not reported the link/u;
 const conformance = JSON.parse(await readFile(new URL("../conformance.json", import.meta.url), "utf8"));
 const titles = [];
+const cases = new Map();
 const ls = (title, run) => {
   titles.push(title);
+  cases.set(title.slice(0, 5), run);
   test(title, run);
+};
+// The shared cases of contract L1-11a (conformance parityL1StatusCommandCases,
+// the same strings as Hermes). Each one runs the OpenClaw cases that carry it,
+// whole and unchanged.
+const shared = [];
+const lsc = (title, ...ids) => {
+  shared.push(title);
+  test(title, async (t) => {
+    for (const id of ids) await cases.get(id)(t);
+  });
 };
 
 // A scratch host: HOME, OPENCLAW_STATE_DIR beside it (not under HOME, as on
@@ -366,6 +378,22 @@ ls("LS-11 a JSON5 configuration without a resolvable host json5 falls back to th
   }
 });
 
+lsc("LSC-01 the status file the gateway writes is found by the gateway's own path rule, also when it is not beside the link record", "LS-01", "LS-02", "LS-03", "LS-09");
+lsc("LSC-02 the link record without its secrets and the link object are shown as the gateway reports them", "LS-04", "LS-05", "LS-08");
+lsc("LSC-03 no status file names the link: a plain statement that the gateway has not reported it", "LS-07");
+lsc("LSC-04 a missing or unreadable status file or host configuration never fails the command", "LS-06", "LS-07", "LS-11");
+lsc("LSC-05 a host configuration is read the way the host reads it; without such a dependency none is read", "LS-10");
+lsc("LSC-06 the command writes nothing and prints no credential, configuration or account content", "LS-09", "LS-11");
+
 test("LS conformance: the regression cases are the ones pinned in conformance.json", () => {
   assert.deepEqual(titles, conformance.linkStatusCliCases);
+});
+
+test("LSC parity: the six shared cases of contract L1-11a are the ones pinned in conformance.json, and the paragraph follows L1-11", async () => {
+  assert.deepEqual(conformance.parityL1StatusCommandCases, shared);
+  assert.deepEqual(shared.map((title) => title.slice(0, 6)), ["LSC-01", "LSC-02", "LSC-03", "LSC-04", "LSC-05", "LSC-06"]);
+  const contract = await readFile(new URL("../docs/delivery-lifecycle-contract-v1.md", import.meta.url), "utf8");
+  const section = contract.slice(contract.indexOf("\n## L1 "), contract.indexOf("\n## ", contract.indexOf("\n## L1 ") + 1));
+  assert.match(section, /`channel_binary`, or empty\) and `updatedAt`\.\n\nL1-11a Status command \(2026-11-17\)\. Each connector gives the person one command/u);
+  assert.match(section, /\(Hermes: `hermes room link status`; OpenClaw: `openclaw-room-link status`\)/u);
 });
