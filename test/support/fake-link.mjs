@@ -166,7 +166,10 @@ function fingerprintOf(spkiBase64) {
 
 // The OpenClaw gateway side. `respond(request, connection)` returns the
 // response frame (or null for none); by default an echo of method and params.
-export async function fakeGateway({token = "gateway-token-0123456789abcdef", password, respond, upgradeStatus = 0, upgradeHeaders = {}, maxMessageBytes} = {}) {
+// `grantScopes(requested)` returns the scopes hello-ok lists (by default
+// operator.read and operator.write); a connect asking `refuseScope` is refused.
+export async function fakeGateway({token = "gateway-token-0123456789abcdef", password, respond, upgradeStatus = 0, upgradeHeaders = {}, maxMessageBytes,
+  grantScopes = () => ["operator.read", "operator.write"], refuseScope} = {}) {
   const sockets = new Set();
   const state = {connections: [], upgrades: [], token};
   const server = http.createServer((request, response) => response.writeHead(426).end());
@@ -191,14 +194,16 @@ export async function fakeGateway({token = "gateway-token-0123456789abcdef", pas
       if (frame.method === "connect" && !connection.connect) {
         connection.connect = frame;
         const auth = frame.params?.auth ?? {};
-        const accepted = password !== undefined ? auth.password === password : token === null ? !frame.params?.auth : auth.token === token;
+        const requested = Array.isArray(frame.params?.scopes) ? frame.params.scopes : [];
+        const accepted = (password !== undefined ? auth.password === password : token === null ? !frame.params?.auth : auth.token === token)
+          && !(refuseScope && requested.includes(refuseScope));
         if (!accepted) {
           ws.send(JSON.stringify({type: "res", id: frame.id, ok: false, error: {code: "INVALID_REQUEST", message: "unauthorized"}}));
           ws.close(1008, "unauthorized");
           return;
         }
         ws.send(JSON.stringify({type: "res", id: frame.id, ok: true, payload: {type: "hello-ok", protocol: 4, server: {version: "2026.7.1-2", connId: "c1"},
-          features: {methods: [], events: []}, snapshot: {}, auth: {role: "operator", scopes: ["operator.read", "operator.write"]},
+          features: {methods: [], events: []}, snapshot: {}, auth: {role: "operator", scopes: grantScopes(requested)},
           policy: {maxPayload: 26214400, maxBufferedBytes: 52428800, tickIntervalMs: 15000}}}));
         // A tick and a presence event, both of which the link drops.
         ws.send(JSON.stringify({type: "event", event: "tick", payload: {ts: 1}}));
