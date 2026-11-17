@@ -39,7 +39,7 @@ outage; an accepted registration no longer restarts it, only a heartbeat the
 Room accepts. A 429 to a registration delays that account's next registration
 at least by its `Retry-After`, or the Room's `retryAfterSeconds` detail when the
 header is missing. A 429 to a heartbeat of a current session is retried after
-its `Retry-After` and, while the session's lease holds (the Room's
+its `Retry-After`, by every path that sends that account's heartbeat, and, while the session's lease holds (the Room's
 `leaseExpiresAt`, else 45 s), is not a failed heartbeat: the account stays
 connected and its recovery delay does not grow. Heartbeats of a current
 session are never delayed, and a membership stopped by the Room (P2c-3d) stays

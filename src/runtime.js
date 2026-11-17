@@ -881,6 +881,9 @@ export class OpenClawRoomRuntime {
     this.recoveryStep = 0;
     // Contract P2c-3e: until when the Room holds this session (its lease).
     this.presenceLeaseUntil = 0;
+    // Contract P2c-3e: no heartbeat of this membership's session before this
+    // time (a heartbeat 429's Retry-After), whichever presence caller sends it.
+    this.heartbeatNotBefore = 0;
   }
 
   async initialize(signal) {
@@ -1076,6 +1079,7 @@ export class OpenClawRoomRuntime {
     // Contract P8-1/P8-2: accepted now, its interval applies, a listing follows.
     this.presenceAcceptedAt = Date.now();
     this.noteLease(this.connectorSession);
+    this.heartbeatNotBefore = 0;
     this.instructedHeartbeatSeconds = undefined;
     this.enrollmentOwed = true;
     this.credentialExpired = false;
@@ -3656,6 +3660,9 @@ export class OpenClawRoomRuntime {
       let delay = this.heartbeatIntervalMs();
       while (!this.closed && !this.heartbeatAbort.signal.aborted) {
         await backgroundSleep(delay, this.heartbeatAbort.signal);
+        // Contract P2c-3e: a heartbeat 429 another caller received meanwhile.
+        const deferred = this.heartbeatNotBefore - Date.now();
+        if (deferred > 0) await backgroundSleep(deferred, this.heartbeatAbort.signal);
         try {
           await this.maintainPresence(this.heartbeatAbort.signal);
           delay = this.heartbeatIntervalMs();
@@ -3681,14 +3688,14 @@ export class OpenClawRoomRuntime {
             // Contract P2c-3e: retried after its Retry-After; while the lease
             // holds it is not a failed heartbeat (the step stays).
             this.logger?.info?.(`Room heartbeat rate limited${roomErrorDiagnostic(error)}; retrying after its Retry-After`);
-            delay = this.retryDelay(this.recoveryStep, error);
+            delay = Math.max(0, this.heartbeatNotBefore - Date.now());
             continue;
           }
           // P2c-3a: keep the loop and the session; only the Room's own "lost"
           // (flagged in maintainPresence) registers it again.
           this.reportStatus({connection: "reconnecting", errorCode: statusErrorCode(error)});
           this.logger?.warn?.(`Room heartbeat failed${roomErrorDiagnostic(error)}; retrying`);
-          delay = this.recoveryDelay(error);
+          delay = Math.max(this.recoveryDelay(error), this.heartbeatNotBefore - Date.now());
         }
       }
     };
@@ -3708,6 +3715,9 @@ export class OpenClawRoomRuntime {
         this.logger?.info?.("Room registering its connector session again");
         await this.registerConnector(signal);
         registered = true;
+      } else if (heartbeat && Date.now() < this.heartbeatNotBefore) {
+        // Contract P2c-3e: deferred by a heartbeat 429's Retry-After; the
+        // presence caller sends no heartbeat before it.
       } else if (heartbeat) {
         try {
           const answer = await this.client.heartbeat(this.state, this.connectorSession.sessionId, signal);
@@ -3720,6 +3730,10 @@ export class OpenClawRoomRuntime {
           // P8-1: a later session answer's interval takes effect.
           if (answer?.heartbeatIntervalSeconds !== undefined) this.instructedHeartbeatSeconds = answer.heartbeatIntervalSeconds;
         } catch (error) {
+          // Contract P2c-3e: one deadline for every presence caller.
+          if ((error instanceof RoomAPIError || error instanceof RoomResponseError) && error.status === 429) {
+            this.heartbeatNotBefore = Date.now() + this.retryDelay(this.recoveryStep, error);
+          }
           // P2c-3: the Room said in its JSON that it no longer holds this
           // session; register it again (until accepted, if this one fails).
           if (!sessionLost(error)) throw error;
