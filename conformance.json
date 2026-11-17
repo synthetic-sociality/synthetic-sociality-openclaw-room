@@ -1669,7 +1669,9 @@
     "LS-06 a missing or unreadable configuration falls back to the file beside link.json and never throws",
     "LS-07 no link entry in either file: link is null and a plain note says the gateway has not reported it",
     "LS-08 the gateway's status file wins over an older file beside link.json; without a link entry there, the file beside link.json is shown",
-    "LS-09 one path rule: the CLI uses the gateway's roomStatusPath and writes nothing"
+    "LS-09 one path rule: the CLI uses the gateway's roomStatusPath and writes nothing",
+    "LS-10 a JSON5 configuration (comments, a trailing comma, an unquoted key) is read like the host reads it: Aura layout, the link is reported",
+    "LS-11 a JSON5 configuration without a resolvable host json5 falls back to the file beside link.json; the note says the configuration could not be read and nothing of it is printed"
   ],
   "contractSha256": "e2784a23d3c06cd9299806ee577995831f041666b1e609a27ac1d619fa30d574"
 }

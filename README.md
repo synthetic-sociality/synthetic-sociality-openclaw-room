@@ -32,9 +32,12 @@ status` shows the link state from the status file the running gateway writes,
 on every layout: next to the account state in use (also when the accounts are
 outside `OPENCLAW_STATE_DIR`), else under the plugin root. 0.2.86 read only the
 file beside `link.json` and printed `"link": null` on such a host while the
-link worked. When the host configuration cannot be read, the file beside
-`link.json` is used; when no status file names the link, the output says so in
-`note`. The gateway, `link.json` and the frames are unchanged.
+link worked. The command reads a JSON5 configuration like the host (JSON
+first, then JSON5 with the host's own `json5` package; nothing is added to this
+plugin's dependencies). When the host configuration cannot be read, the file
+beside `link.json` is used; when no status file names the link, the output says
+so in `note`, and also when the configuration could not be read. The gateway,
+`link.json` and the frames are unchanged.
 
 Version 0.2.86 (contract paragraph "Link features (additive, frame version 1,
 2026-11-17)", contract e2784a23): when the Harness advertises

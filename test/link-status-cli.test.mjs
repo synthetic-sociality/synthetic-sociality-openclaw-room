@@ -10,7 +10,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {execFile} from "node:child_process";
 import {readFileSync} from "node:fs";
-import {chmod, cp, mkdir, mkdtemp, readFile, rm, writeFile} from "node:fs/promises";
+import {chmod, cp, mkdir, mkdtemp, readFile, rm, symlink, writeFile} from "node:fs/promises";
 import {createRequire} from "node:module";
 import {tmpdir} from "node:os";
 import {dirname, join} from "node:path";
@@ -324,6 +324,12 @@ ls("LS-10 a JSON5 configuration (comments, a trailing comma, an unquoted key) is
     report(join(room, "status.json"), paths);
     // The host is found from its binary, as activation.js finds it.
     connected(shown(await run(paths, {OPENCLAW_BIN: join(hostRoot, "openclaw.mjs")}), paths), paths);
+    // And as the peer of the plugin's own location, with no host binary.
+    const plugin = join(paths.root, "plugin");
+    for (const name of ["bin", "src", "package.json"]) await cp(join(PLUGIN_ROOT, name), join(plugin, name), {recursive: true});
+    await mkdir(join(plugin, "node_modules"));
+    await symlink(hostRoot, join(plugin, "node_modules", "openclaw"));
+    connected(shown(await run(paths, {OPENCLAW_BIN: join(paths.root, "no-host", "openclaw.mjs")}, join(plugin, "bin", "link.js")), paths), paths);
   } finally {
     await paths.cleanup();
   }

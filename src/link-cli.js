@@ -5,9 +5,11 @@
 // with the link state the running gateway reports in its status file;
 // `unlink` deletes the local key and record. The token, the pairing secret
 // and the key are never printed.
-import {readFileSync} from "node:fs";
-import {dirname, join} from "node:path";
+import {readFileSync, realpathSync} from "node:fs";
+import {createRequire} from "node:module";
+import {dirname, isAbsolute, join} from "node:path";
 import {roomStatusPath} from "./account-discovery.js";
+import {resolveOpenClawBinary} from "./activation.js";
 import {
   LinkError, MAX_TOKEN_LENGTH, confirmPending, deleteLink, deviceLabel, discardPending, linkPath, parseToken,
   pendingPath, pendingRecord, publicView, readLink, sendConfirmation, serverHost, withLinkLock, writeLink,
@@ -20,6 +22,7 @@ const REASONS = {
   link_blocked_by_site_protection: "The request was blocked by the site's bot protection before it reached the Harness",
 };
 const NOT_REPORTED = "The OpenClaw gateway has not reported the link: its status file has no link entry. Check that the gateway is running.";
+const CONFIG_UNREAD = "The OpenClaw gateway has not reported the link: the host configuration could not be read, and the status file beside link.json has no link entry. Check that the gateway is running.";
 const plain = (code) => (REASONS[code] ? `${REASONS[code]} (${code})` : code);
 
 // Lines from the input stream; a hidden read on a terminal turns echo off.
@@ -99,36 +102,86 @@ class Prompter {
   }
 }
 
+// The root of the OpenClaw host package a file belongs to, or null.
+function hostPackageRoot(file) {
+  for (let directory = dirname(file); ; directory = dirname(directory)) {
+    try {
+      if (JSON.parse(readFileSync(join(directory, "package.json"), "utf8"))?.name === "openclaw") return directory;
+    } catch {
+      // No package here: look one level up.
+    }
+    if (dirname(directory) === directory) return null;
+  }
+}
+
+// The host's own JSON5 parser: the `json5` package the OpenClaw host depends
+// on, loaded from the host package. Never a dependency of this plugin, and
+// never looked up through PATH or the working directory. The host is the peer
+// resolved from this plugin's own location, else the package of the host
+// binary (an absolute path only, found as activation.js finds it). Null when
+// there is none.
+function hostJson5() {
+  const origins = [
+    () => createRequire(import.meta.url).resolve("openclaw"),
+    () => {
+      const binary = resolveOpenClawBinary();
+      return isAbsolute(binary) ? realpathSync(binary) : null;
+    },
+  ];
+  for (const origin of origins) {
+    try {
+      const file = origin();
+      const root = file ? hostPackageRoot(file) : null;
+      const parser = root ? createRequire(join(root, "package.json"))("json5") : null;
+      if (typeof parser?.parse === "function") return parser;
+    } catch {
+      // Not found this way.
+    }
+  }
+  return null;
+}
+
 // The host configuration of the store the record is in: OPENCLAW_CONFIG_PATH,
 // else openclaw.json in the state directory (the parent of the fenced store).
-// Only its account paths are used; nothing of it is printed.
+// Read as the host reads it: JSON, then JSON5 with the host's parser. Only
+// its account paths are used; nothing of it is printed.
 function hostConfig(path) {
   const configured = String(process.env.OPENCLAW_CONFIG_PATH ?? "").trim();
-  return JSON.parse(readFileSync(configured || join(dirname(dirname(path)), "openclaw.json"), "utf8"));
+  const text = readFileSync(configured || join(dirname(dirname(path)), "openclaw.json"), "utf8");
+  try {
+    return JSON.parse(text);
+  } catch (error) {
+    const json5 = error instanceof SyntaxError ? hostJson5() : null;
+    if (!json5) throw error;
+    return json5.parse(text);
+  }
 }
 
 // The link as the running gateway reports it: from the status file the
 // gateway writes (the gateway's own path rule, next to the account state in
 // use, which on Aura is outside OPENCLAW_STATE_DIR), then from the file
 // beside link.json, which is also where a configuration that cannot be read
-// leads. Null when neither names the link.
+// leads. `link` is null when neither names the link; `configUnread` says
+// that a configuration is there and could not be read.
 function linkStatus(path) {
   const files = [];
+  let configUnread = false;
   try {
     files.push(roomStatusPath(hostConfig(path)));
-  } catch {
+  } catch (error) {
     // No readable configuration: only the file beside link.json.
+    configUnread = error?.code !== "ENOENT";
   }
   files.push(join(dirname(path), "status.json"));
   for (const file of new Set(files)) {
     try {
-      const reported = JSON.parse(readFileSync(file, "utf8"))?.link;
-      if (reported !== null && typeof reported === "object") return reported;
+      const link = JSON.parse(readFileSync(file, "utf8"))?.link;
+      if (link !== null && typeof link === "object") return {link, configUnread};
     } catch {
       // A missing or unreadable status file reports nothing.
     }
   }
-  return null;
+  return {link: null, configUnread};
 }
 
 async function link({prompter, out, path, sender, now, label}) {
@@ -185,12 +238,12 @@ function status({out, path}) {
   } catch {
     readable = false;
   }
-  const reported = linkStatus(path);
+  const {link: reported, configUnread} = linkStatus(path);
   out(`${JSON.stringify({
     record: readable ? (record ? publicView(record) : null) : "unreadable",
     pending: pending ? publicView(pending) : null,
     link: reported,
-    ...(reported ? {} : {note: NOT_REPORTED}),
+    ...(reported ? {} : {note: configUnread ? CONFIG_UNREAD : NOT_REPORTED}),
   }, null, 2)}\n`);
   return 0;
 }
