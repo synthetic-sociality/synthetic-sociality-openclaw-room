@@ -313,3 +313,55 @@ test(CASES[4], async (t) => {
     await closeAll(room);
   });
 });
+
+// Paula's OP-12 finding O-RRB05-01 (common brief Addendum 2): a heartbeat 429's Retry-After holds for every presence
+// caller of that membership, not only the loop that received it.
+test(`${CASES[4].slice(0, 6)} cross-path: after a heartbeat 429 with Retry-After no presence caller of that membership heartbeats before the deadline; a sibling is not delayed`, async (t) => {
+  const A = "crosspathhb0001", S = "crosspathsib001";
+  // A's heartbeats: 429 Retry-After 30 (sent by the long-poll presence), then 429 with only retryAfterSeconds 20 (sent by
+  // the timer loop), then accepted.
+  const script = ["429h", "429d"];
+  const room = await installation([A, S], ({kind, membershipId}) => {
+    if (kind !== "heartbeat" || membershipId !== A) return null;
+    const next = script.shift();
+    if (next === "429h") return json({code: "rate_limited", retryable: true}, 429, {"Retry-After": "30"});
+    if (next === "429d") return json({code: "rate_limited", retryable: true, details: {retryAfterSeconds: 20}}, 429);
+    return null;
+  });
+  await withClock(async ({stop, t0}) => {
+    const a = room.runtimes.get(A);
+    await a.initialize(stop.signal);
+    await room.runtimes.get(S).initialize(stop.signal);
+    const until = async (ms) => advance(Math.max(0, t0 + ms - Date.now()));
+    // The long-poll presence (the read path's caller) sends A's heartbeat at 1 s: 429, Retry-After 30 (deadline 31 s).
+    await until(1_000);
+    await a.maintainPresenceResilient(stop.signal, {heartbeat: true});
+    // Paula's probe: the next long-poll presence 1 s later, and again at 20 s; the timer loop's heartbeat is due at 12 s.
+    await until(2_000);
+    await a.maintainPresenceResilient(stop.signal, {heartbeat: true});
+    await until(20_000);
+    await a.maintainPresenceResilient(stop.signal, {heartbeat: true});
+    // The timer loop sends the next heartbeat at or after 31 s: 429, retryAfterSeconds 20 (deadline 20 s later).
+    await until(40_000);
+    const beats = () => room.contacts.filter((contact) => contact.membershipId === A && contact.kind === "heartbeat").map((contact) => contact.at - t0);
+    const second = beats()[1];
+    // The long-poll presence just after it, and 10 s later, sends nothing.
+    await a.maintainPresenceResilient(stop.signal, {heartbeat: true});
+    await until(second + 10_000);
+    await a.maintainPresenceResilient(stop.signal, {heartbeat: true});
+    await until(90_000);
+    const heard = beats();
+    const sibling = room.contacts.filter((contact) => contact.membershipId === S && contact.kind === "heartbeat").map((contact) => contact.at - t0);
+    t.diagnostic(`A heartbeats ${heard}; S heartbeats ${sibling}`);
+    assert.equal(heard[0], 1_000);
+    assert.ok(heard[1] >= 31_000 && heard[1] <= 31_200, `second heartbeat at ${heard[1]}, deadline 31000 (Retry-After 30)`);
+    assert.ok(heard[2] - heard[1] >= 20_000 && heard[2] - heard[1] <= 20_200, `third after ${heard[2] - heard[1]}, deadline 20000 (retryAfterSeconds 20)`);
+    // While leased, neither 429 was a failed heartbeat (RRB-05 unchanged).
+    assert.equal(a.recoveryStep, 0);
+    assert.equal(room.status.snapshot().memberships[A].connection, "connected");
+    // The sibling heartbeats every 12 s throughout.
+    assert.ok(sibling.length >= 7, String(sibling));
+    for (let index = 1; index < sibling.length; index += 1) assert.ok(sibling[index] - sibling[index - 1] <= 12_200, `sibling ${index}`);
+    await closeAll(room);
+  });
+});
