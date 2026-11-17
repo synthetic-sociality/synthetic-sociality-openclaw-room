@@ -27,6 +27,15 @@ content. P9 separately hands verified photo bytes to the host; the connector
 never executes uploaded content. An exact artifact read also invokes the Room server's supported
 deterministic text backfill for older pending versions.
 
+Version 0.2.87 (no contract change, contract e2784a23): `openclaw-room-link
+status` shows the link state from the status file the running gateway writes,
+on every layout: next to the account state in use (also when the accounts are
+outside `OPENCLAW_STATE_DIR`), else under the plugin root. 0.2.86 read only the
+file beside `link.json` and printed `"link": null` on such a host while the
+link worked. When the host configuration cannot be read, the file beside
+`link.json` is used; when no status file names the link, the output says so in
+`note`. The gateway, `link.json` and the frames are unchanged.
+
 Version 0.2.86 (contract paragraph "Link features (additive, frame version 1,
 2026-11-17)", contract e2784a23): when the Harness advertises
 `limits.openclawLinkFeatures: 1`, `openclaw-opened` names the channel's
@@ -1149,8 +1158,12 @@ connections; no Tailscale, tunnel or public address is needed.
    openclaw-room-link status
    ```
 
-   `link.state` `connected` means your seats can open. `status.json` in
-   `~/.openclaw/synthetic-sociality-room/` carries the same codes.
+   `link.state` `connected` means your seats can open. The codes come from
+   the gateway's `status.json` (next to the Room account state, by default in
+   `~/.openclaw/synthetic-sociality-room/`). `"link": null` with a `note`
+   means the gateway has not reported the link: check that it is running, and
+   run the command with the gateway's `OPENCLAW_STATE_DIR` (and
+   `OPENCLAW_CONFIG_PATH`, if it has one).
 
 To end the link on this machine, run `openclaw-room-link unlink`: it deletes
 the local key and record. Revoke the device on your OpenClaw card as well, so
