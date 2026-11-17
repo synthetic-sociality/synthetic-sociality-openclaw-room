@@ -27,8 +27,11 @@ content. P9 separately hands verified photo bytes to the host; the connector
 never executes uploaded content. An exact artifact read also invokes the Room server's supported
 deterministic text backfill for older pending versions.
 
-Version 0.2.87 (no contract change, contract e2784a23): `openclaw-room-link
-status` shows the link state from the status file the running gateway writes,
+Version 0.2.87 (contract paragraph "L1-11a Status command (2026-11-17)",
+contract a96dc1a5; paired with Hermes 1.0.112): the status command follows
+contract L1-11a, the rule both connectors share; the six shared cases are
+`parityL1StatusCommandCases` (LSC-01 to LSC-06, the same strings as Hermes).
+`openclaw-room-link status` shows the link state from the status file the running gateway writes,
 on every layout: next to the account state in use (also when the accounts are
 outside `OPENCLAW_STATE_DIR`), else under the plugin root. 0.2.86 read only the
 file beside `link.json` and printed `"link": null` on such a host while the

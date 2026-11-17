@@ -1333,7 +1333,7 @@
   },
   "parityContractSectionSha256": {
     "P3": "a689096e24f9fee13e0603006274c303f3435ee823f082a84a63b765deb8906b",
-    "L1": "7b1d5426d6608b6f9b835f04b93756b5c330f360dd4cba8209dce034279a34e3",
+    "L1": "94a5809aa1b1a9121404e15769e69487d5919efb641a8b0c358ba1793dc3842c",
     "P5": "4e7272530192d00478b842d4d1c8559530f39b76e0e0c026e738f740422e5a87",
     "P6": "3b79968d551d2613256a90c52c87ca6a18d93ff5337fc73f128b1654715d9e3a",
     "P2c": "16692fd37d7e79631bdb2c679b833ec66ea99f743381ca95be7cc8c27874750b",
@@ -1660,6 +1660,14 @@
   "statusReadinessCases": [
     "STATUS-01 status.json carries every updater readiness field with the shared names and types"
   ],
+  "parityL1StatusCommandCases": [
+    "LSC-01 the status file the gateway writes is found by the gateway's own path rule, also when it is not beside the link record",
+    "LSC-02 the link record without its secrets and the link object are shown as the gateway reports them",
+    "LSC-03 no status file names the link: a plain statement that the gateway has not reported it",
+    "LSC-04 a missing or unreadable status file or host configuration never fails the command",
+    "LSC-05 a host configuration is read the way the host reads it; without such a dependency none is read",
+    "LSC-06 the command writes nothing and prints no credential, configuration or account content"
+  ],
   "linkStatusCliCases": [
     "LS-01 Aura layout: accounts outside OPENCLAW_STATE_DIR, the gateway's status file beside them, the link is reported",
     "LS-02 a state file outside any accounts/ directory: the status file in its own directory is read",
@@ -1673,5 +1681,5 @@
     "LS-10 a JSON5 configuration (comments, a trailing comma, an unquoted key) is read like the host reads it: Aura layout, the link is reported",
     "LS-11 a JSON5 configuration without a resolvable host json5 falls back to the file beside link.json; the note says the configuration could not be read and nothing of it is printed"
   ],
-  "contractSha256": "e2784a23d3c06cd9299806ee577995831f041666b1e609a27ac1d619fa30d574"
+  "contractSha256": "a96dc1a519cee0a7836e982ea973fa4d0b2d865d35a5ab669227fe4f119e0529"
 }
