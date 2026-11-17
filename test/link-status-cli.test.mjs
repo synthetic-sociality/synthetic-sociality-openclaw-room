@@ -9,7 +9,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {execFile} from "node:child_process";
-import {chmod, mkdir, mkdtemp, readFile, rm, writeFile} from "node:fs/promises";
+import {readFileSync} from "node:fs";
+import {chmod, cp, mkdir, mkdtemp, readFile, rm, writeFile} from "node:fs/promises";
+import {createRequire} from "node:module";
 import {tmpdir} from "node:os";
 import {dirname, join} from "node:path";
 import {fileURLToPath} from "node:url";
@@ -81,9 +83,9 @@ function report(statusPath, paths, link = {}) {
     lastConnectedAt: "2026-11-17T06:00:00.000Z", lastChannelErrorCode: "", ...link}), true);
 }
 
-function run(paths, env = {}) {
+function run(paths, env = {}, cli = CLI) {
   return new Promise((resolve) => {
-    execFile(process.execPath, [CLI, "status"], {
+    execFile(process.execPath, [cli, "status"], {
       env: {PATH: process.env.PATH, HOME: paths.home, OPENCLAW_STATE_DIR: paths.stateDir, ...env}, timeout: 20_000,
     }, (error, stdout, stderr) => resolve({code: error ? error.code ?? 1 : 0, stdout, stderr}));
   });
@@ -271,6 +273,88 @@ ls("LS-09 one path rule: the CLI uses the gateway's roomStatusPath and writes no
     connected(shown(await run(paths), paths), paths);
     assert.deepEqual([await readFile(join(paths.store, "link.json")), await readFile(join(elsewhere, "status.json"))], before);
     await assert.rejects(readFile(join(paths.store, "status.json")), /ENOENT/u);
+  } finally {
+    await paths.cleanup();
+  }
+});
+
+// The pinned host, found as test/host-load.test.mjs finds it.
+const PLUGIN_ROOT = fileURLToPath(new URL("..", import.meta.url));
+const PINNED_HOST = JSON.parse(readFileSync(join(PLUGIN_ROOT, "package.json"), "utf8")).peerDependencies.openclaw;
+function installedHost() {
+  const candidates = [process.env.OPENCLAW_HOST_ROOT];
+  try { candidates.push(dirname(createRequire(join(PLUGIN_ROOT, "package.json")).resolve("openclaw/package.json"))); } catch {}
+  candidates.push("/usr/local/lib/node_modules/openclaw");
+  for (const candidate of candidates.filter(Boolean)) {
+    try {
+      if (JSON.parse(readFileSync(join(candidate, "package.json"), "utf8")).version === PINNED_HOST) return candidate;
+    } catch {}
+  }
+  return null;
+}
+
+// A configuration as the host accepts it (JSON5): comments, unquoted keys,
+// single quotes and trailing commas, with credentials in it.
+async function configureJson5(paths, stateFile) {
+  const file = join(paths.stateDir, "openclaw.json");
+  await writeFile(file, `// Aura host configuration
+{
+  gateway: {auth: {mode: 'token', token: '${GATEWAY_TOKEN}'}}, /* the shared token */
+  models: {providers: {example: {apiKey: "${PROVIDER_KEY}"}}},
+  channels: {
+    "${CHANNEL}": {
+      enabled: true,
+      baseUrl: 'https://room.example/api',
+      stateFile: ${JSON.stringify(stateFile)}, // outside OPENCLAW_STATE_DIR
+    },
+  },
+}
+`, {mode: 0o600});
+  assert.throws(() => JSON.parse(readFileSync(file, "utf8")), SyntaxError);
+  return file;
+}
+
+ls("LS-10 a JSON5 configuration (comments, a trailing comma, an unquoted key) is read like the host reads it: Aura layout, the link is reported", async (t) => {
+  const hostRoot = installedHost();
+  if (!hostRoot) return t.skip(`OpenClaw ${PINNED_HOST} is not installed (set OPENCLAW_HOST_ROOT): its json5 cannot be loaded`);
+  const paths = await host("ls-json5");
+  try {
+    const room = join(paths.home, ".openclaw", CHANNEL);
+    await configureJson5(paths, await accountState(join(room, "accounts", "hpaey501k5fmc3n.json")));
+    report(join(room, "status.json"), paths);
+    // The host is found from its binary, as activation.js finds it.
+    connected(shown(await run(paths, {OPENCLAW_BIN: join(hostRoot, "openclaw.mjs")}), paths), paths);
+  } finally {
+    await paths.cleanup();
+  }
+});
+
+ls("LS-11 a JSON5 configuration without a resolvable host json5 falls back to the file beside link.json; the note says the configuration could not be read and nothing of it is printed", async () => {
+  const paths = await host("ls-json5-nohost");
+  try {
+    // A copy of the plugin with no host above it, and no host binary.
+    const plugin = join(paths.root, "plugin");
+    for (const name of ["bin", "src", "package.json"]) await cp(join(PLUGIN_ROOT, name), join(plugin, name), {recursive: true});
+    const cli = join(plugin, "bin", "link.js");
+    const env = {OPENCLAW_BIN: join(paths.root, "no-host", "openclaw.mjs")};
+    const room = join(paths.home, ".openclaw", CHANNEL);
+    await configureJson5(paths, await accountState(join(room, "accounts", "hpaey501k5fmc3n.json")));
+    report(join(room, "status.json"), paths);
+    let result = await run(paths, env, cli);
+    let view = shown(result, paths);
+    assert.equal(view.link, null);
+    assert.match(view.note, NOTE);
+    assert.match(view.note, /configuration could not be read/u);
+    assert.doesNotMatch(result.stdout + result.stderr, /Aura host configuration|shared token|room\.example|hpaey501k5fmc3n/u);
+    // A relative or bare binary name is never looked up.
+    for (const bin of ["openclaw", "./openclaw.mjs"]) {
+      result = await run(paths, {OPENCLAW_BIN: bin}, cli);
+      assert.match(shown(result, paths).note, /configuration could not be read/u);
+    }
+    // The file beside link.json still answers.
+    report(join(paths.store, "status.json"), paths, {state: "stopped", code: "link_revoked", channels: 0});
+    view = shown(await run(paths, env, cli), paths);
+    assert.deepEqual([view.link.state, view.link.code, "note" in view], ["stopped", "link_revoked", false]);
   } finally {
     await paths.cleanup();
   }
