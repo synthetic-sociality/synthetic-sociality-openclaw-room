@@ -347,13 +347,30 @@ ls("LS-10 a JSON5 configuration (comments, a trailing comma, an unquoted key) is
   }
 });
 
-ls("LS-11 a JSON5 configuration without a resolvable host json5 falls back to the file beside link.json; the note says the configuration could not be read and nothing of it is printed", async () => {
+// Whether a child started as run() starts it resolves an `openclaw` package
+// from that file: asked of Node itself, with the child's own environment, so
+// the answer covers every node_modules above the temporary directory and
+// Node's global folders.
+function hostAbove(paths, file) {
+  return new Promise((resolve) => {
+    execFile(process.execPath, ["-e", "try { require('node:module').createRequire(process.argv[1]).resolve('openclaw'); console.log('found'); } catch { console.log('none'); }", file], {
+      env: {PATH: process.env.PATH, HOME: paths.home, OPENCLAW_STATE_DIR: paths.stateDir}, timeout: 20_000,
+    }, (error, stdout) => resolve(error || stdout.trim() !== "none"));
+  });
+}
+
+ls("LS-11 a JSON5 configuration without a resolvable host json5 falls back to the file beside link.json; the note says the configuration could not be read and nothing of it is printed", async (t) => {
   const paths = await host("ls-json5-nohost");
   try {
     // A copy of the plugin with no host above it, and no host binary.
     const plugin = join(paths.root, "plugin");
     for (const name of ["bin", "src", "package.json"]) await cp(join(PLUGIN_ROOT, name), join(plugin, name), {recursive: true});
     const cli = join(plugin, "bin", "link.js");
+    // The case needs a place with no host: say so when this machine has one
+    // above the temporary directory, instead of failing on it.
+    if (await hostAbove(paths, join(plugin, "src", "link-cli.js"))) {
+      return t.skip("an openclaw package is resolvable from the temporary directory (a node_modules above it): no place without a host to test");
+    }
     const env = {OPENCLAW_BIN: join(paths.root, "no-host", "openclaw.mjs")};
     const room = join(paths.home, ".openclaw", CHANNEL);
     await configureJson5(paths, await accountState(join(room, "accounts", "hpaey501k5fmc3n.json")));
@@ -378,11 +395,104 @@ ls("LS-11 a JSON5 configuration without a resolvable host json5 falls back to th
   }
 });
 
+const NESTED_OPEN = "[".repeat(100_000);
+const NESTED = [NESTED_OPEN, NESTED_OPEN + "]".repeat(100_000)];
+const STACK = /\n\s+at [^\n]*\(|RangeError|Maximum call stack|node:internal/u;
+
+// Exit 0, the record, and no stack trace on either stream.
+function quiet(result, paths) {
+  assert.doesNotMatch(result.stdout + result.stderr, STACK);
+  assert.equal(result.stderr, "");
+  return shown(result, paths);
+}
+
+ls("LS-12 (LSC-04) deeply nested: a status file or a host configuration of 100000 opening brackets, also closed again, never fails the command", async (t) => {
+  const paths = await host("ls-nested");
+  try {
+    const elsewhere = join(paths.root, "elsewhere");
+    const config = await configure(paths, {enabled: true, baseUrl: "https://room.example/api", stateFile: await accountState(join(elsewhere, "room-state.json"))});
+    await mkdir(paths.store, {recursive: true});
+    for (const text of NESTED) {
+      // The gateway's status file and the one beside link.json: the record and the plain statement.
+      await writeFile(join(elsewhere, "status.json"), text, {mode: 0o600});
+      await writeFile(join(paths.store, "status.json"), text, {mode: 0o600});
+      const view = quiet(await run(paths), paths);
+      assert.equal(view.link, null);
+      assert.match(view.note, NOTE);
+      // Only the gateway's file is such a file: the file beside link.json answers.
+      report(join(paths.store, "status.json"), paths, {state: "stopped", code: "link_revoked", channels: 0});
+      assert.deepEqual([quiet(await run(paths), paths).link.code], ["link_revoked"]);
+    }
+    // The host configuration: the command falls back to the file beside link.json.
+    report(join(elsewhere, "status.json"), paths);
+    const hostRoot = installedHost();
+    if (!hostRoot) t.diagnostic(`OpenClaw ${PINNED_HOST} is not installed (set OPENCLAW_HOST_ROOT): the configuration is not run through the host's json5`);
+    // As JSON sees it, and (behind a comment, which JSON refuses) as the JSON5 fallback sees it.
+    const environments = [{OPENCLAW_BIN: join(paths.root, "no-host", "openclaw.mjs")}, ...(hostRoot ? [{OPENCLAW_BIN: join(hostRoot, "openclaw.mjs")}] : [])];
+    for (const text of [...NESTED, ...NESTED.map((nested) => `// nested\n${nested}`)]) {
+      await writeFile(config, text, {mode: 0o600});
+      for (const env of environments) {
+        report(join(paths.store, "status.json"), paths, {state: "stopped", code: "link_revoked", channels: 0});
+        assert.deepEqual([quiet(await run(paths, env), paths).link.code], ["link_revoked"]);
+        await rm(join(paths.store, "status.json"));
+        const view = quiet(await run(paths, env), paths);
+        assert.equal(view.link, null);
+        assert.match(view.note, NOTE);
+      }
+    }
+  } finally {
+    await paths.cleanup();
+  }
+});
+
+ls("LS-13 a configuration with ${VAR} or $include and no link in the gateway's status file: the note says the command does not resolve variables or includes", async () => {
+  const paths = await host("ls-variables");
+  try {
+    const UNRESOLVED = /uses variables or includes that this command does not resolve/u;
+    const room = join(paths.root, "data", "room");
+    await accountState(join(room, "accounts", "main.json"));
+    report(join(room, "status.json"), paths);
+    const config = join(paths.stateDir, "openclaw.json");
+    const texts = [
+      // The gateway expands the variable; this command sees the literal text.
+      JSON.stringify({gateway: {auth: {token: GATEWAY_TOKEN}}, channels: {[CHANNEL]: {enabled: true, baseUrl: "https://room.example/api", stateFile: "${ROOM_DATA}/accounts/main.json"}}}),
+      // The channel is in an included file.
+      JSON.stringify({gateway: {auth: {token: GATEWAY_TOKEN}}, $include: "./channels.json"}),
+    ];
+    for (const text of texts) {
+      await writeFile(config, text, {mode: 0o600});
+      const result = await run(paths, {ROOM_DATA: room});
+      const view = shown(result, paths);
+      assert.equal(view.link, null);
+      assert.match(view.note, UNRESOLVED);
+      assert.doesNotMatch(view.note, NOTE);
+      assert.doesNotMatch(result.stdout + result.stderr, /ROOM_DATA|channels\.json|room\.example/u);
+      // A file beside link.json that names the link is still shown, without a note.
+      report(join(paths.store, "status.json"), paths, {state: "stopped", code: "link_revoked", channels: 0});
+      const beside = shown(await run(paths, {ROOM_DATA: room}), paths);
+      assert.deepEqual([beside.link.code, "note" in beside], ["link_revoked", false]);
+      await rm(join(paths.store, "status.json"));
+    }
+    // Without variables or includes the plain statement stays as it is.
+    await configure(paths, {enabled: true, baseUrl: "https://room.example/api", stateFile: join(paths.root, "nowhere", "accounts", "main.json")});
+    const view = shown(await run(paths), paths);
+    assert.match(view.note, NOTE);
+    assert.doesNotMatch(view.note, UNRESOLVED);
+    // A configuration that cannot be read keeps its own note, also with a variable in the text.
+    await writeFile(config, "{\"stateFile\": \"${ROOM_DATA}\", ", {mode: 0o600});
+    const unread = shown(await run(paths, {OPENCLAW_BIN: join(paths.root, "no-host", "openclaw.mjs")}), paths);
+    assert.match(unread.note, /configuration could not be read/u);
+    assert.doesNotMatch(unread.note, UNRESOLVED);
+  } finally {
+    await paths.cleanup();
+  }
+});
+
 lsc("LSC-01 the status file the gateway writes is found by the gateway's own path rule, also when it is not beside the link record", "LS-01", "LS-02", "LS-03", "LS-09");
 lsc("LSC-02 the link record without its secrets and the link object are shown as the gateway reports them", "LS-04", "LS-05", "LS-08");
 lsc("LSC-03 no status file names the link: a plain statement that the gateway has not reported it", "LS-07");
-lsc("LSC-04 a missing or unreadable status file or host configuration never fails the command", "LS-06", "LS-07", "LS-11");
-lsc("LSC-05 a host configuration is read the way the host reads it; without such a dependency none is read", "LS-10");
+lsc("LSC-04 a missing or unreadable status file or host configuration never fails the command", "LS-06", "LS-07", "LS-11", "LS-12");
+lsc("LSC-05 a host configuration is read the way the host reads it; without such a dependency none is read", "LS-10", "LS-13");
 lsc("LSC-06 the command writes nothing and prints no credential, configuration or account content", "LS-09", "LS-11");
 
 test("LS conformance: the regression cases are the ones pinned in conformance.json", () => {

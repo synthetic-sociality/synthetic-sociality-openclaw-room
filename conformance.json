@@ -1679,7 +1679,9 @@
     "LS-08 the gateway's status file wins over an older file beside link.json; without a link entry there, the file beside link.json is shown",
     "LS-09 one path rule: the CLI uses the gateway's roomStatusPath and writes nothing",
     "LS-10 a JSON5 configuration (comments, a trailing comma, an unquoted key) is read like the host reads it: Aura layout, the link is reported",
-    "LS-11 a JSON5 configuration without a resolvable host json5 falls back to the file beside link.json; the note says the configuration could not be read and nothing of it is printed"
+    "LS-11 a JSON5 configuration without a resolvable host json5 falls back to the file beside link.json; the note says the configuration could not be read and nothing of it is printed",
+    "LS-12 (LSC-04) deeply nested: a status file or a host configuration of 100000 opening brackets, also closed again, never fails the command",
+    "LS-13 a configuration with ${VAR} or $include and no link in the gateway's status file: the note says the command does not resolve variables or includes"
   ],
   "contractSha256": "a96dc1a519cee0a7836e982ea973fa4d0b2d865d35a5ab669227fe4f119e0529"
 }
