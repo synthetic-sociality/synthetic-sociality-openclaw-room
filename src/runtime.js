@@ -897,6 +897,9 @@ export class OpenClawRoomRuntime {
         } catch (error) {
           if (!this.waitForRenewal || !(error instanceof RoomAPIError) || error.code !== "credential_expired") throw error;
           this.credentialExpired = true;
+          // Contract P2c-3d: stopped by the Room, with its code, through every
+          // renewal wait; a registration on a renewed credential ends it.
+          this.reportStatus({connection: "stopped", errorCode: "credential_expired"});
           // Keep this enabled account's renewal-only maintenance alive even if
           // the host would otherwise exhaust its account restart budget. Never
           // infer expiry from generic auth failure, nor register a revoked base.
@@ -910,7 +913,10 @@ export class OpenClawRoomRuntime {
       // Revocation is final, unlike expiry: the Room removed this membership or
       // replaced its credential. Record it so neither this runtime nor the host
       // starts the account again; otherwise every restart is refused forever.
-      if (error instanceof RoomAPIError && error.code === "credential_revoked") await this.retireRevokedAccount();
+      if (error instanceof RoomAPIError && error.code === "credential_revoked") {
+        this.reportStatus({connection: "stopped", errorCode: "credential_revoked"});
+        await this.retireRevokedAccount();
+      }
       throw error;
     }
     if (this.closed) throw new Error("Room account closed during credential maintenance");
@@ -3549,6 +3555,8 @@ export class OpenClawRoomRuntime {
           if (error instanceof RoomAPIError && (error.code === "credential_revoked" || error.code === "credential_expired")) {
             this.heartbeatError = error;
             this.logger?.error?.(`Room heartbeat loop stopped${roomErrorDiagnostic(error)}`);
+            // Contract P2c-3d: reported at the first such answer.
+            this.reportStatus({connection: "stopped", errorCode: error.code});
             this.heartbeatAbort.abort(error);
             return;
           }

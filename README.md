@@ -27,6 +27,19 @@ content. P9 separately hands verified photo bytes to the host; the connector
 never executes uploaded content. An exact artifact read also invokes the Room server's supported
 deterministic text backfill for older pending versions.
 
+Version 0.2.88 (contract paragraph "P2c-3d Stopped by the Room (2026-11-17)",
+contract 7fec9f97; paired with Hermes 1.0.113): a membership stopped by the
+Room is reported as stopped with its reason (contract P2c-3d). After the Room
+answers `credential_expired` or `credential_revoked`, the membership's entry in
+`status.json` reads connection `stopped` with that code as `lastErrorCode`,
+from the first such answer and through every renewal wait; a later start or
+retry of the account no longer writes `connecting` or `reconnecting` over it,
+nor another code. 0.2.87 showed `connecting` with no code while an expired
+membership waited for a renewal the Room owner never approved. A renewal or
+re-admission that succeeds returns the membership to the normal path, and only
+then does its connection change; other memberships' entries are unchanged. The four shared cases
+are `parityP2c3dCases` (SBR-01 to SBR-04, the same strings as Hermes).
+
 Version 0.2.87 (contract paragraph "L1-11a Status command (2026-11-17)",
 contract a96dc1a5; paired with Hermes 1.0.112): the status command follows
 contract L1-11a, the rule both connectors share; the six shared cases are

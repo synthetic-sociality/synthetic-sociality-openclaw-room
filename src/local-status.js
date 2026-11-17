@@ -14,6 +14,9 @@ const CONNECTION_STATES = new Set(["connecting", "connected", "reconnecting", "i
 // Contract P2c-4 (tkw-049): the `rooms` summary takes the membership whose
 // connection is worst in this order, ties by the smallest membership id.
 const CONNECTION_ORDER = ["stopped", "reconnecting", "connecting", "inactive", "connected"];
+// Contract P2c-3d: the Room's answers that stop a membership until a renewal
+// or re-admission succeeds.
+const STOPPED_BY_ROOM = new Set(["credential_expired", "credential_revoked"]);
 // Contract P2c-6: the tool names that count as web reading (Hermes
 // WEB_READ_TOOL_NAMES, the same list).
 export const WEB_READ_TOOL_NAMES = Object.freeze(["browser", "browser_navigate", "web_extract", "web_fetch", "web_search"]);
@@ -258,6 +261,14 @@ export class LocalStatus {
       };
       this.entries.set(key, entry);
       if (entry.membershipId) this.data.memberships[key] = entry;
+    }
+    // Contract P2c-3d: a membership the Room stopped stays stopped with its
+    // code while it waits; only an accepted contact (`connected`) changes it.
+    // A later start, retry or stop of the channel never writes over it.
+    if (!connected && entry.connection === "stopped" && STOPPED_BY_ROOM.has(entry.lastErrorCode)) {
+      if (connection !== "stopped") connection = undefined;
+      if (errorCode !== undefined && !STOPPED_BY_ROOM.has(code(errorCode))) errorCode = undefined;
+      inactive = undefined;
     }
     const unstamped = () => JSON.stringify([{...entry, lastConnectedAt: null}, {...this.data.rooms[roomKey], lastConnectedAt: null}]);
     const before = unstamped();
