@@ -23,6 +23,7 @@ const REASONS = {
 };
 const NOT_REPORTED = "The OpenClaw gateway has not reported the link: its status file has no link entry. Check that the gateway is running.";
 const CONFIG_UNREAD = "The OpenClaw gateway has not reported the link: the host configuration could not be read, and the status file beside link.json has no link entry. Check that the gateway is running.";
+const CONFIG_UNRESOLVED = "No status file this command reads names the link: the host configuration uses variables or includes that this command does not resolve (${VAR}, $include), so the gateway's status file may be in a place it cannot find. Check that the gateway is running.";
 const plain = (code) => (REASONS[code] ? `${REASONS[code]} (${code})` : code);
 
 // Lines from the input stream; a hidden read on a terminal turns echo off.
@@ -144,17 +145,21 @@ function hostJson5() {
 // The host configuration of the store the record is in: OPENCLAW_CONFIG_PATH,
 // else openclaw.json in the state directory (the parent of the fenced store).
 // Read as the host reads it: JSON, then JSON5 with the host's parser. Only
-// its account paths are used; nothing of it is printed.
+// its account paths are used; nothing of it is printed. The host's ${VAR}
+// substitution and $include are not resolved here: `unresolved` says that the
+// text uses them.
 function hostConfig(path) {
   const configured = String(process.env.OPENCLAW_CONFIG_PATH ?? "").trim();
   const text = readFileSync(configured || join(dirname(dirname(path)), "openclaw.json"), "utf8");
+  let config;
   try {
-    return JSON.parse(text);
+    config = JSON.parse(text);
   } catch (error) {
     const json5 = error instanceof SyntaxError ? hostJson5() : null;
     if (!json5) throw error;
-    return json5.parse(text);
+    config = json5.parse(text);
   }
+  return {config, unresolved: /\$\{[^}\s]+\}|\$include/u.test(text)};
 }
 
 // The link as the running gateway reports it: from the status file the
@@ -162,12 +167,16 @@ function hostConfig(path) {
 // use, which on Aura is outside OPENCLAW_STATE_DIR), then from the file
 // beside link.json, which is also where a configuration that cannot be read
 // leads. `link` is null when neither names the link; `configUnread` says
-// that a configuration is there and could not be read.
+// that a configuration is there and could not be read, `configUnresolved`
+// that it was read and uses variables or includes.
 function linkStatus(path) {
   const files = [];
   let configUnread = false;
+  let configUnresolved = false;
   try {
-    files.push(roomStatusPath(hostConfig(path)));
+    const {config, unresolved} = hostConfig(path);
+    configUnresolved = unresolved;
+    files.push(roomStatusPath(config));
   } catch (error) {
     // No readable configuration: only the file beside link.json.
     configUnread = error?.code !== "ENOENT";
@@ -176,12 +185,12 @@ function linkStatus(path) {
   for (const file of new Set(files)) {
     try {
       const link = JSON.parse(readFileSync(file, "utf8"))?.link;
-      if (link !== null && typeof link === "object") return {link, configUnread};
+      if (link !== null && typeof link === "object") return {link, configUnread, configUnresolved};
     } catch {
       // A missing or unreadable status file reports nothing.
     }
   }
-  return {link: null, configUnread};
+  return {link: null, configUnread, configUnresolved};
 }
 
 async function link({prompter, out, path, sender, now, label}) {
@@ -238,12 +247,12 @@ function status({out, path}) {
   } catch {
     readable = false;
   }
-  const {link: reported, configUnread} = linkStatus(path);
+  const {link: reported, configUnread, configUnresolved} = linkStatus(path);
   out(`${JSON.stringify({
     record: readable ? (record ? publicView(record) : null) : "unreadable",
     pending: pending ? publicView(pending) : null,
     link: reported,
-    ...(reported ? {} : {note: configUnread ? CONFIG_UNREAD : NOT_REPORTED}),
+    ...(reported ? {} : {note: configUnread ? CONFIG_UNREAD : configUnresolved ? CONFIG_UNRESOLVED : NOT_REPORTED}),
   }, null, 2)}\n`);
   return 0;
 }

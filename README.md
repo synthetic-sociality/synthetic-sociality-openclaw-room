@@ -39,7 +39,10 @@ link worked. The command reads a JSON5 configuration like the host (JSON
 first, then JSON5 with the host's own `json5` package; nothing is added to this
 plugin's dependencies). When the host configuration cannot be read, the file
 beside `link.json` is used; when no status file names the link, the output says
-so in `note`, and also when the configuration could not be read. The gateway,
+so in `note`, and also when the configuration could not be read. The command
+does not resolve `${VAR}` or `$include` in the host configuration; when the
+configuration uses them and no status file names the link, the note says that
+instead. The gateway,
 `link.json` and the frames are unchanged.
 
 Version 0.2.86 (contract paragraph "Link features (additive, frame version 1,
