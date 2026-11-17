@@ -27,6 +27,18 @@ content. P9 separately hands verified photo bytes to the host; the connector
 never executes uploaded content. An exact artifact read also invokes the Room server's supported
 deterministic text backfill for older pending versions.
 
+Version 0.2.86 (contract paragraph "Link features (additive, frame version 1,
+2026-11-17)", contract e2784a23): when the Harness advertises
+`limits.openclawLinkFeatures: 1`, `openclaw-opened` names the channel's
+features (`create`, `archive`, `attachments`, `approvals`) and the link admits
+`sessions.create`, `sessions.patch` (archive only, for keys the gateway
+returned on that channel), `chat.send` attachments (validated, at most 10 files
+and 716800 bytes) and the approval requests, lists and answers of the sessions
+that channel serves. The connect asks `operator.approvals` and retries once
+without it; `approvals` is announced only when the gateway grants the scope.
+An approval request with a string over 32768 characters is never forwarded
+(answer it in OpenClaw). With an older Harness everything stays as in 0.2.85.
+
 Version 0.2.85 (contract paragraph "Open-failure reason (additive, frame version
 1)", contract 82e2e311): when a channel cannot open, `openclaw-open-failed`
 carries one code of the closed list in `reason` (`local_gateway_refused`,
@@ -1153,6 +1165,13 @@ before it reaches the gateway. The gateway's own token never leaves the
 machine. The link reaches the gateway at `127.0.0.1` on `gateway.port`; a
 gateway bound to the tailnet only, or using another auth mode than token,
 password or none, reports `local_gateway_auth_unavailable`.
+
+With an up-to-date Harness, the link can do more: start new sessions, archive
+sessions, send files and photos, and answer approval requests. Approvals are
+answered only for the conversations open in that Harness seat: a request from
+another conversation is never shown there, and an answer for it is refused on
+your machine. Archiving changes nothing but the archive mark. With an older
+Harness, the link does only what the previous paragraph lists.
 
 ## Development verification
 

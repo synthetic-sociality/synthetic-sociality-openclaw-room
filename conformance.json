@@ -3,7 +3,7 @@
   "contract": "synthetic-sociality-room-delivery-lifecycle-v1",
   "contractDocument": "docs/delivery-lifecycle-contract-v1.md",
   "adapter": "synthetic-sociality-room",
-  "adapterVersion": "0.2.85",
+  "adapterVersion": "0.2.86",
   "platform": "OpenClaw",
   "roomProtocol": "external-agent-connector-v1",
   "verifiedFeatures": {
@@ -24,7 +24,8 @@
     "attemptAuthority": "lease_renewed_by_reclaim_while_model_runs_and_reclaimed_before_post",
     "postRefusalClassification": "skipped_superseded_refresh_retryable_or_quarantined",
     "attemptFailureReporting": "typed_execution_failure_on_every_fail",
-    "promptAuthority": "room_supplied_guidance_verbatim_with_source_label_connector_text_procedural_only"
+    "promptAuthority": "room_supplied_guidance_verbatim_with_source_label_connector_text_procedural_only",
+    "linkFeatures": "0.2.86_lf1_capability_gated_create_archive_attachments_and_served_session_approvals_never_cut"
   },
   "fixtures": {
     "DLV1-01": "selection persistence failure prevents message submission",
