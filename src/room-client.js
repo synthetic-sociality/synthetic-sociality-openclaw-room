@@ -142,7 +142,11 @@ export class RoomAPIError extends Error {
     this.fieldPaths = fieldPaths;
     this.retryable = status === 429 || status >= 500 || body?.retryable === true;
     // Contract P2c-3a: seconds from the response's Retry-After, at most 120.
-    this.retryAfter = Math.max(0, Math.min(RETRY_AFTER_MAXIMUM_SECONDS, Number(retryAfter) || 0));
+    // P2c-3e: or the Room's retryAfterSeconds detail, when longer (a proxy may
+    // drop the header).
+    const detail = Number(body?.details?.retryAfterSeconds ?? body?.retryAfterSeconds);
+    this.retryAfter = Math.max(0, Math.min(RETRY_AFTER_MAXIMUM_SECONDS,
+      Math.max(Number(retryAfter) || 0, Number.isFinite(detail) ? detail : 0)));
     // Contract L1-18: the shape of any server code (as Hermes' _REFUSAL_CODE),
     // so an unknown cycle-start refusal is still terminal for its source.
     this.refusalCode = typeof body?.code === "string" && /^[a-z][a-z0-9_]{0,63}$/u.test(body.code) ? body.code : "";

@@ -633,6 +633,53 @@ export function reconnectDelayMs(step, {firstMs = RECONNECT_FIRST_MS, capMs = RE
   return Math.max(delay, Math.min(Math.max(0, Number(retryAfterSeconds) || 0) * 1000, bound));
 }
 
+// Contract P2c-3e: one recovery budget per installation: at most this many
+// connector-session registrations start in any window, across all its
+// memberships; one over the budget waits for the next free slot, in order.
+export const RECOVERY_BUDGET_STARTS = 6;
+export const RECOVERY_BUDGET_WINDOW_MS = 60_000;
+
+class RecoveryBudget {
+  constructor() {
+    this.starts = [];
+    this.queue = Promise.resolve();
+  }
+
+  acquire(signal) {
+    const slot = this.queue.then(() => this.take(signal));
+    this.queue = slot.catch(() => {});
+    return slot;
+  }
+
+  async take(signal) {
+    for (;;) {
+      signal?.throwIfAborted();
+      const now = Date.now();
+      while (this.starts.length && now - this.starts[0] >= RECOVERY_BUDGET_WINDOW_MS) this.starts.shift();
+      if (this.starts.length < RECOVERY_BUDGET_STARTS) {
+        this.starts.push(now);
+        return;
+      }
+      await sleep(this.starts[0] + RECOVERY_BUDGET_WINDOW_MS - now, signal);
+    }
+  }
+}
+
+// Contract P2c-3e: the budgets of this process, keyed by installation (the
+// directory of its status file, as P17's installation id).
+const recoveryBudgets = new Map();
+
+export function recoveryBudgetFor(directory) {
+  const key = resolve(String(directory ?? ""));
+  let budget = recoveryBudgets.get(key);
+  if (!budget) recoveryBudgets.set(key, budget = new RecoveryBudget());
+  return budget;
+}
+
+export function resetRecoveryBudgets() {
+  recoveryBudgets.clear();
+}
+
 // An event page whose active epoch metadata is invalid: never processed, and
 // read again from the same cursor on the P2c-3a schedule.
 export class InvalidEventPage extends Error {
@@ -826,6 +873,9 @@ export class OpenClawRoomRuntime {
     this.participation = new ParticipationGate({probe: (signal) => this.ownMembershipStatus(signal), recheckMs: () => this.inactiveRecheckMs});
     // Full passes of the event scan completed without a failure (P2c-3a reset).
     this.scanPasses = 0;
+    // Contract P2c-3e: the step of this membership's recovery schedule, kept
+    // across failed registrations and heartbeats of one outage.
+    this.recoveryStep = 0;
   }
 
   async initialize(signal) {
@@ -853,8 +903,27 @@ export class OpenClawRoomRuntime {
         if (signal?.aborted || this.closed || !transientRoomFailure(error)) throw error;
         if (step === 0) this.logger?.warn?.(`Room start failed${roomErrorDiagnostic(error)}; retrying inside the connector`);
         this.reportStatus({connection: "reconnecting", errorCode: statusErrorCode(error)});
-        await sleep(this.retryDelay(step, error), signal);
+        await sleep(this.recoveryDelay(error), signal);
       }
+    }
+  }
+
+  // Contract P2c-3e: the wait after a failed registration or heartbeat; the
+  // step persists until the Room accepts a heartbeat (maintainPresence).
+  recoveryDelay(error = null) {
+    const delay = this.retryDelay(this.recoveryStep, error);
+    this.recoveryStep += 1;
+    return delay;
+  }
+
+  // Contract P2c-3e: a membership stopped by the Room (P2c-3d) does not use
+  // the installation's recovery budget.
+  stoppedByRoom() {
+    if (this.credentialExpired) return true;
+    try {
+      return this.status?.stoppedByRoom?.(String(this.state?.membershipId ?? "")) === true;
+    } catch {
+      return false;
     }
   }
 
@@ -944,6 +1013,17 @@ export class OpenClawRoomRuntime {
 
   async registerConnector(signal) {
     const installationId = this.installationId();
+    // Contract P2c-3e: every registration start takes a slot of the
+    // installation's budget, waiting for the next free one.
+    if (!this.stoppedByRoom()) {
+      let installation;
+      try {
+        installation = this.status?.path ? dirname(this.status.path) : roomStateDirectory(this.account.stateFile);
+      } catch {
+        installation = dirname(this.account.stateFile);
+      }
+      await recoveryBudgetFor(installation).acquire(signal);
+    }
     this.connectorSession = await this.client.register(this.state, {
       clientInstanceId: this.state.clientInstanceId,
       contractVersion: 1,
@@ -1259,6 +1339,9 @@ export class OpenClawRoomRuntime {
         }
         this.failClosedOnRequestError(error);
         if (signal?.aborted || this.closed || !transientRoomFailure(error)) throw error;
+        // Contract P2c-3e: a failed registration owed after a lost session
+        // waits on the membership's recovery schedule.
+        const recovering = this.reregister;
         if (failed && (this.scanPasses !== failed.passes
           || (failed.contact && (this.client?.contactSucceeded?.(failed.contact) ?? 0) > failed.successes))) step = 0;
         const contact = typeof error?.roomContact === "string" ? error.roomContact : "";
@@ -1266,7 +1349,7 @@ export class OpenClawRoomRuntime {
         this.logger?.warn?.(`Room event processing interrupted${roomErrorDiagnostic(error)}${error instanceof InvalidEventPage ? " (invalid event page)" : ""}; resuming from the acknowledged position`);
         this.reportStatus({connection: "reconnecting", errorCode: statusErrorCode(error)});
         this.pendingEvent = null;
-        await sleep(this.retryDelay(step, error), signal);
+        await sleep(recovering ? this.recoveryDelay(error) : this.retryDelay(step, error), signal);
         step += 1;
       }
     }
@@ -3540,16 +3623,15 @@ export class OpenClawRoomRuntime {
   runHeartbeat() {
     const loop = async () => {
       // P2c-3a: a failed heartbeat is retried on the schedule, not at the
-      // heartbeat interval; success resets it. P8-1: the interval of the
-      // latest session answer, at most 60 s.
+      // heartbeat interval; P2c-3e: only an accepted heartbeat resets it
+      // (maintainPresence), not an accepted registration. P8-1: the interval
+      // of the latest session answer, at most 60 s.
       let delay = this.heartbeatIntervalMs();
-      let step = 0;
       while (!this.closed && !this.heartbeatAbort.signal.aborted) {
         await backgroundSleep(delay, this.heartbeatAbort.signal);
         try {
           await this.maintainPresence(this.heartbeatAbort.signal);
           delay = this.heartbeatIntervalMs();
-          step = 0;
         } catch (error) {
           if (this.closed || this.heartbeatAbort.signal.aborted) return;
           if (error instanceof RoomAPIError && (error.code === "credential_revoked" || error.code === "credential_expired")) {
@@ -3572,8 +3654,7 @@ export class OpenClawRoomRuntime {
           // (flagged in maintainPresence) registers it again.
           this.reportStatus({connection: "reconnecting", errorCode: statusErrorCode(error)});
           this.logger?.warn?.(`Room heartbeat failed${roomErrorDiagnostic(error)}; retrying`);
-          delay = this.retryDelay(step, error);
-          step += 1;
+          delay = this.recoveryDelay(error);
         }
       }
     };
@@ -3597,6 +3678,8 @@ export class OpenClawRoomRuntime {
         try {
           const answer = await this.client.heartbeat(this.state, this.connectorSession.sessionId, signal);
           this.presenceAcceptedAt = Date.now();
+          // Contract P2c-3e: the Room accepted a heartbeat on this session.
+          this.recoveryStep = 0;
           // Contract P17-2: an owner control command for this installation.
           this.noteConnectorControl(answer?.connectorControl);
           // P8-1: a later session answer's interval takes effect.

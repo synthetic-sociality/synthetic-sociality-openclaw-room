@@ -840,6 +840,9 @@ test("the scan loop's schedule returns to its first step after a full pass, neve
     reads += 1;
     if (script[reads - 1] === false) {
       // A registration accepted meanwhile (another loop) resets nothing here.
+      // The installation's recovery budget (P2c-3e, its own suite) is not this
+      // test's subject: each stand-in registration starts with a fresh one.
+      runtimeModule.resetRecoveryBudgets();
       await runtime.registerConnector();
       throw new RoomAPIError(503, {});
     }

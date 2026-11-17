@@ -231,6 +231,13 @@ export class LocalStatus {
     this.write();
   }
 
+  // Contract P2c-3e: this membership's entry says it is stopped by the Room
+  // (P2c-3d), so its registrations stay outside the recovery budget.
+  stoppedByRoom(membershipId) {
+    const entry = membershipId ? this.data.memberships[String(membershipId)] : null;
+    return entry?.connection === "stopped" && STOPPED_BY_ROOM.has(entry.lastErrorCode);
+  }
+
   // Update one membership's entry and its Room summary; write only when
   // something changed.
   room(roomId, membershipId = "", {connection, errorCode, connected = false, registered = false, inactive,
