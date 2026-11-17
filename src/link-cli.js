@@ -1,11 +1,13 @@
 // Contract L1o-1: `openclaw-room-link`, run by the person on their OpenClaw
 // host. `link` (the default) reads the token from the person's OpenClaw card
 // at a hidden prompt, shows the server and asks before anything is written,
-// then confirms the pairing once; `status` shows the link without secrets;
+// then confirms the pairing once; `status` shows the link without secrets,
+// with the link state the running gateway reports in its status file;
 // `unlink` deletes the local key and record. The token, the pairing secret
 // and the key are never printed.
 import {readFileSync} from "node:fs";
-import {join} from "node:path";
+import {dirname, join} from "node:path";
+import {roomStatusPath} from "./account-discovery.js";
 import {
   LinkError, MAX_TOKEN_LENGTH, confirmPending, deleteLink, deviceLabel, discardPending, linkPath, parseToken,
   pendingPath, pendingRecord, publicView, readLink, sendConfirmation, serverHost, withLinkLock, writeLink,
@@ -17,6 +19,7 @@ const CARD = "Settings > Plugins > OpenClaw > Link";
 const REASONS = {
   link_blocked_by_site_protection: "The request was blocked by the site's bot protection before it reached the Harness",
 };
+const NOT_REPORTED = "The OpenClaw gateway has not reported the link: its status file has no link entry. Check that the gateway is running.";
 const plain = (code) => (REASONS[code] ? `${REASONS[code]} (${code})` : code);
 
 // Lines from the input stream; a hidden read on a terminal turns echo off.
@@ -96,12 +99,36 @@ class Prompter {
   }
 }
 
+// The host configuration of the store the record is in: OPENCLAW_CONFIG_PATH,
+// else openclaw.json in the state directory (the parent of the fenced store).
+// Only its account paths are used; nothing of it is printed.
+function hostConfig(path) {
+  const configured = String(process.env.OPENCLAW_CONFIG_PATH ?? "").trim();
+  return JSON.parse(readFileSync(configured || join(dirname(dirname(path)), "openclaw.json"), "utf8"));
+}
+
+// The link as the running gateway reports it: from the status file the
+// gateway writes (the gateway's own path rule, next to the account state in
+// use, which on Aura is outside OPENCLAW_STATE_DIR), then from the file
+// beside link.json, which is also where a configuration that cannot be read
+// leads. Null when neither names the link.
 function linkStatus(path) {
+  const files = [];
   try {
-    return JSON.parse(readFileSync(join(path, "..", "status.json"), "utf8"))?.link ?? null;
+    files.push(roomStatusPath(hostConfig(path)));
   } catch {
-    return null;
+    // No readable configuration: only the file beside link.json.
   }
+  files.push(join(dirname(path), "status.json"));
+  for (const file of new Set(files)) {
+    try {
+      const reported = JSON.parse(readFileSync(file, "utf8"))?.link;
+      if (reported !== null && typeof reported === "object") return reported;
+    } catch {
+      // A missing or unreadable status file reports nothing.
+    }
+  }
+  return null;
 }
 
 async function link({prompter, out, path, sender, now, label}) {
@@ -158,10 +185,12 @@ function status({out, path}) {
   } catch {
     readable = false;
   }
+  const reported = linkStatus(path);
   out(`${JSON.stringify({
     record: readable ? (record ? publicView(record) : null) : "unreadable",
     pending: pending ? publicView(pending) : null,
-    link: linkStatus(path),
+    link: reported,
+    ...(reported ? {} : {note: NOT_REPORTED}),
   }, null, 2)}\n`);
   return 0;
 }

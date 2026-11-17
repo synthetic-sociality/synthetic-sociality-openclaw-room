@@ -1660,5 +1660,16 @@
   "statusReadinessCases": [
     "STATUS-01 status.json carries every updater readiness field with the shared names and types"
   ],
+  "linkStatusCliCases": [
+    "LS-01 Aura layout: accounts outside OPENCLAW_STATE_DIR, the gateway's status file beside them, the link is reported",
+    "LS-02 a state file outside any accounts/ directory: the status file in its own directory is read",
+    "LS-03 the configuration at OPENCLAW_CONFIG_PATH; named accounts alone leave the gateway's file under the plugin root",
+    "LS-04 accounts/ layout under the state directory: the status file beside link.json is read",
+    "LS-05 no accounts: the status file under the plugin root is read",
+    "LS-06 a missing or unreadable configuration falls back to the file beside link.json and never throws",
+    "LS-07 no link entry in either file: link is null and a plain note says the gateway has not reported it",
+    "LS-08 the gateway's status file wins over an older file beside link.json; without a link entry there, the file beside link.json is shown",
+    "LS-09 one path rule: the CLI uses the gateway's roomStatusPath and writes nothing"
+  ],
   "contractSha256": "e2784a23d3c06cd9299806ee577995831f041666b1e609a27ac1d619fa30d574"
 }

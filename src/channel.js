@@ -2,7 +2,7 @@ import {ShareTurn, beginShareTurn, endShareTurn, registerRoomShareFileTool} from
 import {defineChannelPluginEntry} from "openclaw/plugin-sdk/channel-core";
 import {defineChannelMessageAdapter} from "openclaw/plugin-sdk/channel-message";
 import {buildChannelInboundEventContext} from "openclaw/plugin-sdk/channel-inbound";
-import {basename, dirname, join, resolve} from "node:path";
+import {dirname} from "node:path";
 import {loadState, openClawStateDirectory} from "./state.js";
 import {registerRoomCommands} from "./commands.js";
 import {markChannelActive, markChannelInactive, registerPresenceFallback} from "./presence-fallback.js";
@@ -10,7 +10,7 @@ import {registerRoomHistoryTool} from "./history.js";
 import {registerRoomDocumentTool} from "./document-tool.js";
 import {noteHostSession} from "./documents.js";
 import {claimRuntimeOwnership} from "./account.js";
-import {resolveRoomAccount as resolveAccount, resolvedRoomAccounts} from "./account-discovery.js";
+import {resolveRoomAccount as resolveAccount, resolvedRoomAccounts, roomStatusPath, roomStoreRoot} from "./account-discovery.js";
 import {looksLikeRoomId, normalizeRoomTarget, resolveConfiguredRoomTarget} from "./target.js";
 import {outboundIdempotencyKey} from "./outbound.js";
 import {isPrivateApprovalText, roomExecApprovalPolicy} from "./exec-approval-policy.js";
@@ -81,10 +81,6 @@ export async function hostNoticeKind(payload, info) {
 
 // Contract P2c-1: the Room store is the plugin's state root plus the directory
 // of every configured account's state file.
-function roomStoreRoot() {
-  return join(openClawStateDirectory(), ID);
-}
-
 export function roomStoreDirectories(cfg) {
   const directories = [roomStoreRoot()];
   try {
@@ -95,25 +91,8 @@ export function roomStoreDirectories(cfg) {
   return [...new Set(directories)];
 }
 
-// Contract P2c-4: one status file per installation.
-// Contract P3-5: next to the state actually in use: the parent of the first
-// configured account's state directory (<...>/synthetic-sociality-room for
-// .../accounts/<id>.json), else the plugin root under OPENCLAW_STATE_DIR. On
-// Aura the accounts live outside OPENCLAW_STATE_DIR (2026-10-02 ENOENT).
-export function roomStatusPath(cfg) {
-  try {
-    const account = resolvedRoomAccounts(cfg ?? {}).find((item) => item?.stateFile);
-    if (account) {
-      // An `accounts/` directory's parent; any other layout: the state file's
-      // own directory (the same rule as Hermes: next to the state in use).
-      const directory = dirname(resolve(account.stateFile));
-      return join(basename(directory) === "accounts" ? dirname(directory) : directory, "status.json");
-    }
-  } catch {
-    // An unreadable configuration falls back to the plugin root.
-  }
-  return join(roomStoreRoot(), "status.json");
-}
+// The path rule lives in account-discovery.js (shared with `openclaw-room-link status`).
+export {roomStatusPath};
 
 export function roomLocalStatus(logger, cfg) {
   return localStatusFor(roomStatusPath(cfg), {

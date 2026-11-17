@@ -25,6 +25,12 @@ const GATEWAY_TOKEN = "gateway-token-0123456789abcdef";
 const PROVIDER_KEY = "sk-provider-key-0123456789abcdef";
 const ROOM_CREDENTIAL = "room-credential-0123456789abcdef";
 const NOTE = /gateway has not reported the link/u;
+const conformance = JSON.parse(await readFile(new URL("../conformance.json", import.meta.url), "utf8"));
+const titles = [];
+const ls = (title, run) => {
+  titles.push(title);
+  test(title, run);
+};
 
 // A scratch host: HOME, OPENCLAW_STATE_DIR beside it (not under HOME, as on
 // Aura), and a confirmed link in the fenced store.
@@ -102,7 +108,7 @@ function connected(view, paths) {
   assert.equal("note" in view, false);
 }
 
-test("LS-01 Aura layout: accounts outside OPENCLAW_STATE_DIR, the gateway's status file beside them, the link is reported", async () => {
+ls("LS-01 Aura layout: accounts outside OPENCLAW_STATE_DIR, the gateway's status file beside them, the link is reported", async () => {
   const paths = await host("ls-aura");
   try {
     // Aura: OPENCLAW_STATE_DIR elsewhere, accounts under ~/.openclaw (P3-08).
@@ -115,7 +121,7 @@ test("LS-01 Aura layout: accounts outside OPENCLAW_STATE_DIR, the gateway's stat
   }
 });
 
-test("LS-02 a state file outside any accounts/ directory: the status file in its own directory is read", async () => {
+ls("LS-02 a state file outside any accounts/ directory: the status file in its own directory is read", async () => {
   const paths = await host("ls-custom");
   try {
     const elsewhere = join(paths.root, "elsewhere");
@@ -127,20 +133,28 @@ test("LS-02 a state file outside any accounts/ directory: the status file in its
   }
 });
 
-test("LS-03 a named account outside the state directory and the configuration at OPENCLAW_CONFIG_PATH", async () => {
+ls("LS-03 the configuration at OPENCLAW_CONFIG_PATH; named accounts alone leave the gateway's file under the plugin root", async () => {
   const paths = await host("ls-named");
   try {
     const room = join(paths.root, "data", "room");
-    const config = await configure(paths, {accounts: {main: {enabled: true, baseUrl: "https://room.example/api", stateFile: await accountState(join(room, "accounts", "main.json"))}}},
-      join(paths.root, "etc", "openclaw.json"));
+    const file = join(paths.root, "etc", "openclaw.json");
+    await configure(paths, {enabled: true, baseUrl: "https://room.example/api", stateFile: await accountState(join(room, "accounts", "main.json"))}, file);
     report(join(room, "status.json"), paths);
-    connected(shown(await run(paths, {OPENCLAW_CONFIG_PATH: config}), paths), paths);
+    connected(shown(await run(paths, {OPENCLAW_CONFIG_PATH: file}), paths), paths);
+    // Without the variable that configuration is not found: nothing is reported.
+    assert.match(shown(await run(paths), paths).note, NOTE);
+    // The gateway's rule takes the first account with a state file, which is
+    // the default account's managed path: the plugin root, not the named one.
+    await configure(paths, {accounts: {main: {enabled: true, baseUrl: "https://room.example/api", stateFile: join(room, "accounts", "main.json")}}}, file);
+    report(join(room, "status.json"), paths, {state: "stopped", code: "link_revoked", channels: 0});
+    report(join(paths.store, "status.json"), paths);
+    connected(shown(await run(paths, {OPENCLAW_CONFIG_PATH: file}), paths), paths);
   } finally {
     await paths.cleanup();
   }
 });
 
-test("LS-04 accounts/ layout under the state directory: the status file beside link.json is read", async () => {
+ls("LS-04 accounts/ layout under the state directory: the status file beside link.json is read", async () => {
   const paths = await host("ls-accounts");
   try {
     await configure(paths, {enabled: true, baseUrl: "https://room.example/api", stateFile: await accountState(join(paths.store, "accounts", "default.json"))});
@@ -151,7 +165,7 @@ test("LS-04 accounts/ layout under the state directory: the status file beside l
   }
 });
 
-test("LS-05 no accounts: the status file under the plugin root is read", async () => {
+ls("LS-05 no accounts: the status file under the plugin root is read", async () => {
   const paths = await host("ls-none");
   try {
     await configure(paths, null);
@@ -162,7 +176,7 @@ test("LS-05 no accounts: the status file under the plugin root is read", async (
   }
 });
 
-test("LS-06 a missing or unreadable configuration falls back to the file beside link.json and never throws", async () => {
+ls("LS-06 a missing or unreadable configuration falls back to the file beside link.json and never throws", async () => {
   const paths = await host("ls-fallback");
   try {
     report(join(paths.store, "status.json"), paths);
@@ -192,7 +206,7 @@ test("LS-06 a missing or unreadable configuration falls back to the file beside 
   }
 });
 
-test("LS-07 no link entry in either file: link is null and a plain note says the gateway has not reported it", async () => {
+ls("LS-07 no link entry in either file: link is null and a plain note says the gateway has not reported it", async () => {
   const paths = await host("ls-note");
   try {
     // No status file anywhere (the 0.2.86 view on Aura).
@@ -221,7 +235,7 @@ test("LS-07 no link entry in either file: link is null and a plain note says the
   }
 });
 
-test("LS-08 the gateway's status file wins over an older file beside link.json; without a link entry there, the file beside link.json is shown", async () => {
+ls("LS-08 the gateway's status file wins over an older file beside link.json; without a link entry there, the file beside link.json is shown", async () => {
   const paths = await host("ls-both");
   try {
     const elsewhere = join(paths.root, "elsewhere");
@@ -236,7 +250,7 @@ test("LS-08 the gateway's status file wins over an older file beside link.json; 
   }
 });
 
-test("LS-09 one path rule: the CLI uses the gateway's roomStatusPath and writes nothing", async () => {
+ls("LS-09 one path rule: the CLI uses the gateway's roomStatusPath and writes nothing", async () => {
   const cli = await readFile(new URL("../src/link-cli.js", import.meta.url), "utf8");
   const channel = await readFile(new URL("../src/channel.js", import.meta.url), "utf8");
   const discovery = await readFile(new URL("../src/account-discovery.js", import.meta.url), "utf8");
@@ -260,4 +274,8 @@ test("LS-09 one path rule: the CLI uses the gateway's roomStatusPath and writes 
   } finally {
     await paths.cleanup();
   }
+});
+
+test("LS conformance: the regression cases are the ones pinned in conformance.json", () => {
+  assert.deepEqual(titles, conformance.linkStatusCliCases);
 });

@@ -1,6 +1,6 @@
 import {existsSync, readFileSync, readdirSync, lstatSync, statSync} from "node:fs";
-import {join} from "node:path";
-import {defaultStateDirectory, validateState} from "./state.js";
+import {basename, dirname, join, resolve} from "node:path";
+import {defaultStateDirectory, openClawStateDirectory, validateState} from "./state.js";
 import {accountCandidates, resolveAccountConfig, resolveAccountSelection, selectUniqueAccountIds} from "./account.js";
 
 export const ROOM_CHANNEL_ID = "synthetic-sociality-room";
@@ -89,4 +89,29 @@ export function resolvedRoomAccounts(cfg, {managedIds = managedAccounts, managed
   // Deduplicate before filtering enabled: a disabled selected/default account
   // must not be resurrected through an enabled managed alias of the same file.
   return selectUniqueAccountIds(accountCandidates(cfg?.channels?.[ROOM_CHANNEL_ID], managedIds()), resolve).map(resolve);
+}
+
+// The plugin's state root under OPENCLAW_STATE_DIR (contract P2c-1).
+export function roomStoreRoot() {
+  return join(openClawStateDirectory(), ROOM_CHANNEL_ID);
+}
+
+// Contract P2c-4: one status file per installation.
+// Contract P3-5: next to the state actually in use: the parent of the first
+// configured account's state directory (<...>/synthetic-sociality-room for
+// .../accounts/<id>.json), else the plugin root under OPENCLAW_STATE_DIR. On
+// Aura the accounts live outside OPENCLAW_STATE_DIR (2026-10-02 ENOENT).
+export function roomStatusPath(cfg) {
+  try {
+    const account = resolvedRoomAccounts(cfg ?? {}).find((item) => item?.stateFile);
+    if (account) {
+      // An `accounts/` directory's parent; any other layout: the state file's
+      // own directory (the same rule as Hermes: next to the state in use).
+      const directory = dirname(resolve(account.stateFile));
+      return join(basename(directory) === "accounts" ? dirname(directory) : directory, "status.json");
+    }
+  } catch {
+    // An unreadable configuration falls back to the plugin root.
+  }
+  return join(roomStoreRoot(), "status.json");
 }
