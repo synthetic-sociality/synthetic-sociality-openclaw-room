@@ -638,6 +638,9 @@ export function reconnectDelayMs(step, {firstMs = RECONNECT_FIRST_MS, capMs = RE
 // memberships; one over the budget waits for the next free slot, in order.
 export const RECOVERY_BUDGET_STARTS = 6;
 export const RECOVERY_BUDGET_WINDOW_MS = 60_000;
+// Contract P2c-3e: the connector-session lease when the Room names no
+// leaseExpiresAt (the server contract fallback, as Hermes).
+export const SESSION_LEASE_FALLBACK_MS = 45_000;
 
 class RecoveryBudget {
   constructor() {
@@ -876,6 +879,8 @@ export class OpenClawRoomRuntime {
     // Contract P2c-3e: the step of this membership's recovery schedule, kept
     // across failed registrations and heartbeats of one outage.
     this.recoveryStep = 0;
+    // Contract P2c-3e: until when the Room holds this session (its lease).
+    this.presenceLeaseUntil = 0;
   }
 
   async initialize(signal) {
@@ -914,6 +919,22 @@ export class OpenClawRoomRuntime {
     const delay = this.retryDelay(this.recoveryStep, error);
     this.recoveryStep += 1;
     return delay;
+  }
+
+  // Contract P2c-3e: the session lease after an accepted contact: the
+  // answer's leaseExpiresAt, else the fallback from now.
+  noteLease(answer) {
+    const at = Date.parse(String(answer?.leaseExpiresAt ?? ""));
+    this.presenceLeaseUntil = Number.isFinite(at) ? at : Date.now() + SESSION_LEASE_FALLBACK_MS;
+  }
+
+  // Contract P2c-3e: a 429 to a heartbeat of a current session whose lease
+  // holds: retried after its Retry-After, not a failed heartbeat.
+  heartbeatRateLimited(error) {
+    return (error instanceof RoomAPIError || error instanceof RoomResponseError) && error.status === 429
+      && !this.reregister && Boolean(this.connectorSession)
+      && typeof error.roomContact === "string" && error.roomContact.endsWith("/heartbeat")
+      && Date.now() < this.presenceLeaseUntil;
   }
 
   // Contract P2c-3e: a membership stopped by the Room (P2c-3d) does not use
@@ -1054,6 +1075,7 @@ export class OpenClawRoomRuntime {
     this.reregister = false;
     // Contract P8-1/P8-2: accepted now, its interval applies, a listing follows.
     this.presenceAcceptedAt = Date.now();
+    this.noteLease(this.connectorSession);
     this.instructedHeartbeatSeconds = undefined;
     this.enrollmentOwed = true;
     this.credentialExpired = false;
@@ -3614,6 +3636,11 @@ export class OpenClawRoomRuntime {
       // P2c-3a: a registration owed after a lost session is retried on the
       // scan's schedule (assignedTurns), not only at the next long poll.
       if (this.reregister && transientRoomFailure(error)) throw error;
+      // P2c-3e: a 429 to a heartbeat while the lease holds is not a failure.
+      if (this.heartbeatRateLimited(error)) {
+        this.logger?.info?.(`Room heartbeat rate limited${roomErrorDiagnostic(error)}; retrying at the next contact`);
+        return;
+      }
       // P2c-3a: the session is kept; a lost one was flagged by maintainPresence.
       this.reportStatus({connection: "reconnecting", errorCode: statusErrorCode(error)});
       this.logger?.warn?.(`Room presence unavailable${roomErrorDiagnostic(error)}; retrying at the next contact`);
@@ -3650,6 +3677,13 @@ export class OpenClawRoomRuntime {
             return;
           }
           if (error instanceof RoomAPIError && !error.retryable && !sessionLost(error)) throw error;
+          if (this.heartbeatRateLimited(error)) {
+            // Contract P2c-3e: retried after its Retry-After; while the lease
+            // holds it is not a failed heartbeat (the step stays).
+            this.logger?.info?.(`Room heartbeat rate limited${roomErrorDiagnostic(error)}; retrying after its Retry-After`);
+            delay = this.retryDelay(this.recoveryStep, error);
+            continue;
+          }
           // P2c-3a: keep the loop and the session; only the Room's own "lost"
           // (flagged in maintainPresence) registers it again.
           this.reportStatus({connection: "reconnecting", errorCode: statusErrorCode(error)});
@@ -3680,6 +3714,7 @@ export class OpenClawRoomRuntime {
           this.presenceAcceptedAt = Date.now();
           // Contract P2c-3e: the Room accepted a heartbeat on this session.
           this.recoveryStep = 0;
+          this.noteLease(answer);
           // Contract P17-2: an owner control command for this installation.
           this.noteConnectorControl(answer?.connectorControl);
           // P8-1: a later session answer's interval takes effect.

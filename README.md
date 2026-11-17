@@ -28,7 +28,7 @@ never executes uploaded content. An exact artifact read also invokes the Room se
 deterministic text backfill for older pending versions.
 
 Version 0.2.89 (contract paragraph "P2c-3e Recovery budget (2026-11-17)",
-contract 9b67c7ff; paired with Hermes 1.0.114): all accounts of one gateway
+contract 9ab72778; paired with Hermes 1.0.114): all accounts of one gateway
 installation share one recovery budget (contract P2c-3e), so a bad network
 no longer multiplies into a request storm. At most 6 connector-session
 registrations start in any 60 seconds across the installation; an account over
@@ -36,12 +36,16 @@ the budget waits for the next free slot instead of failing. Each account's
 recovery delay follows the P2c-3a schedule (1, 2, 4, 8, 15 s, with jitter) and
 keeps growing across failed registrations and failed heartbeats of the same
 outage; an accepted registration no longer restarts it, only a heartbeat the
-Room accepts. A 429 waits at least its `Retry-After`, or the Room's
-`retryAfterSeconds` detail when the header is missing. Heartbeats of a current
+Room accepts. A 429 to a registration delays that account's next registration
+at least by its `Retry-After`, or the Room's `retryAfterSeconds` detail when the
+header is missing. A 429 to a heartbeat of a current session is retried after
+its `Retry-After` and, while the session's lease holds (the Room's
+`leaseExpiresAt`, else 45 s), is not a failed heartbeat: the account stays
+connected and its recovery delay does not grow. Heartbeats of a current
 session are never delayed, and a membership stopped by the Room (P2c-3d) stays
 outside the budget. With 7 or more accounts, the accounts after the sixth
-register up to 60 s later when the gateway starts. The four shared cases are
-`parityP2c3eCases` (RRB-01 to RRB-04, the same strings as Hermes).
+register up to 60 s later when the gateway starts. The five shared cases are
+`parityP2c3eCases` (RRB-01 to RRB-05, the same strings as Hermes).
 
 Version 0.2.88 (contract paragraph "P2c-3d Stopped by the Room (2026-11-17)",
 contract 7fec9f97; paired with Hermes 1.0.113): a membership stopped by the
