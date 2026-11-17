@@ -83,6 +83,30 @@ const STRING_PARAM_MAX = 512;
 const REQUEST_ID = /^[A-Za-z0-9_.:-]{1,128}$/;
 const ERROR_CODE = /^[A-Za-z0-9_.:-]{1,64}$/;
 export const METHOD_REFUSAL_MESSAGE = "This method is not available over the link.";
+// Contract "Link features" (LF-1 to LF-7): what a channel admits beyond
+// L1o-6 when the Harness advertises `limits.openclawLinkFeatures: 1`.
+export const LINK_FEATURES = Object.freeze(["create", "archive", "attachments", "approvals"]);
+export const LINK_FEATURE_METHODS = Object.freeze({
+  create: Object.freeze(["sessions.create"]),
+  archive: Object.freeze(["sessions.patch"]),
+  attachments: Object.freeze(["chat.send"]),
+  approvals: Object.freeze(["exec.approval.list", "plugin.approval.list", "exec.approval.resolve", "plugin.approval.resolve"]),
+});
+export const LINK_FEATURE_EVENTS = Object.freeze({
+  approvals: Object.freeze(["exec.approval.requested", "plugin.approval.requested", "exec.approval.resolved", "plugin.approval.resolved"]),
+});
+export const APPROVALS_SCOPE = "operator.approvals";
+export const MAX_APPROVAL_ENTRIES = 32;
+export const APPROVAL_STRING_MAX = 32768;
+export const MAX_ATTACHMENTS = 10;
+export const MAX_ATTACHMENT_BYTES = 716800;
+const APPROVAL_ID_MAX = 128;
+const DEFAULT_DECISIONS = Object.freeze(["allow-once", "allow-always", "deny"]);
+const APPROVAL_REQUEST_STRINGS = ["sessionKey", "parentSessionKey", "parent", "commandPreview", "command", "title", "description", "toolName", "tool"];
+const IMAGE_MIME_TYPES = new Set(["image/png", "image/jpeg", "image/gif", "image/webp", "image/bmp"]);
+const MIME_TYPE = /^[A-Za-z0-9_.+-]+\/[A-Za-z0-9_.+-]+$/;
+const FILE_NAME_FORBIDDEN = /[\u0000-\u001f\u007f-\u009f/\\]/;
+const PADDED_BASE64 = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
 const UUID4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const CHANNEL_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const PAIRING_SECRET = /^[A-Za-z0-9_-]{43}$/;
@@ -727,13 +751,14 @@ export function resolveLocalGateway(cfg, env = process.env) {
   return {host, port, auth: credential};
 }
 
-export function gatewayConnectRequest(id, auth, version) {
+// LF-5 (a): `approvals` asks operator.approvals as well.
+export function gatewayConnectRequest(id, auth, version, {approvals = false} = {}) {
   const params = {
     minProtocol: GATEWAY_PROTOCOL,
     maxProtocol: GATEWAY_PROTOCOL,
     client: {id: "gateway-client", displayName: "Tokenwerk link", version: String(version || "0.0.0"), platform: process.platform, mode: "backend"},
     role: "operator",
-    scopes: ["operator.read", "operator.write"],
+    scopes: approvals ? ["operator.read", "operator.write", APPROVALS_SCOPE] : ["operator.read", "operator.write"],
     caps: [],
   };
   if (auth) params.auth = {...auth};
@@ -745,10 +770,23 @@ function hostUrl(host) {
   return host.includes(":") ? `[${host}]` : host;
 }
 
-// One new gateway connection for one channel (L1o-5): {socket, early}, where
-// `early` holds messages that arrived with the hello. Throws LocalGatewayError.
-export async function openLocalGateway({cfg, env = process.env, maxDataBytes = FALLBACK_LIMITS.maxDataBytes, timeoutMs = FALLBACK_LIMITS.openTimeoutMs,
-  version = "", connect = connectWebSocket} = {}) {
+// One new gateway connection for one channel (L1o-5): {socket, early,
+// approvals}, where `early` holds messages that arrived with the hello and
+// `approvals` says the gateway granted operator.approvals. With `approvals`
+// the connect asks that scope, and a refused connect is sent once more
+// without it on a new connection (LF-5 (a)). Throws LocalGatewayError.
+export async function openLocalGateway(options = {}) {
+  if (!options.approvals) return openGatewayOnce(options, false);
+  try {
+    return await openGatewayOnce(options, true);
+  } catch (error) {
+    if (!(error instanceof LocalGatewayError && error.connectRefused)) throw error;
+    return openGatewayOnce(options, false);
+  }
+}
+
+async function openGatewayOnce({cfg, env = process.env, maxDataBytes = FALLBACK_LIMITS.maxDataBytes, timeoutMs = FALLBACK_LIMITS.openTimeoutMs,
+  version = "", connect = connectWebSocket} = {}, approvals) {
   const {host, port, auth} = resolveLocalGateway(cfg, env);
   let socket;
   try {
@@ -764,6 +802,7 @@ export async function openLocalGateway({cfg, env = process.env, maxDataBytes = F
     const early = [];
     let sent = false;
     let settled = false;
+    let granted = false;
     const finish = (error) => {
       if (settled) return;
       settled = true;
@@ -775,8 +814,10 @@ export async function openLocalGateway({cfg, env = process.env, maxDataBytes = F
         reject(error);
         return;
       }
-      resolve({socket, early, release: () => socket.off("message", onMessage)});
+      resolve({socket, early, approvals: granted, release: () => socket.off("message", onMessage)});
     };
+    // A refusal after the connect was sent is a refused connect (LF-5 (a)).
+    const refused = () => Object.assign(new LocalGatewayError("local_gateway_refused"), {connectRefused: sent});
     const onMessage = (text, binary) => {
       if (settled) {
         if (!binary) early.push(text);
@@ -788,17 +829,21 @@ export async function openLocalGateway({cfg, env = process.env, maxDataBytes = F
       if (frame?.type === "event" && frame.event === "connect.challenge") {
         if (!sent) {
           sent = true;
-          socket.send(JSON.stringify(gatewayConnectRequest(id, auth, version)));
+          socket.send(JSON.stringify(gatewayConnectRequest(id, auth, version, {approvals})));
         }
         return;
       }
       if (frame?.type === "res" && frame.id === id) {
-        if (frame.ok === true && frame.payload?.type === "hello-ok") return finish();
+        if (frame.ok === true && frame.payload?.type === "hello-ok") {
+          const scopes = frame.payload.auth?.scopes;
+          granted = approvals && Array.isArray(scopes) && scopes.includes(APPROVALS_SCOPE);
+          return finish();
+        }
         const code = String(frame.error?.code ?? "");
-        finish(new LocalGatewayError(code === "UNAVAILABLE" ? "local_gateway_unavailable" : "local_gateway_refused"));
+        finish(code === "UNAVAILABLE" ? new LocalGatewayError("local_gateway_unavailable") : refused());
       }
     };
-    const onClose = (code) => finish(new LocalGatewayError(code === 1008 || code === 4401 || code === 4403 ? "local_gateway_refused" : "local_gateway_unavailable"));
+    const onClose = (code) => finish(code === 1008 || code === 4401 || code === 4403 ? refused() : new LocalGatewayError("local_gateway_unavailable"));
     const timer = setTimeout(() => finish(new LocalGatewayError("local_gateway_unavailable", "open_timeout")), timeoutMs);
     timer.unref?.();
     socket.on("message", onMessage);
@@ -836,6 +881,13 @@ export function readOpenFailedReason(complete) {
 // The closed list of the contract, in its order.
 export const OPEN_FAILED_REASONS = Object.freeze(["local_gateway_refused", "local_gateway_auth_unavailable", "local_gateway_unavailable",
   "link_blocked_by_site_protection", "channel_limit", "open_timeout", "unknown"]);
+
+// LF-1: a Harness that reads link features advertises
+// `limits.openclawLinkFeatures: 1`; any other value or none means 0.2.85.
+export function readLinkFeatures(complete) {
+  const advertised = isObject(complete) ? complete.limits : undefined;
+  return isObject(advertised) && advertised.openclawLinkFeatures === 1;
+}
 
 // One code of the closed list for a failed local open; never upstream text.
 export function openFailedReasonFor(error) {
@@ -935,10 +987,217 @@ const PROJECTORS = {
   ]),
 };
 
+// --- Link features LF-3 to LF-6 --------------------------------------------------------------------
+
+// LF-6: the attachments of chat.send, validated exactly; undefined when absent.
+function attachmentsParam(params) {
+  if (!("attachments" in params) || params.attachments === undefined) return undefined;
+  const rows = params.attachments;
+  if (!Array.isArray(rows) || rows.length > MAX_ATTACHMENTS) return INVALID;
+  const kept = [];
+  let bytes = 0;
+  for (const row of rows) {
+    if (!isObject(row)) return INVALID;
+    const keys = Object.keys(row);
+    if (keys.length !== 4 || !["type", "mimeType", "fileName", "content"].every((key) => Object.hasOwn(row, key))) return INVALID;
+    const {type, mimeType, fileName, content} = row;
+    if (type !== "image" && type !== "file") return INVALID;
+    if (typeof mimeType !== "string" || mimeType.length > 128 || !MIME_TYPE.test(mimeType)) return INVALID;
+    if (type === "image" && !IMAGE_MIME_TYPES.has(mimeType)) return INVALID;
+    if (typeof fileName !== "string" || !fileName || fileName.length > 256 || FILE_NAME_FORBIDDEN.test(fileName)) return INVALID;
+    if (typeof content !== "string" || !PADDED_BASE64.test(content)) return INVALID;
+    const decoded = Buffer.from(content, "base64");
+    // Canonical: re-encoding gives the same text (no stray padding bits).
+    if (decoded.toString("base64") !== content) return INVALID;
+    bytes += decoded.length;
+    if (bytes > MAX_ATTACHMENT_BYTES) return INVALID;
+    kept.push({type, mimeType, fileName, content});
+  }
+  return kept;
+}
+
+function decisionList(value) {
+  return Array.isArray(value) && value.every((entry) => typeof entry === "string") ? [...value] : INVALID;
+}
+
+// LF-5 (b): one approval request reduced to the named keys, or null when it
+// is not forwarded (an invalid id, a kept string over 32768 characters or of
+// another type, a malformed number or decision list). Nothing is ever cut.
+function reduceApproval(row) {
+  if (!isObject(row) || typeof row.id !== "string" || !row.id || row.id.length > APPROVAL_ID_MAX || !isObject(row.request)) return null;
+  const request = {};
+  for (const key of APPROVAL_REQUEST_STRINGS) {
+    const value = row.request[key];
+    if (value === undefined) continue;
+    if (typeof value !== "string" || value.length > APPROVAL_STRING_MAX) return null;
+    request[key] = value;
+  }
+  const out = {id: row.id};
+  for (const [target, source, key, read] of [
+    [out, row, "createdAtMs", Number.isFinite], [out, row, "expiresAtMs", Number.isFinite], [out, row, "allowedDecisions", null],
+    [request, row.request, "allowedDecisions", null], [request, row.request, "expiresAtMs", Number.isFinite],
+  ]) {
+    const value = source[key];
+    if (value === undefined) continue;
+    if (read ? !read(value) : decisionList(value) === INVALID) return null;
+    target[key] = read ? value : [...value];
+  }
+  out.request = request;
+  return out;
+}
+
+const APPROVAL_KIND = (name) => name.slice(0, name.indexOf("."));
+
+// The link-feature state of one channel (LF-3 to LF-5): the announced
+// features, the session keys the gateway returned on it, its served sessions
+// and its approval entries. Everything is per channel and ends with it.
+export class LinkFeatureState {
+  constructor({clock = Date.now} = {}) {
+    this.features = [];
+    this.clock = clock;
+    this.keys = new Set();
+    this.served = new Set();
+    this.entries = new Map();
+  }
+
+  announce(features) {
+    this.features = LINK_FEATURES.filter((name) => features.includes(name));
+  }
+
+  has(name) {
+    return this.features.includes(name);
+  }
+
+  // The feature that admits `method` on this channel, if announced.
+  admits(method) {
+    return LINK_FEATURES.find((name) => this.has(name) && LINK_FEATURE_METHODS[name].includes(method));
+  }
+
+  // LF-4: equal to a served session, or nested under one after ":".
+  belongs(key) {
+    if (typeof key !== "string" || !key) return false;
+    for (const served of this.served) {
+      if (key === served || key.startsWith(`${served}:`)) return true;
+    }
+    return false;
+  }
+
+  belongsRequest(request) {
+    return this.belongs(request.sessionKey) || this.belongs(request.parentSessionKey) || this.belongs(request.parent);
+  }
+
+  // LF-5 (c): an entry is forgotten once its expiry passes.
+  prune() {
+    const now = this.clock();
+    for (const [id, entry] of this.entries) {
+      if (entry.expiresAt !== undefined && now >= entry.expiresAt) this.entries.delete(id);
+    }
+  }
+
+  record(kind, reduced) {
+    this.entries.set(reduced.id, {
+      kind,
+      state: "pending",
+      decisions: reduced.request.allowedDecisions ?? reduced.allowedDecisions ?? [...DEFAULT_DECISIONS],
+      expiresAt: reduced.request.expiresAtMs ?? reduced.expiresAtMs,
+    });
+  }
+
+  // LF-5 (b), (c): a requested event's payload to forward, or null.
+  requested(kind, payload) {
+    const reduced = reduceApproval(payload);
+    if (!reduced || !this.belongsRequest(reduced.request)) return null;
+    this.prune();
+    if (this.entries.has(reduced.id) || this.entries.size >= MAX_APPROVAL_ENTRIES) return null;
+    this.record(kind, reduced);
+    return reduced;
+  }
+
+  // LF-5 (d): a resolved event's payload to forward, or null; ends the entry.
+  resolved(kind, payload) {
+    if (!isObject(payload) || typeof payload.id !== "string") return null;
+    this.prune();
+    const entry = this.entries.get(payload.id);
+    if (!entry || entry.kind !== kind) return null;
+    this.entries.delete(payload.id);
+    const out = {id: payload.id};
+    if (typeof payload.decision === "string") out.decision = payload.decision;
+    return out;
+  }
+
+  // LF-5 (e): the channel's own rows of a list answer, as a bare array.
+  replay(kind, payload) {
+    const rows = Array.isArray(payload) ? payload
+      : [payload?.requests, payload?.pending, payload?.approvals].find((value) => Array.isArray(value)) ?? [];
+    this.prune();
+    const out = [];
+    const seen = new Set();
+    for (const row of rows) {
+      const reduced = reduceApproval(row);
+      if (!reduced || seen.has(reduced.id) || !this.belongsRequest(reduced.request)) continue;
+      const entry = this.entries.get(reduced.id);
+      if (entry) {
+        if (entry.kind !== kind || entry.state !== "pending") continue;
+      } else {
+        if (this.entries.size >= MAX_APPROVAL_ENTRIES) continue;
+        this.record(kind, reduced);
+      }
+      seen.add(reduced.id);
+      out.push(reduced);
+    }
+    return out;
+  }
+
+  // LF-5 (f): pending again after the gateway's ok false, if still answered.
+  reopen(kind, id) {
+    const entry = this.entries.get(id);
+    if (entry && entry.kind === kind && entry.state === "answered") entry.state = "pending";
+  }
+
+  learnKey(key) {
+    if (typeof key === "string" && key) this.keys.add(key);
+  }
+
+  forget() {
+    this.entries.clear();
+    this.served.clear();
+    this.keys.clear();
+  }
+
+  // A request of an announced feature method: the same shape as projectRequest.
+  project(id, method, params) {
+    const invalid = {refuse: refusal(id, "invalid_params", "The parameters are not valid for this method."), id};
+    if (!isObject(params)) return invalid;
+    const forward = (projected, extra = {}) => ({forward: JSON.stringify({type: "req", id, method, params: projected}), id, method, ...extra});
+    if (method === "sessions.create") {
+      const projected = assemble([["agentId", optionalString(params, "agentId")]]);
+      return projected ? forward(projected) : invalid;
+    }
+    if (method === "sessions.patch") {
+      if (typeof params.key !== "string" || !this.keys.has(params.key) || params.archived !== true) return invalid;
+      return forward({key: params.key, archived: true});
+    }
+    const kind = APPROVAL_KIND(method);
+    if (method.endsWith(".approval.list")) return forward({});
+    // *.approval.resolve: exactly id and decision, for a pending entry here.
+    const keys = Object.keys(params);
+    if (keys.length !== 2 || typeof params.id !== "string" || typeof params.decision !== "string") return invalid;
+    this.prune();
+    const entry = this.entries.get(params.id);
+    if (!entry || entry.kind !== kind || entry.state !== "pending" || !entry.decisions.includes(params.decision)) return invalid;
+    return forward({id: params.id, decision: params.decision}, {
+      approvalId: params.id,
+      commit: () => { entry.state = "answered"; },
+    });
+  }
+}
+
 // One server request: {forward, id, method} for the gateway, {refuse} for an
 // answer from the device itself, or {invalid: true} for data that is not a
-// request object.
-export function projectRequest(text) {
+// request object. With a channel's LinkFeatureState the link features of that
+// channel are admitted too, and `commit` (when present) runs once the request
+// is forwarded.
+export function projectRequest(text, features) {
   let frame;
   try {
     frame = JSON.parse(text);
@@ -949,11 +1208,22 @@ export function projectRequest(text) {
     return {invalid: true};
   }
   const {id, method} = frame;
-  if (!Object.hasOwn(PROJECTORS, method)) return {refuse: refusal(id, "method_not_allowed", METHOD_REFUSAL_MESSAGE), id};
   const params = frame.params === undefined ? {} : frame.params;
+  if (features && !Object.hasOwn(PROJECTORS, method) && features.admits(method)) return features.project(id, method, params);
+  if (!Object.hasOwn(PROJECTORS, method)) return {refuse: refusal(id, "method_not_allowed", METHOD_REFUSAL_MESSAGE), id};
   const projected = isObject(params) ? PROJECTORS[method](params) : null;
   if (!projected) return {refuse: refusal(id, "invalid_params", "The parameters are not valid for this method."), id};
-  return {forward: JSON.stringify({type: "req", id, method, params: projected}), id, method};
+  let commit;
+  if (features) {
+    if (method === "chat.send" && features.has("attachments")) {
+      const attachments = attachmentsParam(params);
+      if (attachments === INVALID) return {refuse: refusal(id, "invalid_params", "The parameters are not valid for this method."), id};
+      if (attachments !== undefined) projected.attachments = attachments;
+    }
+    // LF-4: an admitted chat.history or chat.send serves its session.
+    if (method === "chat.history" || method === "chat.send") commit = () => features.served.add(projected.sessionKey);
+  }
+  return {forward: JSON.stringify({type: "req", id, method, params: projected}), id, method, ...(commit ? {commit} : {})};
 }
 
 function projectError(error) {
@@ -967,8 +1237,11 @@ function projectError(error) {
 }
 
 // One gateway message for the server, or null when it is dropped. `pending`
-// holds the ids of this channel's forwarded requests; a response consumes its id.
-export function projectGatewayMessage(text, pending) {
+// holds the ids of this channel's forwarded requests (a Map to what was
+// forwarded, or a Set); a response consumes its id. With the channel's
+// LinkFeatureState, responses teach it session keys, list answers become the
+// channel's own rows (LF-5 (e)) and approval events pass as LF-5 says.
+export function projectGatewayMessage(text, pending, features) {
   let frame;
   try {
     frame = JSON.parse(text);
@@ -977,6 +1250,7 @@ export function projectGatewayMessage(text, pending) {
   }
   if (!isObject(frame)) return null;
   if (frame.type === "res" && typeof frame.id === "string" && pending.has(frame.id)) {
+    const sent = typeof pending.get === "function" ? pending.get(frame.id) : undefined;
     pending.delete(frame.id);
     const out = {type: "res", id: frame.id, ok: frame.ok === true};
     if (out.ok) {
@@ -984,6 +1258,7 @@ export function projectGatewayMessage(text, pending) {
     } else {
       out.error = projectError(frame.error);
     }
+    if (features && isObject(sent)) projectFeatureResponse(out, frame, sent, features);
     return JSON.stringify(out);
   }
   if (frame.type === "event" && frame.event === "chat") {
@@ -992,7 +1267,28 @@ export function projectGatewayMessage(text, pending) {
     if (Number.isSafeInteger(frame.seq)) out.seq = frame.seq;
     return JSON.stringify(out);
   }
+  if (frame.type === "event" && features?.has("approvals") && LINK_FEATURE_EVENTS.approvals.includes(frame.event)) {
+    const kind = APPROVAL_KIND(frame.event);
+    const payload = frame.event.endsWith(".requested") ? features.requested(kind, frame.payload) : features.resolved(kind, frame.payload);
+    if (!payload) return null;
+    const out = {type: "event", event: frame.event, payload};
+    if (Number.isSafeInteger(frame.seq)) out.seq = frame.seq;
+    return JSON.stringify(out);
+  }
   return null;
+}
+
+function projectFeatureResponse(out, frame, sent, features) {
+  const {method} = sent;
+  if (out.ok && method === "sessions.list" && Array.isArray(frame.payload?.sessions)) {
+    for (const row of frame.payload.sessions) if (isObject(row)) features.learnKey(row.key);
+  } else if (out.ok && method === "sessions.create" && isObject(frame.payload)) {
+    features.learnKey(frame.payload.key);
+  } else if (out.ok && method.endsWith(".approval.list") && features.has("approvals")) {
+    out.payload = features.replay(APPROVAL_KIND(method), frame.payload);
+  } else if (!out.ok && method.endsWith(".approval.resolve") && sent.approvalId !== undefined) {
+    features.reopen(APPROVAL_KIND(method), sent.approvalId);
+  }
 }
 
 // --- L1-6, L1o-4, L1o-6: channels ---------------------------------------------------------------
@@ -1012,14 +1308,17 @@ class LinkChannel {
     this.local = null;
     this.open = false;
     this.ended = false;
-    this.pending = new Set();
+    // Forwarded request id -> {method, approvalId} (LF-5 (f) needs both).
+    this.pending = new Map();
     this.queue = [];
     this.queuedBytes = 0;
+    // LF-1: the channel's link-feature state, only with the capability.
+    this.features = bridge.linkFeatures ? new LinkFeatureState() : null;
   }
 
   async run() {
     const {limits} = this.bridge;
-    const opening = Promise.resolve().then(() => this.bridge.localOpener(limits));
+    const opening = Promise.resolve().then(() => this.bridge.localOpener(limits, this.features ? {approvals: true} : {}));
     let timer;
     const timeout = new Promise((_, reject) => {
       timer = setTimeout(() => reject(new LocalGatewayError("local_gateway_unavailable", "open_timeout")), limits.openTimeoutMs);
@@ -1049,8 +1348,14 @@ class LinkChannel {
       this.bridge.end(this, "openclaw-close");
     });
     this.open = true;
-    // L1o-5: opened once the gateway's hello-ok arrived.
-    this.bridge.send(frame("openclaw-opened", this.id));
+    // L1o-5: opened once the gateway's hello-ok arrived; LF-2: with the
+    // capability it names the features this channel admits.
+    const openedFrame = frame("openclaw-opened", this.id);
+    if (this.features) {
+      this.features.announce(opened.approvals === true ? LINK_FEATURES : LINK_FEATURES.filter((name) => name !== "approvals"));
+      openedFrame.features = [...this.features.features];
+    }
+    this.bridge.send(openedFrame);
     for (const message of opened.early ?? []) this.fromLocal(message, false);
     const queued = this.queue;
     this.queue = [];
@@ -1059,7 +1364,7 @@ class LinkChannel {
   }
 
   fromServer(data) {
-    const result = projectRequest(data);
+    const result = projectRequest(data, this.features ?? undefined);
     if (result.invalid) {
       this.bridge.channelError("channel_request_invalid");
       this.bridge.end(this, "openclaw-close");
@@ -1075,7 +1380,8 @@ class LinkChannel {
       this.toServer(refusal(result.id, "too_many_requests", "Too many requests are waiting on this channel."));
       return;
     }
-    this.pending.add(result.id);
+    this.pending.set(result.id, {method: result.method, approvalId: result.approvalId});
+    result.commit?.();
     if (!this.open) {
       const size = byteLength(result.forward);
       if (this.queuedBytes + size > 4 * this.bridge.limits.maxDataBytes) {
@@ -1112,7 +1418,7 @@ class LinkChannel {
       this.bridge.end(this, "openclaw-close");
       return;
     }
-    const projected = projectGatewayMessage(message, this.pending);
+    const projected = projectGatewayMessage(message, this.pending, this.features ?? undefined);
     if (projected !== null) this.toServer(projected);
   }
 
@@ -1128,6 +1434,8 @@ class LinkChannel {
     const local = this.local;
     this.local = null;
     this.open = false;
+    // LF-5 (c): the channel's entries end with it.
+    this.features?.forget();
     if (local) {
       try { local.close(1000); } catch {}
     }
@@ -1136,11 +1444,12 @@ class LinkChannel {
 
 // The channels of one authenticated device socket (L1-6, L1o-4).
 export class LinkBridge {
-  constructor(socket, limits, localOpener, {onChange = () => {}, onChannelError = () => {}, openFailedReason = false} = {}) {
+  constructor(socket, limits, localOpener, {onChange = () => {}, onChannelError = () => {}, openFailedReason = false, linkFeatures = false} = {}) {
     this.socket = socket;
     this.limits = limits;
     this.localOpener = localOpener;
     this.openFailedReason = openFailedReason;
+    this.linkFeatures = linkFeatures;
     this.channels = new Map();
     this.onChange = onChange;
     this.onChannelError = onChannelError;
@@ -1321,7 +1630,8 @@ export class LinkService {
     this.pluginVersion = pluginVersion;
     this.status = status;
     this.recordPath = recordPath;
-    this.localOpener = localOpener ?? ((limits) => openLocalGateway({maxDataBytes: limits.maxDataBytes, timeoutMs: limits.openTimeoutMs, version: pluginVersion}));
+    this.localOpener = localOpener ?? ((limits, {approvals = false} = {}) => openLocalGateway({maxDataBytes: limits.maxDataBytes, timeoutMs: limits.openTimeoutMs,
+      version: pluginVersion, approvals}));
     this.connect = connect;
     this.sender = sender;
     this.backoff = backoff;
@@ -1651,6 +1961,7 @@ export class LinkService {
           onChange: () => this.set({channels: this.bridge ? this.bridge.channels.size : 0}),
           onChannelError: (code) => this.set({lastChannelErrorCode: code}),
           openFailedReason: readOpenFailedReason(value),
+          linkFeatures: readLinkFeatures(value),
         });
         phase = "serving";
         serve(limits);
@@ -1692,8 +2003,8 @@ export function startRoomLink({pluginVersion, status, config, logger, env = proc
       pluginVersion,
       status,
       logger,
-      localOpener: (limits) => openLocalGateway({cfg: typeof config === "function" ? config() : config, env, maxDataBytes: limits.maxDataBytes,
-        timeoutMs: limits.openTimeoutMs, version: pluginVersion}),
+      localOpener: (limits, {approvals = false} = {}) => openLocalGateway({cfg: typeof config === "function" ? config() : config, env,
+        maxDataBytes: limits.maxDataBytes, timeoutMs: limits.openTimeoutMs, version: pluginVersion, approvals}),
     });
     activeService = service;
     service.run().catch(() => {}).finally(() => {
