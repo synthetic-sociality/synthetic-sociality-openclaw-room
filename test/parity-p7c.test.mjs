@@ -1221,29 +1221,29 @@ test("a command source older than the loaded page is found by the cycle-source l
 test("a fenced message of an earlier discussion is acknowledged at once, before the next event is handled", async () => {
   const old = {id: "m-20", seq: 20, type: "message.posted", actorRole: "human_owner", actorId: "owner-tj",
     payload: {body: "A message of the earlier discussion.", resolvedRecipientMembershipIds: ["zurie"]}};
-  // No event in between that is acknowledged before its own state read (a
-  // discussion start is, and its cumulative acknowledgement would cover 20).
+  // No technical event in between whose cumulative acknowledgement could
+  // cover 20 before the next addressed message is handled.
   const events = [old, HUMAN];
   const runtime = runtimeFor(events, {pageStartsAt: 0, policy: {coordinationMode: "open"}});
   runtime.state.cursor = 19;
-  // The first Room state read after the fenced message was superseded is the
-  // fence read of the next event: the fenced message is acknowledged by then.
+  // P2c-3f reuses the batch state. Observe the next receive boundary instead
+  // of requiring an extra state read: the fenced message is acknowledged by then.
   let superseded = false;
-  let acknowledgedAtNextRead = null;
+  let acknowledgedAtNextEvent = null;
   const supersede = runtime.supersedeHistoricalEvent.bind(runtime);
   runtime.supersedeHistoricalEvent = async (event, ...rest) => {
     const result = await supersede(event, ...rest);
     if (event.seq === 20) superseded = true;
     return result;
   };
-  const read = runtime.client.roomState;
-  runtime.client.roomState = async (...args) => {
-    if (superseded && acknowledgedAtNextRead === null) acknowledgedAtNextRead = [...runtime.calls.acks];
-    return read(...args);
+  const receive = runtime.recordReceived.bind(runtime);
+  runtime.recordReceived = async (...args) => {
+    if (superseded && acknowledgedAtNextEvent === null) acknowledgedAtNextEvent = [...runtime.calls.acks];
+    return receive(...args);
   };
   await scan(runtime, events);
   assert.ok(superseded, "the earlier message was fenced");
-  assert.deepEqual(acknowledgedAtNextRead, [20]);
+  assert.deepEqual(acknowledgedAtNextEvent, [20]);
 });
 
 test("the topic is trimmed as guidance is", () => {

@@ -1,5 +1,5 @@
 export const ROOM_CONNECTOR_PROVENANCE = Object.freeze({
-  "version": "0.2.89",
+  "version": "0.2.90",
   "sourceCommit": "unbuilt",
   "artifactIdentity": "unbuilt"
 });

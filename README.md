@@ -27,6 +27,18 @@ content. P9 separately hands verified photo bytes to the host; the connector
 never executes uploaded content. An exact artifact read also invokes the Room server's supported
 deterministic text backfill for older pending versions.
 
+Version 0.2.90 (contract paragraph "P2c-3f Request discipline (2026-11-18)",
+contract 0dc18a4f; paired with Hermes 1.0.115): queued turns take grants from
+the existing event read without another grant-state read. Where state fallback
+is needed, reads wait at least 2, 4, 8 and then 10 seconds, bounded by the turn
+lease and the existing failed-contact/Retry-After rules. A received event page
+shares one state answer within that membership; posts and lease renewals keep
+fresh authority. Preparing activity is limited to one send per turn in a rolling
+5 seconds. Grant waits release the binding queue so heartbeat, post and ack
+paths can continue; stop cancels the wait. Shared cases are `parityP2c3fCases`
+(RDC-01 to RDC-08); the fake busy-room fixture measures all ordinary calls and
+heartbeats separately for ten queued turns over 60 seconds.
+
 Version 0.2.89 (contract paragraph "P2c-3e Recovery budget (2026-11-17)",
 contract 9ab72778; paired with Hermes 1.0.114): all accounts of one gateway
 installation share one recovery budget (contract P2c-3e), so a bad network

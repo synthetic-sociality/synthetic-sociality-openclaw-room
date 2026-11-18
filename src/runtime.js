@@ -62,6 +62,7 @@ export const KEPT_REPLY_CLOSE = "[/Your own earlier reply]";
 export const HOST_LABEL = hostname();
 export const CONTEXT_SCAN_CHUNK = 100;
 const CONTEXT_FOOTER = "[/Canonical Room context]";
+const WAITING_FOR_GRANT = Symbol("waiting for Room turn");
 
 function validCanonicalTimestamp(value) {
   if (typeof value !== "string" || !value.trim()) return false;
@@ -884,6 +885,9 @@ export class OpenClawRoomRuntime {
     // Contract P2c-3e: no heartbeat of this membership's session before this
     // time (a heartbeat 429's Retry-After), whichever presence caller sends it.
     this.heartbeatNotBefore = 0;
+    this.grantWaiters = new Set();
+    this.observedGrant = null;
+    this.preparingSentAt = new Map();
   }
 
   async initialize(signal) {
@@ -1296,6 +1300,7 @@ export class OpenClawRoomRuntime {
       // Do not rotate while the channel owns a delivered model turn or while
       // durable outbound/lifecycle work needs its original credential.
       if (this.closed) return false;
+      if (this.grantWaiters.size) return false;
       if (this.pendingEvent) {
         if (!this.isQuarantinedEvent(this.pendingEvent)) return false;
         this.pendingEvent = null;
@@ -1391,6 +1396,9 @@ export class OpenClawRoomRuntime {
       await this.renewAccess(signal);
       await this.applyRecoveryClosures(signal);
       const page = await this.readEventsResilient(Math.max(scanCursor, this.state.cursor), signal);
+      // P2c-3f: this lazy answer belongs only to this received page. Pass it
+      // explicitly so concurrent posts and lease renewals always read fresh authority.
+      const batch = {};
       const pageEpoch = validEventPage(page);
       const pageActiveEpochId = pageEpoch.id;
       if (this.state.epochSessionRoutingInitialized !== true) {
@@ -1523,7 +1531,7 @@ export class OpenClawRoomRuntime {
         // page's start only when the state's is unknown. A message of an
         // earlier discussion is never handed to the model (Hermes: the receive
         // fence, historical_epoch).
-        const stateStart = knownEpochStart((await this.client.roomState(this.state, signal))?.activeEpoch?.startsAtSeq);
+        const stateStart = knownEpochStart((await this.roomStateForBatch(batch, signal))?.activeEpoch?.startsAtSeq);
         if (stateStart && event.seq < stateStart) {
           await this.supersedeHistoricalEvent(event, "");
           await this.ackEvent(event);
@@ -1536,7 +1544,7 @@ export class OpenClawRoomRuntime {
         if (isPeerContribution(event, this.state.membershipId)) {
           await this.client.acknowledgePeerContribution(this.state, event.id, signal);
         }
-        const cycleAttempt = await this.prepareCycleAttempt(event, signal);
+        const cycleAttempt = await this.prepareCycleAttempt(event, signal, batch);
         if (cycleAttempt?.refused) {
           // Refused before the model ran: offered on the next turn (P2a-3).
           if (MISSED_SOURCE_EVENT_TYPES.has(event.type)) await this.noteMissedSource(String(event.id), event.seq);
@@ -1565,7 +1573,7 @@ export class OpenClawRoomRuntime {
         this.contextSourceIsCommand = false;
         this.contextGuidanceCarriesNoStatus = false;
         this.contextMedia = [];
-        const sharedContext = await this.sharedRoomContext(event, pageEpoch, signal, cycleAttempt || null);
+        const sharedContext = await this.sharedRoomContext(event, pageEpoch, signal, cycleAttempt || null, batch);
         const normalized = normalizeEvent(
           event,
           this.state.roomId,
@@ -1891,11 +1899,17 @@ export class OpenClawRoomRuntime {
     return reason;
   }
 
-  async sharedRoomContext(event, sourceEpoch, signal, cycleAttempt = null) {
+  roomStateForBatch(batch, signal) {
+    if (!batch) return this.client.roomState(this.state, signal);
+    // A rejected read also belongs to this batch; never retry it per event.
+    return batch.state ??= this.client.roomState(this.state, signal);
+  }
+
+  async sharedRoomContext(event, sourceEpoch, signal, cycleAttempt = null, batch = null) {
     // Conversation Policy, saved Add guidance and canonical transcript are
     // mandatory model input. If any read fails, leave the event unacknowledged
     // and fail closed so a later retry cannot answer without owner guidance.
-    const state = await this.client.roomState(this.state, signal);
+    const state = await this.roomStateForBatch(batch, signal);
     const stateEpochId = exactEpochId(state?.activeEpoch?.id, "Room state active epoch");
     if (stateEpochId !== sourceEpoch.id) {
       throw new Error("Room active epoch advanced before model dispatch");
@@ -2222,7 +2236,7 @@ export class OpenClawRoomRuntime {
     return startEvent ?? null;
   }
 
-  async prepareCycleAttempt(event, signal) {
+  async prepareCycleAttempt(event, signal, batch = null) {
     const payload = eventPayload(event.payload);
     const agentSeed = isAgentCycleSeed(event);
     if (event.type === "message.posted" && !String(payload.cycleId ?? "").trim()) {
@@ -2240,7 +2254,7 @@ export class OpenClawRoomRuntime {
       if (open && isHumanCycleSource(event)) return null;
     }
     if (isHumanCycleSource(event) || agentSeed) {
-      const cycle = await this.ensureDiscussionCycle(event, signal);
+      const cycle = await this.ensureDiscussionCycle(event, signal, batch);
       if (cycle?.refused) return cycle;
       if (!cycle) return false;
       // Starting a cycle publishes the authoritative attempt-ready event.
@@ -2254,7 +2268,7 @@ export class OpenClawRoomRuntime {
     // Unclaimed or expired: the model never saw this attempt's source (P2a-3).
     if (claimed === false) {
       await this.noteMissedSource(String(payload.sourceEventId ?? ""));
-      await this.noteHeldByModerator(String(payload.cycleId), signal);
+      await this.noteHeldByModerator(String(payload.cycleId), signal, batch);
     }
     return claimed;
   }
@@ -2273,12 +2287,12 @@ export class OpenClawRoomRuntime {
   // coded reason held_by_moderator (wait 0); never the holder or any text. The
   // Room state is read once for it; the reason is diagnostics only, so a
   // failed read records nothing and changes nothing else.
-  async noteHeldByModerator(cycleId, signal) {
+  async noteHeldByModerator(cycleId, signal, batch = null) {
     // Only for cycle_no_attempt, never for cycle_superseded.
     if (this.claimRefusal !== "cycle_no_attempt") return;
     let state = null;
     try {
-      state = await this.client.roomState(this.state, signal);
+      state = await this.roomStateForBatch(batch, signal);
     } catch {
       return;
     }
@@ -2457,8 +2471,8 @@ export class OpenClawRoomRuntime {
     await this.persistState();
   }
 
-  async ensureDiscussionCycle(event, signal) {
-    const state = await this.client.roomState(this.state, signal);
+  async ensureDiscussionCycle(event, signal, batch = null) {
+    const state = await this.roomStateForBatch(batch, signal);
     if (!state.activeEpoch?.id) return null;
     let roster = (state.roster ?? []).filter((member) => member.status === "active" && ["participant_agent", "room_master"].includes(member.role));
     const payload = eventPayload(event.payload);
@@ -2918,16 +2932,30 @@ export class OpenClawRoomRuntime {
     // Contract P17-3: a submission in flight is work in progress.
     this.submissions += 1;
     try {
-      return await this.withBindingOperation(() => {
-        if (this.state.credentialRotation) throw new Error("Room access renewal is pending; outbound delivery paused");
-        return this.postAndFinishOnce(request);
-      });
+      for (;;) {
+        const result = await this.withBindingOperation(() => {
+          if (this.closed || this.stoppedByRoom()) throw new Error("Room membership is stopped");
+          if (this.state.credentialRotation) throw new Error("Room access renewal is pending; outbound delivery paused");
+          return this.postAndFinishOnce(request, true);
+        });
+        if (!result?.[WAITING_FOR_GRANT]) return result;
+        // P2c-3f: do not hold the binding's mutation queue across a grant
+        // wait. Heartbeats and other deliveries retain their normal paths.
+        const granted = await this.waitForGrant(result.turn, request.signal, result.requestedAt);
+        await this.withBindingOperation(async () => {
+          if (this.closed || this.stoppedByRoom()) throw new Error("Room membership is stopped");
+          if (this.state.deliveryIntents?.[result.key] !== result.intent) throw new Error("Room delivery binding changed while waiting for a grant");
+          result.intent.turn = {turnId: granted.turnId};
+          await this.persistState();
+        });
+        // The ordinary send path rechecks epoch/post authority after the wait.
+      }
     } finally {
       this.submissions -= 1;
     }
   }
 
-  async postAndFinishOnce({roomId, text, replyToId, idempotencyKey, signal, sourceEventId, sourceEpochId = "", cycleAttempt = null, resolveRecipientMentions = false, contributionType, literal = false}) {
+  async postAndFinishOnce({roomId, text, replyToId, idempotencyKey, signal, sourceEventId, sourceEpochId = "", cycleAttempt = null, resolveRecipientMentions = false, contributionType, literal = false}, parkGrant = false) {
     if (roomId !== this.state.roomId) throw new Error("Outbound Room does not match connector membership");
     const originalRaw = String(text ?? "").trim();
     // Recovery supplies the already-frozen body; never parse it as new output.
@@ -3107,13 +3135,15 @@ export class OpenClawRoomRuntime {
       }
       await this.persistState();
     }
-    await this.markTurnPreparing(intent.identity.sourceEventId, signal);
+    await this.markTurnPreparing(intent.identity.sourceEventId, signal, intent.identity.sourceEventId || deliveryKey);
     let granted = null;
     if (intent.turn) {
       granted = intent.turn;
     } else if (intent.identity.coordinationMode === "coordinated") {
+      const requestedAt = Date.now();
       const turn = await this.client.requestTurn(this.state, intent.turnRequest, signal);
-      granted = await this.waitForGrant(turn, signal);
+      if (parkGrant && turn.state !== "granted") return {[WAITING_FOR_GRANT]: true, turn, requestedAt, intent, key: deliveryKey};
+      granted = await this.waitForGrant(turn, signal, requestedAt);
       intent.turn = {turnId: granted.turnId};
       await this.persistState();
     }
@@ -3592,15 +3622,77 @@ export class OpenClawRoomRuntime {
     return this.settleDiscussionAttempt(cycleAttempt, "pass", signal);
   }
 
-  async waitForGrant(initial, signal) {
-    if (initial.state === "granted") return initial;
-    const deadline = Date.now() + 120_000;
-    while (Date.now() < deadline) {
-      await sleep(750, signal);
-      const state = await this.client.roomState(this.state, signal);
-      if (state.activeTurn?.holderMembershipId === this.state.membershipId) return state.activeTurn;
+  observeTurnGrants(page) {
+    // The normal event read notifies existing waiters without another state
+    // read, cursor advance or acknowledgement. Canonical processing is unchanged.
+    if (!Array.isArray(page?.events)) return;
+    const candidates = [page?.activeTurn];
+    for (const event of page?.events ?? []) {
+      const payload = eventPayload(event.payload);
+      if (event.type === "turn.granted") candidates.push(payload.turn ?? payload);
+      if (payload.activeTurn) candidates.push(payload.activeTurn);
     }
-    throw new Error("Room turn was not granted before the lease deadline");
+    for (const grant of candidates) {
+      if (!grant?.turnId || grant.holderMembershipId !== this.state.membershipId) continue;
+      this.observedGrant = grant;
+      for (const waiter of this.grantWaiters) if (waiter.matches(grant)) waiter.resolve(grant);
+    }
+  }
+
+  async waitForGrant(initial, signal, requestedAt = Date.now()) {
+    signal?.throwIfAborted();
+    this.heartbeatAbort.signal.throwIfAborted();
+    if (this.closed || this.stoppedByRoom()) throw new Error("Room membership is stopped");
+    const expiry = Date.parse(String(initial.leaseExpiresAt ?? initial.expiresAt ?? ""));
+    const deadline = Number.isFinite(expiry) ? expiry : requestedAt + 120_000;
+    const timeout = new Error("Room turn was not granted before the lease deadline");
+    if (Date.now() >= deadline) throw timeout;
+    if (initial.state === "granted") return initial;
+    const cancel = new AbortController();
+    const stop = AbortSignal.any([cancel.signal, this.heartbeatAbort.signal, ...(signal ? [signal] : [])]);
+    const matches = (grant) => Date.now() < deadline && !this.stoppedByRoom()
+      && grant?.holderMembershipId === this.state.membershipId
+      && (!initial.turnId || grant.turnId === initial.turnId)
+      && (!grant.leaseExpiresAt || Date.parse(grant.leaseExpiresAt) > Date.now());
+    const grant = Promise.withResolvers();
+    const waiter = {matches, resolve: grant.resolve};
+    this.grantWaiters.add(waiter);
+    const timer = setTimeout(() => cancel.abort(timeout), deadline - Date.now());
+    let onAbort;
+    const aborted = new Promise((_, reject) => {
+      onAbort = () => reject(stop.reason);
+      stop.addEventListener("abort", onAbort, {once: true});
+    });
+    const fallback = async () => {
+      let minimum = 2_000, eligible = requestedAt + minimum, failures = 0;
+      for (;;) {
+        await sleep(Math.max(0, Math.min(eligible, deadline) - Date.now()), stop);
+        stop.throwIfAborted();
+        if (this.closed || this.stoppedByRoom()) throw new Error("Room membership is stopped");
+        if (Date.now() >= deadline) throw timeout;
+        try {
+          const state = await this.client.roomState(this.state, stop);
+          stop.throwIfAborted();
+          if (matches(state.activeTurn)) return state.activeTurn;
+          failures = 0;
+          minimum = Math.min(10_000, minimum * 2);
+          eligible = Date.now() + minimum;
+        } catch (error) {
+          if (stop.aborted || this.closed || !transientRoomFailure(error)) throw error;
+          // P2c-3a including Retry-After, never shorter than P2c-3f.
+          eligible = Date.now() + Math.max(minimum, this.retryDelay(failures++, error));
+        }
+      }
+    };
+    try {
+      if (initial.turnId && matches(this.observedGrant)) return this.observedGrant;
+      return await Promise.race([grant.promise, fallback(), aborted]);
+    } finally {
+      clearTimeout(timer);
+      this.grantWaiters.delete(waiter);
+      cancel.abort();
+      stop.removeEventListener("abort", onAbort);
+    }
   }
 
   // Contract P2c-3: a lost network is recovered here on the P2c-3a schedule
@@ -3616,6 +3708,7 @@ export class OpenClawRoomRuntime {
         // long poll with that answer (runHeartbeat), so the read ends at once.
         const stop = signal ? AbortSignal.any([signal, this.heartbeatAbort.signal]) : this.heartbeatAbort.signal;
         const page = await this.client.readEvents(this.state, after, {wait: 20, signal: stop});
+        this.observeTurnGrants(page);
         if (lost) this.logger?.info?.("Room event stream resumed");
         return page;
       } catch (error) {
@@ -4072,13 +4165,23 @@ export class OpenClawRoomRuntime {
     }
   }
 
-  async publishActivityFrame({kind, status, sourceEventId, sourceSeq, delivery, textDelta, canonicalEventId}, signal) {
+  async publishActivityFrame({kind, status, sourceEventId, sourceSeq, delivery, textDelta, canonicalEventId, turnKey}, signal) {
     // Presentation-only relay frames. Any failure is deliberately swallowed:
     // the UI activity pane is best-effort and must never block canonical work.
     // Each source event owns one immutable runId + gap-free stream sequence.
     // Reusing a process-wide run across different sourceEventIds violates the
     // relay scope contract and makes every later acknowledgement fail with 400.
     const source = String(sourceEventId ?? "");
+    const preparationKey = String(turnKey ?? source);
+    if (status === "preparing_response") {
+      if (this.closed || this.stoppedByRoom() || signal?.aborted || this.heartbeatAbort.signal.aborted) return;
+      const now = Date.now();
+      // Reserve before I/O: concurrent host calls and ambiguous responses
+      // cannot bypass the rolling window. Standalone delivery keys are turns too.
+      for (const [key, at] of this.preparingSentAt) if (now - at >= 5_000) this.preparingSentAt.delete(key);
+      if (this.preparingSentAt.has(preparationKey)) return;
+      this.preparingSentAt.set(preparationKey, now);
+    }
     if (!this.activityRunId || source !== this.activitySourceEventId) {
       this.activityRunId = `openclaw-activity:${randomUUID()}`;
       this.activityStreamSeq = 0;
@@ -4086,6 +4189,20 @@ export class OpenClawRoomRuntime {
       this.pendingActivityFrame = null;
     }
     if (this.activityStreamSeq === undefined) this.activityStreamSeq = 0;
+    // A lost preparing receipt must not be retried by an unrelated frame
+    // inside its rolling window. Start a fresh presentation run so that the
+    // acknowledgement/terminal can proceed without a sequence gap or a wait.
+    if (this.pendingActivityFrame?.status === "preparing_response") {
+      const key = this.pendingPreparingKey;
+      const sentAt = this.preparingSentAt.get(key);
+      if (this.closed || this.stoppedByRoom() || (sentAt !== undefined && Date.now() - sentAt < 5_000)) {
+        this.pendingActivityFrame = null;
+        this.activityRunId = `openclaw-activity:${randomUUID()}`;
+        this.activityStreamSeq = 0;
+      } else {
+        this.preparingSentAt.set(key, Date.now());
+      }
+    }
     if (this.pendingActivityFrame) {
       try {
         const receipt = await this.client.publishActivity(this.state, this.pendingActivityFrame, signal);
@@ -4111,6 +4228,7 @@ export class OpenClawRoomRuntime {
         ...(canonicalEventId ? {canonicalEventId} : {}),
     };
     this.pendingActivityFrame = frame;
+    this.pendingPreparingKey = status === "preparing_response" ? preparationKey : null;
     try {
       const receipt = await this.client.publishActivity(this.state, frame, signal);
       this.activityStreamSeq = acceptedActivitySequence(receipt, frame.streamSeq);
@@ -4131,8 +4249,8 @@ export class OpenClawRoomRuntime {
     await this.publishActivityFrame({kind: "context_acknowledged", sourceEventId: event.id, sourceSeq: event.seq}, signal);
   }
 
-  async markTurnPreparing(sourceEventId, signal) {
-    await this.publishActivityFrame({kind: "lifecycle", status: "preparing_response", sourceEventId}, signal);
+  async markTurnPreparing(sourceEventId, signal, turnKey) {
+    await this.publishActivityFrame({kind: "lifecycle", status: "preparing_response", sourceEventId, turnKey}, signal);
   }
 
   async markTurnPosted(sourceEventId, canonicalEventId, signal) {

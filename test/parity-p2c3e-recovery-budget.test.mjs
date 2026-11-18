@@ -119,7 +119,7 @@ test("conformance parityP2c3eCases carries the five shared cases, each a test of
   assert.deepEqual(conformance.parityP2c3eCases, CASES);
   assert.ok(contract.includes("\nP2c-3e Recovery budget (2026-11-17). All memberships of one connector installation share one recovery budget: across\n"), "P2c-3e paragraph");
   assert.ok(contract.indexOf("The per-Room summary follows the membership entries (P2c-4).\n\nP2c-3e ") > 0, "P2c-3e directly after P2c-3d");
-  assert.ok(contract.indexOf("does not use it.\n\nP2c-4 Local status.") > 0, "P2c-4 follows P2c-3e");
+  assert.ok(contract.indexOf("does not use it.\n\nP2c-3f Request discipline") > 0, "P2c-3f follows P2c-3e");
   // Paula's final text (common brief Addendum 1): a 429 to a registration and a 429 to a heartbeat differ.
   assert.ok(contract.includes("An HTTP 429 answer to a registration\ndelays that membership's next registration at least by its `Retry-After` (or `retryAfterSeconds`); an HTTP 429 answer\nto a heartbeat of a current session is retried after its `Retry-After` and does not count as a failed heartbeat unless\nthe lease expires first."), "P2c-3e final text");
   assert.equal(sha256(contract), conformance.contractSha256);
