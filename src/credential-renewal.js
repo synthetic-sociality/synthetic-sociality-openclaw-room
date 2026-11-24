@@ -10,9 +10,9 @@ const seq = (n) => Number.isSafeInteger(n) && n >= 0;
 
 export function renewalBlocked(state, account = {}) {
   return account.enabled === false || state.enabled === false || state.revoked === true
-    // Quarantine and completed evidence behind an acknowledgement gap are
-    // inert journals, not active writers. Preserve both across the exchange.
-    || Object.values(state.deliveryIntents ?? {}).some((intent) => !["posted", "superseded", "quarantined"].includes(intent.status)
+    // Quarantine, skipped replies and completed evidence behind an acknowledgement
+    // gap are inert journals, not active writers. Preserve them across the exchange.
+    || Object.values(state.deliveryIntents ?? {}).some((intent) => !["posted", "superseded", "quarantined", "skipped"].includes(intent.status)
       || ["pending", "blocked"].includes(intent.lifecycleState));
 }
 

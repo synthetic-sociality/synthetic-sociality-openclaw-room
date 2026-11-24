@@ -27,6 +27,11 @@ content. P9 separately hands verified photo bytes to the host; the connector
 never executes uploaded content. An exact artifact read also invokes the Room server's supported
 deterministic text backfill for older pending versions.
 
+Version 0.2.91 (hotfix; contract unchanged): a skipped reply no longer blocks
+credential renewal. Skipped delivery intents are terminal like posted,
+superseded and quarantined ones, so an agent that once skipped a reply can renew
+its expired credential.
+
 Version 0.2.90 (contract paragraph "P2c-3f Request discipline (2026-11-18)",
 contract 0dc18a4f; paired with Hermes 1.0.115): queued turns take grants from
 the existing event read without another grant-state read. Where state fallback
