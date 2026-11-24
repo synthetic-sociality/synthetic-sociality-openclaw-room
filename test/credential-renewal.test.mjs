@@ -166,6 +166,59 @@ for (const lost of [null, "requestCredentialRenewal", "redeemCredentialRenewal",
   });
 }
 
+// 0.2.91 hotfix: a skipped reply (lifecycleState not_required) is terminal
+// and must not lock the membership out of credential renewal.
+// "selected" stands for any non-terminal (pending) delivery status.
+const intentOf = (status, lifecycleState) => ({"source-5:final": {
+  version: 2, status, deliveryState: status, lifecycleState, messagePayloadDialect: "v1",
+  ...(status === "skipped" ? {skippedReason: "no_reply", skippedSourceSeq: 5} : {}),
+  identity: {roomId: "room-1", sourceEventId: "source-5", body: ""},
+  binding: {roomId: "room-1", membershipId: "member-1", clientInstanceId: "instance-1"},
+}});
+
+test("0.2.91 a skipped delivery intent does not block renewal; renewal journals and requests", async () => {
+  const f = await fixture();
+  f.state.deliveryIntents = intentOf("skipped", "not_required");
+  await saveState(f.stateFile, f.state);
+  const before = structuredClone(f.state.deliveryIntents);
+  const journaled = f.client.requestCredentialRenewal;
+  let journalSeen = false;
+  f.client.requestCredentialRenewal = async (...args) => {
+    journalSeen = Boolean((await loadState(f.stateFile)).credentialRotation);
+    return journaled(...args);
+  };
+  assert.equal(await renewCredential(f), true);
+  assert.equal(journalSeen, true);
+  assert.deepEqual(f.calls.slice(0, 2), ["discover", "request"]);
+  assert.ok(f.calls.includes("confirm"));
+  assert.deepEqual(f.state.deliveryIntents, before);
+});
+
+for (const [label, mutate] of [
+  ["non-terminal status selected", (s) => { s.deliveryIntents = intentOf("selected", "not_started"); }],
+  ["skipped with lifecycleState pending", (s) => { s.deliveryIntents = intentOf("skipped", "pending"); }],
+  ["skipped with lifecycleState blocked", (s) => { s.deliveryIntents = intentOf("skipped", "blocked"); }],
+  ["revoked state", (s) => { s.revoked = true; s.deliveryIntents = intentOf("skipped", "not_required"); }],
+  ["state enabled:false", (s) => { s.enabled = false; s.deliveryIntents = intentOf("skipped", "not_required"); }],
+  ["account enabled:false", (s, f) => { f.account = {enabled: false}; s.deliveryIntents = intentOf("skipped", "not_required"); }],
+]) {
+  test(`0.2.91 negative control: ${label} still blocks renewal before discovery`, async () => {
+    const f = await fixture();
+    mutate(f.state, f);
+    await saveState(f.stateFile, f.state);
+    assert.equal(await renewCredential(f), false);
+    assert.deepEqual(f.calls, []);
+  });
+}
+
+test("0.2.91 control: a quarantined intent still passes", async () => {
+  const f = await fixture();
+  f.state.deliveryIntents = intentOf("quarantined", "not_started");
+  await saveState(f.stateFile, f.state);
+  assert.equal(await renewCredential(f), true);
+  assert.ok(f.calls.includes("confirm"));
+});
+
 test("external state writer prevents renewal overwriting local cursor", async () => {
   const f = await fixture();
   await saveState(f.stateFile, {...f.state, cursor: 8});
