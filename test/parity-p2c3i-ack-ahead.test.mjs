@@ -432,3 +432,27 @@ test("P2c-3i site matrix: every site reports a Room behind as the one conflict",
     });
   }
 });
+
+// OP-12 r3 F1 parity column: a Room acknowledgement that is a string, a
+// fraction or missing is the one conflict at every site, never adopted. (In
+// JavaScript 3222.0 is the integer 3222, so the fraction is 3222.5.)
+test("P2c-3i site matrix: every site reports a non-integer Room acknowledgement as the one conflict", async (t) => {
+  for (const [site, run] of Object.entries(SITES)) {
+    for (const value of ["3222", 3222.5, null]) {
+      await t.test(`${site} ${JSON.stringify(value)}`, async () => {
+        let code = "";
+        let runtime;
+        try {
+          runtime = await run(value);
+        } catch (error) {
+          code = error?.code ?? "";
+        }
+        if (runtime) {
+          code = runtime.logs.some((item) => /ack_frontier_mismatch/.test(item.line)) ? "ack_frontier_mismatch" : code;
+          assert.equal(runtime.state.cursor, 3220, `${site} ${value}: nothing adopted`);
+        }
+        assert.equal(code, "ack_frontier_mismatch", `${site} ${value}`);
+      });
+    }
+  }
+});
