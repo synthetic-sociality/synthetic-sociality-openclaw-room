@@ -195,10 +195,13 @@ test("0.2.91 a skipped delivery intent does not block renewal; renewal journals 
   assert.deepEqual(f.state.deliveryIntents, before);
 });
 
+// Contract P2c-3j (0.2.93): unfinished work blocks only while the base credential
+// is still valid; an expired base renews first (test/parity-p2c3j-renew-inflight.test.mjs).
+const valid = (s) => { s.credentialExpiresAt = "2099-01-01T00:00:00Z"; };
 for (const [label, mutate] of [
-  ["non-terminal status selected", (s) => { s.deliveryIntents = intentOf("selected", "not_started"); }],
-  ["skipped with lifecycleState pending", (s) => { s.deliveryIntents = intentOf("skipped", "pending"); }],
-  ["skipped with lifecycleState blocked", (s) => { s.deliveryIntents = intentOf("skipped", "blocked"); }],
+  ["non-terminal status selected", (s) => { valid(s); s.deliveryIntents = intentOf("selected", "not_started"); }],
+  ["skipped with lifecycleState pending", (s) => { valid(s); s.deliveryIntents = intentOf("skipped", "pending"); }],
+  ["skipped with lifecycleState blocked", (s) => { valid(s); s.deliveryIntents = intentOf("skipped", "blocked"); }],
   ["revoked state", (s) => { s.revoked = true; s.deliveryIntents = intentOf("skipped", "not_required"); }],
   ["state enabled:false", (s) => { s.enabled = false; s.deliveryIntents = intentOf("skipped", "not_required"); }],
   ["account enabled:false", (s, f) => { f.account = {enabled: false}; s.deliveryIntents = intentOf("skipped", "not_required"); }],

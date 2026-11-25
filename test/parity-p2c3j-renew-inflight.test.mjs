@@ -169,7 +169,10 @@ test("RENEW-INFLIGHT-01 delivery_pending", async (t) => {
       assert.equal(saved.credentialRotation, undefined);
       assert.deepEqual(saved.deliveryIntents[KEY], before, "the intent and its frozen bytes are unchanged by the exchange");
       assert.deepEqual(room.calls, ["discover", "request", "redeem", "verify", "confirm", "state"]);
-      // The normal replay resumes it: the same frozen post, the new credential.
+      // The registration on the renewed credential ends the Room's stop
+      // (P2c-3d, registerConnector); then the normal replay resumes the intent:
+      // the same frozen post, the new credential.
+      runtime.credentialExpired = false;
       const posts = [];
       runtime.client = {...room.client, postMessage: async (session, body) => {
         posts.push({credential: session.credential, body: structuredClone(body)});
@@ -183,6 +186,29 @@ test("RENEW-INFLIGHT-01 delivery_pending", async (t) => {
       assert.equal(runtime.state.deliveryIntents[KEY].deliveryState, "posted");
     });
   }
+});
+
+test("RENEW-INFLIGHT-01 delivery_pending: a lost confirm reply resumes after the swap", async () => {
+  const state = await withIntent("delivery_pending");
+  const before = structuredClone(state.deliveryIntents[KEY]);
+  const room = renewalRoom();
+  const confirm = room.client.confirmCredentialRenewal;
+  let lost = true;
+  room.client.confirmCredentialRenewal = async (...args) => {
+    if (lost) { lost = false; room.calls.push("confirm-lost"); throw new RoomTransportError("lost reply"); }
+    return confirm(...args);
+  };
+  const runtime = await runtimeFor(state, room, "inflight01b");
+  await assert.rejects(runtime.renewAccess(), RoomTransportError);
+  const swapped = await loadState(runtime.account.stateFile);
+  assert.equal(swapped.credentialRotation.phase, "swapped");
+  assert.equal(swapped.credentialRotation.baseExpired, true);
+  assert.equal(swapped.credentialExpiresAt, "2099-01-01T00:00:00Z", "after the swap the state carries the replacement's expiry");
+  runtime.lastRenewalCheck = 0;
+  assert.equal(await runtime.renewAccess(), true);
+  const saved = await loadState(runtime.account.stateFile);
+  assert.equal(saved.credentialRotation, undefined);
+  assert.deepEqual(saved.deliveryIntents[KEY], before);
 });
 
 test("RENEW-INFLIGHT-02 lifecycle_blocked", async (t) => {

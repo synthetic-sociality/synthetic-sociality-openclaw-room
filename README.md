@@ -27,7 +27,19 @@ content. P9 separately hands verified photo bytes to the host; the connector
 never executes uploaded content. An exact artifact read also invokes the Room server's supported
 deterministic text backfill for older pending versions.
 
-Version 0.2.93 (contract paragraph P2c-3i, after P2c-3h; contract 823b536d;
+Version 0.2.93 also carries contract paragraph P2c-3j (after P2c-3i; contract
+2cf69145): an expired base credential never waits for work that needs a valid
+credential. With the base expired (stored expiry passed, or the Room refused it
+as credential_expired) unfinished delivery and lifecycle intents no longer block
+an owner Renew (renewalBlocked, baseExpired; nor after the swap does a journal
+that began on an expired base); the intents stay byte-identical through the exchange,
+delivery_pending ones resume through their normal replay with the new
+credential, and lifecycle work blocked only by credential_expired is reopened
+once with a fresh attempt budget. With a valid base the quiescence rule is
+unchanged. Live finding: Aura (Networks, Kabeltracker). Shared cases
+RENEW-INFLIGHT-01 to -03 (test/parity-p2c3j-renew-inflight.test.mjs).
+
+Version 0.2.93 (contract paragraph P2c-3i, after P2c-3h; P2c-3i text contract 823b536d;
 paired with Hermes 1.0.118): the Room is the authority for the acknowledged
 frontier. A connector may only be behind it and catches up by adopting; only
 ahead of the Room is an error. One helper, recovery.reconcileRoomAck, is the only

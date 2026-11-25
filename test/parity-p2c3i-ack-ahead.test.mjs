@@ -108,7 +108,7 @@ test("P2c-3i conformance: shared case names and the exact contract paragraph aft
   }
   assert.equal(createHash("sha256").update(`<<<P2c-3i\n${P2C3I}\nP2c-3i>>>\n`).digest("hex"), P2C3I_BLOCK_SHA256);
   const contract = await readFile(new URL("../docs/delivery-lifecycle-contract-v1.md", import.meta.url), "utf8");
-  assert.ok(contract.includes(`optional forensics.\nP2c-3h>>>\n\n<<<P2c-3i\n${P2C3I}\nP2c-3i>>>\n\nP2c-4 Local status.`));
+  assert.ok(contract.includes(`optional forensics.\nP2c-3h>>>\n\n<<<P2c-3i\n${P2C3I}\nP2c-3i>>>\n\n<<<P2c-3j\n`));
   assert.equal(contract.split("<<<P2c-3i").length, 2);
   assert.equal(createHash("sha256").update(contract).digest("hex"), conformance.contractSha256);
 });

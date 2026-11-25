@@ -1331,7 +1331,8 @@ export class OpenClawRoomRuntime {
       this.renewing = true;
       try {
         const changed = await renewCredential({state: this.state, stateFile: this.account.stateFile,
-          account: this.account, client: this.client, signal: renewalSignal, logger: this.logger});
+          account: this.account, client: this.client, signal: renewalSignal, logger: this.logger,
+          refusedByRoom: this.credentialExpired});
         if (changed) {
           this.client.credential = this.state.credential;
           // Contract P2c-1: the renewed credential is scrubbed too.

@@ -30,7 +30,8 @@
     "requestDiscipline": "0.2.90_p2c3f_event_grants_lease_bounded_2_4_8_10s_fallback_batch_state_and_rolling_preparing_debounce",
     "recoveryBudget": "0.2.89_p2c3e_six_registration_starts_per_60s_per_installation_backoff_kept_until_an_accepted_heartbeat_retry_after_honoured",
     "stuckEvents": "0.2.92_p2c3h_quarantine_or_hole_at_frontier_stuck_on_room_proof_or_24h_quarantine_audited_terminal_evidence_one_terminal_set",
-    "ackAhead": "0.2.93_p2c3i_room_is_ack_authority_one_reconcile_helper_all_sites_renewal_adopts_expired_owner_request_closes_journal"
+    "ackAhead": "0.2.93_p2c3i_room_is_ack_authority_one_reconcile_helper_all_sites_renewal_adopts_expired_owner_request_closes_journal",
+    "renewInflight": "0.2.93_p2c3j_expired_base_renews_before_inflight_work_then_replay_and_reopen_credential_expired_lifecycles"
   },
   "fixtures": {
     "DLV1-01": "selection persistence failure prevents message submission",
@@ -1341,7 +1342,7 @@
     "L1": "94a5809aa1b1a9121404e15769e69487d5919efb641a8b0c358ba1793dc3842c",
     "P5": "4e7272530192d00478b842d4d1c8559530f39b76e0e0c026e738f740422e5a87",
     "P6": "3b79968d551d2613256a90c52c87ca6a18d93ff5337fc73f128b1654715d9e3a",
-    "P2c": "e986cc6dd0b6a05e1415899b1a7b4cb121a695c6d2a2f59ee8cde8bf26e2c8d9",
+    "P2c": "d2f23edeac1ed6f41298845e72470f4c973bf9fe52b84b228bc2bb09ee1cb14f",
     "Appendix": "3184213bcf7df5a6c9d01602e1ff48d36584f447ad2a09bcf3307b2bf89d2315",
     "P7c": "4919916e3f97e48c9f1e39f6e990eeba4ea80ee11e40e894396664a8445441cc",
     "P7d": "a6f2bfb6f38ab2e01cb0879bc8d7f576cf83c87b31cbe14dbb7468237d9b3c44",
@@ -1739,6 +1740,11 @@
     "ACK-AHEAD-06 renewal_resumes",
     "ACK-AHEAD-07 expired_intent_ends_cleanly"
   ],
+  "parityP2c3jCases": [
+    "RENEW-INFLIGHT-01 delivery_pending",
+    "RENEW-INFLIGHT-02 lifecycle_blocked",
+    "RENEW-INFLIGHT-03 valid_credential_unchanged"
+  ],
   "stuckEventsRegression": {
     "adapterVersion": "0.2.92",
     "base": "9afd34c",
@@ -1749,5 +1755,5 @@
     "base": "6796bb7",
     "runner": "node --test test/parity-p2c3i-ack-ahead.test.mjs"
   },
-  "contractSha256": "823b536d949e60aae6fcefa1587c7e38f1b1a46afe6651d0cc5ee09f3b7b145e"
+  "contractSha256": "2cf69145329266892655ef17bf57c2d5602b0ef865f6a4a54380528f4b358ed6"
 }

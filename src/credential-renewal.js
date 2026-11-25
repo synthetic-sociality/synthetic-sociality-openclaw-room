@@ -23,12 +23,44 @@ export class RenewalClosed extends Error {
   }
 }
 
-export function renewalBlocked(state, account = {}) {
-  return account.enabled === false || state.enabled === false || state.revoked === true
-    // Quarantine, skipped replies and completed evidence behind an acknowledgement
-    // gap are inert journals, not active writers. Preserve them across the exchange
-    // (contract P2c-3h: the shared settled set).
-    || Object.values(state.deliveryIntents ?? {}).some((intent) => !intentSettled(intent));
+// Contract P2c-3j: the base credential has expired (its stored expiry passed,
+// or the Room refused it as credential_expired: `refusedByRoom`).
+export function baseCredentialExpired(state, {refusedByRoom = false, nowMs = Date.now()} = {}) {
+  const expiresAt = Date.parse(state?.credentialExpiresAt ?? "");
+  return refusedByRoom === true || (Number.isFinite(expiresAt) && expiresAt <= nowMs);
+}
+
+export function renewalBlocked(state, account = {}, {baseExpired = false} = {}) {
+  if (account.enabled === false || state.enabled === false || state.revoked === true) return true;
+  // Contract P2c-3j: an expired base never waits for work that needs a valid
+  // credential to finish (nor does a journal that began on an expired base:
+  // after the swap the state carries the replacement's expiry); that work is
+  // kept unchanged and resumes after the renewal.
+  if (baseExpired || state.credentialRotation?.baseExpired === true) return false;
+  // Quarantine, skipped replies and completed evidence behind an acknowledgement
+  // gap are inert journals, not active writers. Preserve them across the exchange
+  // (contract P2c-3h: the shared settled set).
+  return Object.values(state.deliveryIntents ?? {}).some((intent) => !intentSettled(intent));
+}
+
+// Contract P2c-3j: after a confirmed renewal, lifecycle work blocked only
+// because the Room refused the credential as expired is reopened once for
+// automatic retry with a fresh attempt budget. Anything else stays as it is.
+function reopenExpiredLifecycles(intents) {
+  const next = {};
+  for (const [key, intent] of Object.entries(intents ?? {})) {
+    if (intent?.status === "lifecycle_blocked" && intent.lifecycleState === "blocked"
+      && intent.lifecycleErrorCode === "credential_expired" && intent.deliveryState === "posted" && intent.canonicalMessage) {
+      const reopened = {...intent, status: "lifecycle_pending", lifecycleState: "pending", lifecycleAutomaticRetry: true, lifecycleAttempts: 0};
+      delete reopened.lifecycleError;
+      delete reopened.lifecycleErrorCode;
+      delete reopened.lifecycleFailedAt;
+      next[key] = reopened;
+    } else {
+      next[key] = intent;
+    }
+  }
+  return next;
 }
 
 function identity(value, expected) {
@@ -80,8 +112,9 @@ export function validateRenewalJournal(journal, state) {
  * Every secret exists in durable private state before it is used on the wire.
  * Only a confirmed replacement may erase the recovery journal.
  */
-export async function renewCredential({state, stateFile, account, client, signal, logger}) {
-  if (renewalBlocked(state, account)) return false;
+export async function renewCredential({state, stateFile, account, client, signal, logger, refusedByRoom = false}) {
+  const baseExpired = baseCredentialExpired(state, {refusedByRoom});
+  if (renewalBlocked(state, account, {baseExpired})) return false;
   const persist = async (next) => {
     // Refuse a concurrent external writer instead of overwriting its cursors.
     if (!isDeepStrictEqual(await loadState(stateFile), state)) fail();
@@ -104,7 +137,7 @@ export async function renewCredential({state, stateFile, account, client, signal
       version: 1, phase: "requested", requestId: request.requestId,
       grantSecret: secret(), replacementCredential: secret(), baseCredential: state.credential,
       clientInstanceId: state.clientInstanceId, baseCredentialGeneration: request.baseCredentialGeneration,
-      localCursor: next.cursor,
+      localCursor: next.cursor, baseExpired,
       expected: {roomId: state.roomId, membershipId: state.membershipId,
         displayName: request.displayName, identityVersion: request.identityVersion,
         deliveredSeq: request.deliveredSeq, acknowledgedSeq: request.acknowledgedSeq},
@@ -194,7 +227,8 @@ export async function renewCredential({state, stateFile, account, client, signal
   const active = member(await client.roomState(replacement, signal, {background: true}), journal.expected);
   await reconcile(active, "renewal active state");
   delivery(active, journal.expected);
-  const finished = {...state, displayName: journal.expected.displayName, identityVersion: journal.expected.identityVersion};
+  const finished = {...state, displayName: journal.expected.displayName, identityVersion: journal.expected.identityVersion,
+    deliveryIntents: reopenExpiredLifecycles(state.deliveryIntents)};
   delete finished.credentialRotation;
   await persist(finished);
   return true;
