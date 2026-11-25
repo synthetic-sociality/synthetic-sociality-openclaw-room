@@ -258,6 +258,7 @@ test(`renewed runtime scans past quarantine and never replays on restart (${lega
     {id: "source-9", seq: 9, type: "credential.renewed", payload: {}},
     {id: "source-10", seq: 10, type: "message.posted", actorRole: "human_owner", payload: {body: "new", epochId: "epoch-1"}},
   ];
+  let stamp = "";
   for (const restarted of [false, true]) {
     const runtime = new OpenClawRoomRuntime({stateFile: f.stateFile});
     runtime.state = await loadState(f.stateFile);
@@ -296,7 +297,14 @@ test(`renewed runtime scans past quarantine and never replays on restart (${lega
     }
     assert.deepEqual(reads, [7, 8, 9, 10]);
     assert.equal(runtime.state.cursor, 7);
-    assert.deepEqual(runtime.state.deliveryIntents, quarantine);
+    // Contract P2c-3h (0.2.92): the first scan stamps the age clock of a
+    // quarantine that has no time of its own; nothing else in the intent
+    // changes, and a restart keeps the same stamp.
+    const {quarantinedAt, ...kept} = runtime.state.deliveryIntents["source-8:final"];
+    assert.match(quarantinedAt, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/);
+    stamp ||= quarantinedAt;
+    assert.equal(quarantinedAt, stamp);
+    assert.deepEqual({...runtime.state.deliveryIntents, "source-8:final": kept}, quarantine);
     assert.ok(runtime.state.terminalEvidence["9"]);
     assert.ok(runtime.state.terminalEvidence["10"]);
     await runtime.close();

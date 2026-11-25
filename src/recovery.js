@@ -142,7 +142,7 @@ async function readProof(room, seq) {
     deliveredSeq: Number(page?.deliveredSeq) || 0, fetchedAt: now(),
   };
   const facts = {eventId: String(event.id ?? ""), eventType: String(event.type ?? ""), eventEpochId: epochId};
-  return {facts, proof, payload, eventTs: String(event.ts ?? "")};
+  return {facts, proof, payload};
 }
 
 const epochClosed = ({facts, proof}) => Boolean(facts.eventEpochId) && facts.eventEpochId !== proof.activeEpochId
@@ -199,8 +199,8 @@ export async function serverProof(room, membershipId, seq, reason, evidenceRef) 
 // Contract P2c-3h: what the Room proves about the event at `seq`, with the
 // reads and the proof shape of a closure (P3-4): the trigger epoch_closed (or
 // hole_epoch_closed for a hole, which only an epoch-closed proof frees),
-// cycle_terminal or cycle_superseded, else "". Also the Room's event time.
-// Null when the Room has no such event.
+// cycle_terminal or cycle_superseded, else "". Null when the Room has no
+// such event.
 export async function stuckProof(room, membershipId, seq, {hole = false} = {}) {
   let read;
   try {
@@ -209,7 +209,7 @@ export async function stuckProof(room, membershipId, seq, {hole = false} = {}) {
     if (error instanceof RecoveryRefused) return null;
     throw error;
   }
-  const result = (trigger, evidenceRef = "") => ({...read.facts, trigger, evidenceRef, proof: read.proof, eventTs: read.eventTs});
+  const result = (trigger, evidenceRef = "") => ({...read.facts, trigger, evidenceRef, proof: read.proof});
   if (epochClosed(read)) return result(hole ? "hole_epoch_closed" : "epoch_closed", `epoch:${read.facts.eventEpochId}`);
   if (hole) return result("");
   const cycleId = await readCycle(room, membershipId, seq, read);

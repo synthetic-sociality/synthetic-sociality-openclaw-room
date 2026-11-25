@@ -354,8 +354,8 @@ test("RDC conformance: final shared cases and exact contract digest", async () =
   const contract = await readFile(new URL("../docs/delivery-lifecycle-contract-v1.md", import.meta.url), "utf8");
   assert.deepEqual(conformance.parityP2c3fCases, CASES);
   assert.ok(contract.includes("membership stopped by the Room (P2c-3d) does not use it.\n\nP2c-3f Request discipline"));
-  // P2c-3h (0.2.92) follows P2c-3f directly; P2c-4 follows P2c-3h.
-  assert.ok(contract.includes("re-admission rules permit it.\n\nA Room event that the connector has quarantined never holds"));
-  assert.ok(contract.includes("Recovery verbs remain available as optional forensics.\n\nP2c-4 Local status."));
+  // P2c-3h (0.2.92, markers included) follows P2c-3f directly; P2c-4 follows it.
+  assert.ok(contract.includes("re-admission rules permit it.\n\n<<<P2c-3h\nA Room event that the connector has quarantined never holds"));
+  assert.ok(contract.includes("Recovery verbs remain available as optional forensics.\nP2c-3h>>>\n\nP2c-4 Local status."));
   assert.equal(createHash("sha256").update(contract).digest("hex"), conformance.contractSha256);
 });

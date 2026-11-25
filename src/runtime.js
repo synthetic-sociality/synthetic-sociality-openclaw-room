@@ -545,6 +545,9 @@ function validTerminalEvidence(evidence) {
 // frontier seq at most this often (request discipline, P2c-3f).
 export const STUCK_AGE_MS = 24 * 3_600_000;
 export const STUCK_PROBE_INTERVAL_MS = 5 * 60_000;
+// The intent's own times that can start the age clock, in order: the stamp
+// written at quarantine (0.2.92), then a recorded failure time.
+const QUARANTINE_CLOCK_FIELDS = Object.freeze(["quarantinedAt", "lifecycleFailedAt"]);
 // At most this many frontier seqs become stuck in one scan.
 const STUCK_PASS_LIMIT = 32;
 const sha256Hex = (text) => createHash("sha256").update(text, "utf8").digest("hex");
@@ -2985,19 +2988,19 @@ export class OpenClawRoomRuntime {
     let quarantinedAt = "";
     let ageSource = "";
     if (!hole) {
-      if (validCanonicalTimestamp(candidate.intent.quarantinedAt)) {
-        [quarantinedAt, ageSource] = [candidate.intent.quarantinedAt, "intent"];
-      } else if (validCanonicalTimestamp(proven?.eventTs)) {
-        // A quarantine before 0.2.92 carries no stamp: it is no older than the Room's event.
-        [quarantinedAt, ageSource] = [proven.eventTs, "room_event"];
-      } else if (probe.answered) {
-        // Neither: the age clock starts now (migration; the only change to the intent).
-        candidate.intent.quarantinedAt = isoSeconds(now);
-        await this.persistState();
-        return false;
-      }
+      // The age clock is the intent's own quarantine (or failure) time, never
+      // the Room's event time, which would overstate the age.
+      ageSource = QUARANTINE_CLOCK_FIELDS.find((field) => validCanonicalTimestamp(candidate.intent[field])) ?? "";
+      quarantinedAt = ageSource ? candidate.intent[ageSource] : "";
       if (!trigger) {
-        if (!quarantinedAt || now - Date.parse(quarantinedAt) < STUCK_AGE_MS) return false;
+        if (!quarantinedAt) {
+          // A quarantine before 0.2.92 with no time of its own: the clock
+          // starts at this first scan (the only change to the intent).
+          candidate.intent.quarantinedAt = isoSeconds(now);
+          await this.persistState();
+          return false;
+        }
+        if (now - Date.parse(quarantinedAt) < STUCK_AGE_MS) return false;
         trigger = "age";
       }
     } else if (trigger !== "hole_epoch_closed") {

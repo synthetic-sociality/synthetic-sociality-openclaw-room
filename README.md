@@ -27,7 +27,7 @@ content. P9 separately hands verified photo bytes to the host; the connector
 never executes uploaded content. An exact artifact read also invokes the Room server's supported
 deterministic text backfill for older pending versions.
 
-Version 0.2.92 (contract paragraph P2c-3h, after P2c-3f; contract 71618047;
+Version 0.2.92 (contract paragraph P2c-3h, after P2c-3f; contract cf182f6b;
 paired with Hermes 1.0.117): a quarantined event never holds the acknowledgement
 frontier indefinitely. At the frontier, with no attempt in flight and no retry
 pending, it becomes stuck when the Room proves its epoch closed or its cycle

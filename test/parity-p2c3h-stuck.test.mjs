@@ -185,8 +185,9 @@ test("P2c-3h conformance: shared case names, verified feature and the exact cont
   }
   assert.equal(createHash("sha256").update(`<<<P2c-3h\n${P2C3H}\nP2c-3h>>>\n`).digest("hex"), P2C3H_BLOCK_SHA256);
   const contract = await readFile(new URL("../docs/delivery-lifecycle-contract-v1.md", import.meta.url), "utf8");
-  // Directly after P2c-3f (P2c-3g is reserved by the batch-acks lane).
-  assert.ok(contract.includes(`re-admission rules permit it.\n\n${P2C3H}\n\nP2c-4 Local status.`));
+  // The block's exact bytes, markers included, directly after P2c-3f (P2c-3g
+  // is reserved by the batch-acks lane), byte-identical to the Hermes contract.
+  assert.ok(contract.includes(`re-admission rules permit it.\n\n<<<P2c-3h\n${P2C3H}\nP2c-3h>>>\n\nP2c-4 Local status.`));
   assert.equal(createHash("sha256").update(contract).digest("hex"), conformance.contractSha256);
 });
 
@@ -291,16 +292,41 @@ for (const item of AGE_TRACES) {
     assert.equal(runtime.state.deliveryIntents[`ev${item.seq}:final`].quarantinedAt, iso(item.since), "the intent is kept unchanged");
   });
 
-  test(`STK-04 age: migration of a pre-0.2.92 ${item.name} state on the first scan (no quarantine stamp; the Room's event time)`, async (t) => {
-    clock(t);
+  test(`STK-04 age: migration of a pre-0.2.92 ${item.name} state: the first scan stamps the intent and it is stuck 24 h later`, async (t) => {
+    const advance = clock(t);
     const state = traceState({cursor: item.seq - 1, quarantine: [[item.seq, item.code]], evidence: [item.seq + 1]});
+    // The Room's event is days old: it is never the quarantine clock.
     const room = fakeRoom({events: [roomEvent(item.seq, item.type, {ts: iso(item.since)})]});
     const runtime = await runtimeFor(state, room, `migrate-${item.name}`);
+    await scanOnce(runtime);
+    assert.deepEqual(room.acks, []);
+    assert.equal(runtime.state.cursor, item.seq - 1);
+    assert.equal(runtime.state.deliveryIntents[`ev${item.seq}:final`].quarantinedAt, iso(NOW), "the first scan stamps the age clock");
+    assert.equal((await loadState(runtime.account.stateFile)).deliveryIntents[`ev${item.seq}:final`].quarantinedAt, iso(NOW), "durably");
+    advance(24 * HOUR - 60_000);
+    await scanOnce(runtime);
+    assert.deepEqual(room.acks, [], "under 24 h after the stamp");
+    advance(60_000);
     await scanOnce(runtime);
     assert.deepEqual(room.acks, [item.seq + 1]);
     assert.equal(runtime.state.cursor, item.seq + 1, `the cursor leaves ${item.seq - 1}`);
     const [record] = await stuckRecords(runtime);
-    assert.deepEqual([record.seq, record.reason], [item.seq, `stuck:age:${item.code || "none"}`]);
+    assert.deepEqual([record.seq, record.reason, record.quarantinedAt, record.ageSource],
+      [item.seq, `stuck:age:${item.code || "none"}`, iso(NOW), "quarantinedAt"]);
+  });
+
+  test(`STK-04 age: a pre-0.2.92 ${item.name} intent with its own recorded failure time is aged from that time`, async (t) => {
+    clock(t);
+    const state = traceState({cursor: item.seq - 1, quarantine: [[item.seq, item.code]], evidence: [item.seq + 1]});
+    state.deliveryIntents[`ev${item.seq}:final`].lifecycleFailedAt = iso(item.since);
+    const room = fakeRoom({events: [roomEvent(item.seq, item.type, {ts: iso(item.since)})]});
+    const runtime = await runtimeFor(state, room, `failed-at-${item.name}`);
+    await scanOnce(runtime);
+    assert.deepEqual(room.acks, [item.seq + 1]);
+    assert.equal(runtime.state.deliveryIntents[`ev${item.seq}:final`].quarantinedAt, undefined, "no stamp: the intent is kept unchanged");
+    const [record] = await stuckRecords(runtime);
+    assert.deepEqual([record.seq, record.reason, record.quarantinedAt, record.ageSource],
+      [item.seq, `stuck:age:${item.code || "none"}`, iso(item.since), "lifecycleFailedAt"]);
   });
 }
 
@@ -425,9 +451,10 @@ test("STK-08 under_24h", async (t) => {
   await scanOnce(runtime);
   assert.deepEqual(room.acks, [3224], "at 24 h it is stuck");
 
-  // A legacy intent without a stamp whose Room event is 23 h old is not stuck.
+  // A pre-0.2.92 intent without a time of its own is not stuck on its first
+  // scan, however old the Room's event is.
   const legacy = traceState({cursor: 3222, quarantine: [[3223, ""]], evidence: [3224]});
-  const legacyRoom = fakeRoom({events: [roomEvent(3223, "peer.acknowledged", {ts: iso(NOW - 23 * HOUR)})]});
+  const legacyRoom = fakeRoom({events: [roomEvent(3223, "peer.acknowledged", {ts: iso(NOW - 72 * HOUR)})]});
   const legacyRuntime = await runtimeFor(legacy, legacyRoom, "under-24h-legacy");
   await scanOnce(legacyRuntime);
   assert.deepEqual(legacyRoom.acks, []);
