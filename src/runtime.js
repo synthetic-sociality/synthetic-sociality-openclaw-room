@@ -12,7 +12,7 @@ import {activateRoomChannel} from "./activation.js";
 import {ParticipationGate} from "./participation.js";
 import {abandonRevokedPendingWork, abandonableEntries, staleInertState} from "./readmission.js";
 import {ROOM_CONNECTOR_PROVENANCE} from "./release-provenance.js";
-import {renewCredential} from "./credential-renewal.js";
+import {RenewalClosed, renewCredential} from "./credential-renewal.js";
 import {speakerLabel, speakerName} from "./speaker.js";
 import {rememberSecrets} from "./secret-isolation.js";
 import {CONTROL_CAPABILITY, connectorControl, installationIdFor, roomStateDirectory, storedWorkInProgress, untilSignal} from "./connector-control.js";
@@ -21,8 +21,9 @@ import {
 } from "./documents.js";
 import {readRotationRequest, removeRotationRequest} from "./epoch-rotation.js";
 import {
-  CLOSURE_EVIDENCE_PREFIX, RecoveryRefused, appendRecord, canonical, closuresFor, journalPath, ledgerReport, priorState,
-  pruneTerminalIntents, readRecordsCached, roomForState, seal, serverProof, stuckProof,
+  AckFrontierConflict, CLOSURE_EVIDENCE_PREFIX, RecoveryRefused, appendRecord, canonical, closuresFor, journalPath, ledgerReport,
+  priorState, pruneTerminalIntents, readRecordsCached, reconcileRoomAck, roomAckAheadMessage, roomForState, seal, serverProof,
+  stuckProof,
 } from "./recovery.js";
 import {isQuarantinedIntent, isTerminalEvidenceStatus, isTerminalIntent, parseStuckReason, stuckReason} from "./terminal-states.js";
 
@@ -1330,7 +1331,7 @@ export class OpenClawRoomRuntime {
       this.renewing = true;
       try {
         const changed = await renewCredential({state: this.state, stateFile: this.account.stateFile,
-          account: this.account, client: this.client, signal: renewalSignal});
+          account: this.account, client: this.client, signal: renewalSignal, logger: this.logger});
         if (changed) {
           this.client.credential = this.state.credential;
           // Contract P2c-1: the renewed credential is scrubbed too.
@@ -1339,6 +1340,12 @@ export class OpenClawRoomRuntime {
         }
         return changed;
       } catch (error) {
+        if (error instanceof RenewalClosed) {
+          // ACK-AHEAD-07: the journal is closed with its reason; nothing to retry.
+          this.logger?.warn?.(`Room ${this.state.roomId} renewal journal closed (${error.reason}); a new owner Renew is needed`);
+          this.reportStatus({errorCode: error.code});
+          return false;
+        }
         // Old servers may return 200 HTML for an unknown optional route.
         // Discovery alone must not terminate ordinary delivery. Once secrets
         // were journaled, however, no participation may race a partial swap.
@@ -2796,52 +2803,28 @@ export class OpenClawRoomRuntime {
     // Contract P2c-3a: the evidence above is durable; the acknowledgement is
     // retried on the schedule while the Room has not answered.
     const response = await this.retryContact("acknowledgement", () => this.client.acknowledge(this.state, frontier));
-    const authoritative = response?.acknowledgedSeq;
-    // Contract P2c-3i: the Room already holds a higher acknowledgement
-    // (earlier instance, fence, lost state write); it is adopted as a fence.
-    const ahead = Number.isSafeInteger(authoritative) && authoritative > frontier;
-    if (!ahead && (!Number.isSafeInteger(authoritative) || authoritative !== frontier)) {
-      throw new Error("Room acknowledgement exceeded the locally proven contiguous frontier");
+    // Contract P2c-3i: the Room is the authority for the acknowledged
+    // frontier; one helper reconciles it (a Room ahead is adopted as a fence,
+    // a Room behind or a non-integer answer is the conflict).
+    const eventIds = this.pendingEvent ? {[String(this.pendingEvent.seq)]: this.pendingEvent.id} : {};
+    const reconciled = reconcileRoomAck(this.state, response?.acknowledgedSeq, {frontier, eventIds});
+    const authoritative = reconciled.acknowledged;
+    if (reconciled.adopted) {
+      this.logger?.warn?.(roomAckAheadMessage(this.state.roomId, reconciled, "acknowledgement"));
+    } else {
+      this.state.cursor = authoritative;
+      this.state.terminalEvidence = Object.fromEntries(
+        Object.entries(this.state.terminalEvidence ?? {}).filter(([seq]) => Number(seq) > authoritative),
+      );
+      this.state.receiveLedger = Object.fromEntries(
+        Object.entries(this.state.receiveLedger ?? {}).filter(([seq]) => Number(seq) > authoritative),
+      );
+      // Contract P3-2: terminal intents beyond the newest 32 are pruned.
+      const pruned = pruneTerminalIntents(this.state);
+      if (pruned.length) this.logger?.info?.(`Room pruned ${pruned.length} terminal delivery intents`);
     }
-    const previous = this.state.cursor;
-    if (ahead) this.adoptRoomAckAhead(frontier, authoritative);
-    this.state.cursor = authoritative;
-    // The adopted range keeps its evidence until the next frontier advance.
-    const kept = ahead ? previous : authoritative;
-    this.state.terminalEvidence = Object.fromEntries(
-      Object.entries(this.state.terminalEvidence ?? {}).filter(([seq]) => Number(seq) > kept),
-    );
-    this.state.receiveLedger = Object.fromEntries(
-      Object.entries(this.state.receiveLedger ?? {}).filter(([seq]) => Number(seq) > authoritative),
-    );
-    // Contract P3-2: terminal intents beyond the newest 32 are pruned.
-    const pruned = pruneTerminalIntents(this.state);
-    if (pruned.length) this.logger?.info?.(`Room pruned ${pruned.length} terminal delivery intents`);
     await saveState(this.account.stateFile, this.state);
     if (this.pendingEvent && (this.pendingEvent.seq <= authoritative || this.pendingEvent.id === event.id)) this.pendingEvent = null;
-  }
-
-  // Contract P2c-3i: every seq up to the Room's acknowledgement without
-  // terminal evidence becomes "ignored" with reason room_ack_ahead; existing
-  // evidence is kept. One warn line per adoption.
-  adoptRoomAckAhead(frontier, authoritative) {
-    this.state.terminalEvidence ??= {};
-    for (let seq = this.state.cursor + 1; seq <= authoritative; seq += 1) {
-      const key = String(seq);
-      if (validTerminalEvidence(this.state.terminalEvidence[key]) && this.state.terminalEvidence[key].sourceSeq === seq) continue;
-      const known = this.state.receiveLedger?.[key]?.eventId
-        || (this.pendingEvent?.seq === seq ? this.pendingEvent.id : "");
-      this.state.terminalEvidence[key] = {
-        status: "ignored",
-        sourceEventId: String(known || `room_ack_ahead:${seq}`),
-        sourceSeq: seq,
-        canonicalEventId: "",
-        canonicalSeq: 0,
-        canonicalTs: "",
-        reason: "room_ack_ahead",
-      };
-    }
-    this.logger?.warn?.(`Room ${this.state.roomId} acknowledgement ahead of the local cursor adopted: frontier ${frontier}, Room ${authoritative}, seqs ${frontier + 1}-${authoritative} ignored with reason room_ack_ahead where no terminal evidence existed`);
   }
 
   // Contract P3-1: ledger entries for a page, persisted before processing.
@@ -2928,9 +2911,18 @@ export class OpenClawRoomRuntime {
     let freed = 0;
     for (let pass = 0; pass < STUCK_PASS_LIMIT && !signal?.aborted && !this.closed; pass += 1) {
       const seq = this.state.cursor + 1;
-      const candidate = this.stuckCandidate(seq);
-      if (!candidate) break;
+      const evidence = this.state.terminalEvidence?.[String(seq)];
+      // Contract P2c-3i: durable terminal evidence at the frontier is only
+      // acknowledged here, and the Room's answer is reconciled.
+      const recorded = validTerminalEvidence(evidence) && evidence.sourceSeq === seq;
+      const candidate = recorded ? null : this.stuckCandidate(seq);
+      if (!recorded && !candidate) break;
       try {
+        if (recorded) {
+          await this.ackEvent({id: evidence.sourceEventId, seq});
+          if (this.state.cursor < seq) break;
+          continue;
+        }
         if (!(await this.freeStuck(seq, candidate, signal))) break;
         freed += 1;
       } catch (error) {
@@ -5442,6 +5434,7 @@ function sessionLost(error) {
 
 // P2c-4: a status code for a failure: the Room code, else a fixed class.
 export function statusErrorCode(error) {
+  if (error instanceof AckFrontierConflict) return error.code;
   if (error instanceof RoomAPIError) return error.code || `http_${error.status}`;
   if (error instanceof RoomRequestError) return error.code;
   if (error instanceof InvalidEventPage) return "invalid_event_page";

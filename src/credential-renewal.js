@@ -2,12 +2,26 @@ import {createHash, randomBytes} from "node:crypto";
 import {isDeepStrictEqual} from "node:util";
 import {loadState, saveState} from "./state.js";
 import {intentSettled} from "./terminal-states.js";
+import {reconcileRoomAck, roomAckAheadMessage} from "./recovery.js";
 
 const secret = () => randomBytes(32).toString("base64url");
 const phases = ["requested", "prepared", "redeemed", "swapped", "confirmed"];
 const fail = () => { throw new Error("Room credential renewal evidence mismatch; retain private journal for review"); };
 const positive = (n) => Number.isSafeInteger(n) && n > 0;
 const seq = (n) => Number.isSafeInteger(n) && n >= 0;
+const MISMATCH = "Room credential renewal evidence mismatch; retain private journal for review";
+
+// Contract P2c-3i (ACK-AHEAD-07): the journal was closed without a credential.
+// The owner request expired before it was issued; nothing was swapped. The
+// state records the reason and a new owner Renew is needed.
+export class RenewalClosed extends Error {
+  constructor(reason) {
+    super(`owner renewal journal closed: ${reason}; a new owner Renew is needed`);
+    this.name = "RenewalClosed";
+    this.reason = reason;
+    this.code = `renewal_${reason}`;
+  }
+}
 
 export function renewalBlocked(state, account = {}) {
   return account.enabled === false || state.enabled === false || state.revoked === true
@@ -23,17 +37,22 @@ function identity(value, expected) {
   }
 }
 
+// The acknowledgement was reconciled with the local cursor before
+// (reconcileDelivery, contract P2c-3i); delivered stays exact.
 function delivery(value, expected) {
   identity(value, expected);
-  for (const field of ["deliveredSeq", "acknowledgedSeq"]) {
-    if (value?.[field] !== expected[field]) fail();
-  }
+  if (value?.deliveredSeq !== expected.deliveredSeq) fail();
 }
 
-function deliverySnapshot(request, state) {
-  if (!seq(request?.deliveredSeq) || request.deliveredSeq < state.cursor
-    || request.acknowledgedSeq !== state.cursor) fail();
-  return {deliveredSeq: request.deliveredSeq, acknowledgedSeq: request.acknowledgedSeq};
+// Contract P2c-3i: a renewal answer's acknowledgement meets the local cursor
+// only here. A Room ahead is adopted on a copy the caller persists; a Room
+// behind, a non-integer value or delivered below it is the one conflict.
+function reconcileDelivery(value, state) {
+  // A delivered below the local cursor is below the Room's acknowledgement too: the helper's conflict.
+  if (!seq(value?.deliveredSeq)) fail();
+  const next = structuredClone(state);
+  const result = reconcileRoomAck(next, value.acknowledgedSeq, {delivered: value.deliveredSeq, conflict: MISMATCH});
+  return {result, next};
 }
 
 function member(snapshot, expected) {
@@ -61,7 +80,7 @@ export function validateRenewalJournal(journal, state) {
  * Every secret exists in durable private state before it is used on the wire.
  * Only a confirmed replacement may erase the recovery journal.
  */
-export async function renewCredential({state, stateFile, account, client, signal}) {
+export async function renewCredential({state, stateFile, account, client, signal, logger}) {
   if (renewalBlocked(state, account)) return false;
   const persist = async (next) => {
     // Refuse a concurrent external writer instead of overwriting its cursors.
@@ -80,17 +99,21 @@ export async function renewCredential({state, stateFile, account, client, signal
       || request.membershipId !== state.membershipId || !positive(request.identityVersion)
       || !request.displayName || !positive(request.baseCredentialGeneration)
       || !Number.isFinite(Date.parse(request.expiresAt)) || Date.parse(request.expiresAt) <= Date.now()) fail();
+    const {result, next} = reconcileDelivery(request, state);
     journal = {
       version: 1, phase: "requested", requestId: request.requestId,
       grantSecret: secret(), replacementCredential: secret(), baseCredential: state.credential,
       clientInstanceId: state.clientInstanceId, baseCredentialGeneration: request.baseCredentialGeneration,
-      localCursor: state.cursor,
+      localCursor: next.cursor,
       expected: {roomId: state.roomId, membershipId: state.membershipId,
         displayName: request.displayName, identityVersion: request.identityVersion,
-        ...deliverySnapshot(request, state)},
+        deliveredSeq: request.deliveredSeq, acknowledgedSeq: request.acknowledgedSeq},
     };
-    validateRenewalJournal(journal, state);
-    await persist({...state, credentialRotation: journal});
+    validateRenewalJournal(journal, next);
+    const prepared = {...next, credentialRotation: journal};
+    delete prepared.renewalClosed;
+    await persist(prepared);
+    if (result.adopted) logger?.warn?.(roomAckAheadMessage(state.roomId, result, "renewal preflight"));
   }
   validateRenewalJournal(journal, state);
   const base = {...state, credential: journal.baseCredential};
@@ -99,20 +122,45 @@ export async function renewCredential({state, stateFile, account, client, signal
     journal = {...journal, ...fields};
     await persist({...state, ...stateFields, credentialRotation: journal});
   };
+  // Contract P2c-3i: reconcile before any comparison; on adoption the journal's
+  // expected and local cursors follow the Room.
+  const reconcile = async (value, where) => {
+    const {result, next} = reconcileDelivery(value, state);
+    if (!result.adopted) return;
+    journal = {...journal, localCursor: next.cursor, expected: {...journal.expected,
+      acknowledgedSeq: next.cursor, deliveredSeq: Math.max(journal.expected.deliveredSeq ?? 0, value.deliveredSeq)}};
+    await persist({...next, credentialRotation: journal});
+    logger?.warn?.(roomAckAheadMessage(state.roomId, result, where));
+  };
+  // ACK-AHEAD-07: an expired owner request closes the journal (base credential
+  // unchanged), records the reason and is not retried.
+  const close = async (answer, reason) => {
+    if (answer?.requestId !== journal.requestId || answer?.roomId !== state.roomId
+      || (answer.membershipId !== undefined && answer.membershipId !== state.membershipId)
+      || journal.phase !== "requested" || state.credential !== journal.baseCredential) fail();
+    const closed = {...state, renewalClosed: {reason, requestId: journal.requestId, closedAt: new Date().toISOString()}};
+    delete closed.credentialRotation;
+    await persist(closed);
+    throw new RenewalClosed(reason);
+  };
   if (journal.phase === "requested") {
     if (!seq(journal.expected.deliveredSeq)) {
       // Resume an older private preparation through renewal-only authority.
       // An expired base must never be granted or require ordinary /state.
       const current = (await client.credentialRenewalIntent(base, signal))?.request;
+      if (current?.state === "expired") await close(current, "owner_request_expired");
       identity(current, journal.expected);
       if (current.requestId !== journal.requestId || current.baseCredentialGeneration !== journal.baseCredentialGeneration) fail();
-      await update({expected: {...journal.expected, ...deliverySnapshot(current, state)}});
+      await reconcile(current, "renewal preflight");
+      await update({expected: {...journal.expected, deliveredSeq: current.deliveredSeq, acknowledgedSeq: state.cursor}});
     }
     const requested = await client.requestCredentialRenewal(base, {
       requestId: journal.requestId,
       grantSecretHash: createHash("sha256").update(journal.grantSecret).digest("hex"),
       clientInstanceId: state.clientInstanceId,
     }, signal);
+    if (requested?.state === "expired") await close(requested, "owner_request_expired");
+    await reconcile(requested, "renewal request");
     delivery(requested, journal.expected);
     if (requested.requestId !== journal.requestId || requested.baseCredentialGeneration !== journal.baseCredentialGeneration
       || !["issued", "redeemed"].includes(requested.state) || !requested.grantId) fail();
@@ -122,12 +170,14 @@ export async function renewCredential({state, stateFile, account, client, signal
     const redeemed = await client.redeemCredentialRenewal(base, journal.grantId, {
       grantSecret: journal.grantSecret, replacementCredential: journal.replacementCredential,
     }, signal);
+    await reconcile(redeemed, "renewal redeem");
     delivery(redeemed, journal.expected);
     if (redeemed.grantId !== journal.grantId) fail();
     await update({phase: "redeemed"});
   }
   if (journal.phase === "redeemed") {
     const verified = await client.verifyCredentialRenewal(replacement, journal.grantId, signal);
+    await reconcile(verified, "renewal verify");
     delivery(verified, journal.expected);
     if (verified.grantId !== journal.grantId || !Number.isFinite(Date.parse(verified.credentialExpiresAt))) fail();
     await update({phase: "swapped"}, {credential: journal.replacementCredential, credentialExpiresAt: verified.credentialExpiresAt});
@@ -142,6 +192,7 @@ export async function renewCredential({state, stateFile, account, client, signal
   }
   // Contract P15-2 (PR80-O-004): credential discovery is a background watcher; it waits while participation is paused.
   const active = member(await client.roomState(replacement, signal, {background: true}), journal.expected);
+  await reconcile(active, "renewal active state");
   delivery(active, journal.expected);
   const finished = {...state, displayName: journal.expected.displayName, identityVersion: journal.expected.identityVersion};
   delete finished.credentialRotation;

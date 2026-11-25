@@ -27,18 +27,25 @@ content. P9 separately hands verified photo bytes to the host; the connector
 never executes uploaded content. An exact artifact read also invokes the Room server's supported
 deterministic text backfill for older pending versions.
 
-Version 0.2.93 (contract paragraph P2c-3i, after P2c-3h; contract 0fa6c2fe;
-paired with Hermes 1.0.118): a Room acknowledgement ahead of the local cursor is
-adopted, not a reconnect loop. When the Room answers an acknowledgement with an
-acknowledgedSeq above the frontier the connector acknowledged (an earlier
-instance, a fence or a lost state write), ackEvent records every seq up to it
-without terminal evidence as ignored with reason room_ack_ahead (existing
-evidence stays unchanged; the adopted range keeps its evidence until the next
-frontier advance), moves the cursor, persists and logs one warn line; delivery
-continues from the next seq and a later equal answer logs nothing. A lower,
-missing or non-integer answer still throws. Trace: Berlin in Digital
-sovereignty, cursor 3220, evidence 3221 ignored, Room 3222. Shared cases
-ACK-AHEAD-01 to ACK-AHEAD-05 (test/parity-p2c3i-ack-ahead.test.mjs).
+Version 0.2.93 (contract paragraph P2c-3i, after P2c-3h; contract 823b536d;
+paired with Hermes 1.0.118): the Room is the authority for the acknowledged
+frontier. A connector may only be behind it and catches up by adopting; only
+ahead of the Room is an error. One helper, recovery.reconcileRoomAck, is the only
+place a Room acknowledgement meets the local cursor: equal changes nothing; a
+Room ahead is adopted as a fence (seqs up to it without terminal evidence become
+ignored with reason room_ack_ahead, existing evidence is kept, the cursor moves
+and is saved, one warn line); a Room behind, a missing or non-integer value, or a
+delivered seq below it is the one conflict ack_frontier_mismatch and changes
+nothing. It serves ackEvent (and so every replay after a reconnect or restart),
+the stuck scan (durable evidence at the frontier is acknowledged there), and
+every renewal answer (preflight, request, redeem, verify, active state); during
+a renewal an adoption also moves the journal's expected and local cursors, so a
+journal no longer fails every scan. An owner request reported expired closes
+the journal without changing the credential, records renewalClosed (reason
+owner_request_expired) and logs that a new owner Renew is needed; it is not
+retried. Trace: Berlin in Digital sovereignty, cursor 3220, evidence 3221
+ignored, Room 3222. Shared cases ACK-AHEAD-01 to ACK-AHEAD-07 and a six-site
+matrix (test/parity-p2c3i-ack-ahead.test.mjs).
 
 Version 0.2.92 (contract paragraph P2c-3h, after P2c-3f; contract cf182f6b;
 paired with Hermes 1.0.117): a quarantined event never holds the acknowledgement

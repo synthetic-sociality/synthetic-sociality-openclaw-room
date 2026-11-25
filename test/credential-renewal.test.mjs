@@ -111,10 +111,11 @@ test("failed final state verification retains confirmed journal and replacement"
 for (const mutation of [
   (f) => { f.request.membershipId = "someone-else"; },
   (f) => { f.proof.identityVersion = 999; },
-  (f) => { f.proof.acknowledgedSeq = 8; },
+  // Contract P2c-3i: a Room ahead is adopted; a Room behind the cursor (7) is the mismatch.
+  (f) => { f.proof.acknowledgedSeq = 6; },
   (f) => { f.request.expiresAt = "2020-01-01T00:00:00Z"; },
   (f) => { delete f.request.deliveredSeq; },
-  (f) => { f.request.acknowledgedSeq = 8; },
+  (f) => { f.request.acknowledgedSeq = 6; },
 ]) {
   test("rejects wrong identity, cursor or expired intent", async () => {
     const f = await fixture(); mutation(f);

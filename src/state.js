@@ -181,6 +181,11 @@ export function validateState(value) {
   }
   if (!Number.isSafeInteger(value.cursor) || value.cursor < 0) throw new Error("Room state cursor is invalid");
   if (value.credentialRotation !== undefined) validateRenewalJournal(value.credentialRotation, value);
+  // Contract P2c-3i (ACK-AHEAD-07): why the last owner renewal journal closed.
+  if (value.renewalClosed !== undefined && (!value.renewalClosed || typeof value.renewalClosed !== "object"
+    || Array.isArray(value.renewalClosed) || typeof value.renewalClosed.reason !== "string" || !value.renewalClosed.reason)) {
+    throw new Error("Room renewal closure is invalid");
+  }
   if (value.epochSessionRoutingInitialized !== undefined && typeof value.epochSessionRoutingInitialized !== "boolean") {
     throw new Error("Room epoch session routing marker is invalid");
   }

@@ -1659,7 +1659,9 @@ test("redacted production-state projection proves seq839 durably before ack and 
   };
   const result = await restarted.assignedTurns(restartController.signal).next();
   assert.equal(result.done, true);
-  assert.deepEqual(restartTrace, [["listEpochs"], ["acknowledge", 839], ["acknowledge", 840]]);
+  // Contract P2c-3i: the scan acknowledges the durable 839 evidence at the
+  // frontier before the page read, so the prior-epoch catalog is not needed.
+  assert.deepEqual(restartTrace, [["acknowledge", 839], ["acknowledge", 840]]);
   assert.deepEqual(restartCounters, zeroEpochTransitionSideEffects());
 
   const complete = await loadState(stateFile);

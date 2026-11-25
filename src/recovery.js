@@ -12,7 +12,7 @@
 // is applied (contract P3-4) and on the store fence that keeps agents out.
 import {createHash} from "node:crypto";
 import {closeSync, fchmodSync, fsyncSync, openSync, readFileSync, statSync, writeSync, constants as fs} from "node:fs";
-import {isQuarantinedIntent, isTerminalIntent} from "./terminal-states.js";
+import {isQuarantinedIntent, isTerminalEvidenceStatus, isTerminalIntent} from "./terminal-states.js";
 
 // Contract P2c-3h: one terminal-state set per connector (terminal-states.js).
 export {isQuarantinedIntent, isTerminalIntent};
@@ -81,6 +81,58 @@ export function pruneTerminalIntents(state, keep = TERMINAL_INTENT_RETENTION) {
   const pruned = keep > 0 ? terminal.slice(0, Math.max(0, terminal.length - keep)) : terminal;
   for (const key of pruned) delete intents[key];
   return pruned;
+}
+
+// Contract P2c-3i: the Room is the authority for the acknowledged frontier.
+export const ROOM_ACK_AHEAD = "room_ack_ahead";
+export const ACK_FRONTIER_MISMATCH = "ack_frontier_mismatch";
+
+// The Room's acknowledgement is behind the local one, or not an integer.
+export class AckFrontierConflict extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "AckFrontierConflict";
+    this.code = ACK_FRONTIER_MISMATCH;
+  }
+}
+
+// Contract P2c-3i: the one place a Room acknowledgement meets a local cursor.
+// `frontier` is the local value compared (default: the cursor; ackEvent passes
+// its walked frontier). Equal: no change. Room ahead: adopted as a fence;
+// every seq up to it without terminal evidence becomes "ignored" with reason
+// room_ack_ahead (existing evidence is kept and the adopted range keeps its
+// records until the next frontier advance prunes them), the cursor moves, the
+// receive ledger and terminal intents are pruned. Room behind, a non-integer
+// answer, or a `delivered` below the Room's acknowledgement: AckFrontierConflict,
+// nothing changes. The caller persists and logs (roomAckAheadMessage).
+export function reconcileRoomAck(state, roomAck, {frontier, delivered, eventIds = {},
+  conflict = "Room acknowledgement exceeded the locally proven contiguous frontier"} = {}) {
+  const local = Number.isSafeInteger(frontier) ? frontier : state.cursor;
+  if (!Number.isSafeInteger(roomAck) || roomAck < local || roomAck < state.cursor) throw new AckFrontierConflict(conflict);
+  if (delivered !== undefined && (!Number.isSafeInteger(delivered) || delivered < roomAck)) throw new AckFrontierConflict(conflict);
+  if (roomAck === local) return {adopted: false, frontier: local, acknowledged: roomAck, seqs: []};
+  const previous = state.cursor;
+  const marked = [];
+  state.terminalEvidence ??= {};
+  for (let seq = previous + 1; seq <= roomAck; seq += 1) {
+    const key = String(seq);
+    const existing = state.terminalEvidence[key];
+    if (existing && isTerminalEvidenceStatus(existing.status) && existing.sourceSeq === seq) continue;
+    const known = state.receiveLedger?.[key]?.eventId || eventIds[key] || "";
+    state.terminalEvidence[key] = {status: "ignored", sourceEventId: String(known || `${ROOM_ACK_AHEAD}:${seq}`), sourceSeq: seq,
+      canonicalEventId: "", canonicalSeq: 0, canonicalTs: "", reason: ROOM_ACK_AHEAD};
+    marked.push(seq);
+  }
+  state.cursor = roomAck;
+  state.terminalEvidence = Object.fromEntries(Object.entries(state.terminalEvidence).filter(([seq]) => Number(seq) > previous));
+  state.receiveLedger = Object.fromEntries(Object.entries(state.receiveLedger ?? {}).filter(([seq]) => Number(seq) > roomAck));
+  pruneTerminalIntents(state);
+  return {adopted: true, frontier: local, acknowledged: roomAck, seqs: marked};
+}
+
+// The one warning line per adoption (contract P2c-3i).
+export function roomAckAheadMessage(roomId, result, where) {
+  return `Room ${roomId} acknowledgement ahead of the local cursor adopted (${where}): frontier ${result.frontier}, Room ${result.acknowledged}, ${result.seqs.length} seqs ignored with reason ${ROOM_ACK_AHEAD} where no terminal evidence existed`;
 }
 
 // Intents that cannot progress by themselves: quarantined, or not terminal with
