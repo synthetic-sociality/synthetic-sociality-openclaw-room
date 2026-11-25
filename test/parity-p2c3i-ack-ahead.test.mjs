@@ -32,6 +32,9 @@ after(() => rm(home, {recursive: true, force: true}));
 process.env.OPENCLAW_STATE_DIR = join(home, "openclaw");
 const {OpenClawRoomRuntime} = await import("../src/runtime.js");
 const {loadState, saveState} = await import("../src/state.js");
+const {RenewalClosed, renewCredential} = await import("../src/credential-renewal.js");
+const {AckFrontierConflict} = await import("../src/recovery.js");
+const {randomBytes} = await import("node:crypto");
 
 const conformance = JSON.parse(await readFile(new URL("../conformance.json", import.meta.url), "utf8"));
 const CASES = [
@@ -40,10 +43,12 @@ const CASES = [
   "ACK-AHEAD-03 behind_errors",
   "ACK-AHEAD-04 non_int_errors",
   "ACK-AHEAD-05 restart_keeps_cursor",
+  "ACK-AHEAD-06 renewal_resumes",
+  "ACK-AHEAD-07 expired_intent_ends_cleanly",
 ];
-const P2C3I = "When the Room answers an acknowledgement with an acknowledgedSeq that is an integer greater than the frontier the connector acknowledged, the Room already holds that acknowledgement (from an earlier instance, a fence or a lost state write) and the connector adopts it as a fence instead of treating it as a mismatch. Every sequence up to and including acknowledgedSeq that has no terminal evidence is recorded as terminal \"ignored\" with reason room_ack_ahead; existing terminal evidence for those sequences stays unchanged. The connector moves its acknowledged cursor to acknowledgedSeq, persists it, logs one warning per room per adoption and continues normal delivery from acknowledgedSeq + 1; it raises no retryable error and does not reconnect, and a later equal answer logs nothing. An acknowledgedSeq below the frontier, or one that is missing or not an integer, remains the error ack_frontier_mismatch. Adoption is per room and per membership and needs no owner action.";
+const P2C3I = "The Room is the authority for the member's acknowledged frontier. A connector may only be behind it and catches up by adopting; only a connector ahead of the Room is an error. Wherever the connector meets the Room's acknowledgedSeq (the acknowledgement answer, a reconnect or replay, the scan, a restart, the credential-renewal preflight and each renewal verification), one reconciliation per connector applies: equal needs no change; an integer acknowledgedSeq above the local frontier (from an earlier instance, a fence or a lost state write) is adopted as a fence: every sequence up to and including it that has no terminal evidence is recorded as terminal \"ignored\" with reason room_ack_ahead, existing terminal evidence stays unchanged, the acknowledged cursor moves to acknowledgedSeq and is persisted, one warning is logged per room per adoption, and normal delivery continues from acknowledgedSeq + 1 with no retryable error, no reconnect and no renewal retry. An acknowledgedSeq below the local frontier, one that is missing or not an integer, or a delivered sequence below it or below the local read cursor, is the one conflict ack_frontier_mismatch and changes nothing. During a credential renewal the adoption also renews the journal's expected and protected cursors. An owner-initiated renewal whose request expired before it was issued closes its journal without changing the credential, records the reason and reports that a new owner Renew is needed; it is not retried. Reconciliation is per room and per membership and needs no owner action.";
 // The card's block, markers included (handover/ackahead-p2c3i.txt).
-const P2C3I_BLOCK_SHA256 = "760f6be0bc71319c4e906545c00df4314c354e35f8927498407cd82da626d361";
+const P2C3I_BLOCK_SHA256 = "917c297d29da2b2282106a459f6ae223561f00024c42f02b2ff5aea9c8fc6b2e";
 const ROOM = "duev8o1h936bl9f";
 
 const ignored = (seq, reason = "not_assigned_or_technical") => ({status: "ignored", sourceEventId: `ev${seq}`, sourceSeq: seq,
@@ -208,4 +213,222 @@ test("ACK-AHEAD-05 restart_keeps_cursor", async (t) => {
     assert.equal(untouched.cursor, 3220);
     assert.equal(untouched.terminalEvidence["3222"], undefined);
   });
+});
+
+// --- r1: renewal (ACK-AHEAD-06/07) and the site matrix -------------------------
+
+const REQUEST_ID = randomBytes(32).toString("base64url");
+
+function berlinExpired() {
+  return berlinState({credential: "expired-base", credentialExpiresAt: "2020-01-01T00:00:00Z", installationId: "inst-1"});
+}
+
+// One fake Room's renewal routes. `room` holds the answers ({ack, ackAfterConfirm,
+// delivered, state, loseRequest}) and records the calls.
+function renewalClient(room) {
+  room.calls ??= [];
+  const answer = () => ({roomId: ROOM, membershipId: "member-1", displayName: "Berlin", identityVersion: 3,
+    baseCredentialGeneration: 1, requestId: REQUEST_ID,
+    deliveredSeq: room.confirmed && room.deliveredAfterConfirm !== undefined ? room.deliveredAfterConfirm : room.delivered ?? 3222,
+    acknowledgedSeq: room.confirmed && room.ackAfterConfirm !== undefined ? room.ackAfterConfirm : room.ack});
+  return {
+    credentialRenewalIntent: async () => {
+      room.calls.push("discover");
+      return {request: room.confirmed ? null : {...answer(), acknowledgedSeq: room.discoverAck ?? room.ack,
+        state: "owner_requested", expiresAt: new Date(Date.now() + 60_000).toISOString()}};
+    },
+    requestCredentialRenewal: async () => {
+      room.calls.push("request");
+      if (room.loseRequest) { room.loseRequest = false; throw new Error("lost reply"); }
+      if (room.state === "expired") return {roomId: ROOM, membershipId: "member-1", requestId: REQUEST_ID, state: "expired"};
+      return {...answer(), state: "issued", grantId: "grant-1"};
+    },
+    redeemCredentialRenewal: async (_session, _grant, body) => {
+      room.calls.push("redeem"); room.replacement = body.replacementCredential;
+      return {...answer(), grantId: "grant-1"};
+    },
+    verifyCredentialRenewal: async () => {
+      room.calls.push("verify");
+      return {...answer(), grantId: "grant-1", credentialExpiresAt: "2099-01-01T00:00:00Z"};
+    },
+    confirmCredentialRenewal: async () => {
+      room.calls.push("confirm"); room.confirmed = true;
+      return {id: "event-1", type: "credential.renewed",
+        payload: {membershipId: "member-1", credentialGeneration: 2, credentialExpiresAt: "2099-01-01T00:00:00Z"}};
+    },
+    roomState: async (session) => {
+      assert.equal(room.confirmed, true, "an expired base never reads ordinary /state");
+      assert.equal(session.credential, room.replacement);
+      room.calls.push("state");
+      return {roomId: ROOM, roster: [answer()]};
+    },
+    acknowledge: async (_state, seq) => ({acknowledgedSeq: Math.max(seq, room.ack)}),
+  };
+}
+
+// Berlin's state file with an owner journal in phase requested: expected and
+// local cursor 3220 (the request reply was lost while the Room said 3220).
+async function berlinJournal(name) {
+  const stateFile = await account(berlinExpired(), name);
+  const state = await loadState(stateFile);
+  const room = {ack: 3220, delivered: 3221, loseRequest: true};
+  await assert.rejects(renewCredential({state, stateFile, client: renewalClient(room)}), /lost reply/);
+  const saved = await loadState(stateFile);
+  assert.equal(saved.credentialRotation.phase, "requested");
+  assert.equal(saved.credentialRotation.localCursor, 3220);
+  assert.equal(saved.credentialRotation.expected.acknowledgedSeq, 3220);
+  return stateFile;
+}
+
+async function renew(stateFile, room) {
+  const runtime = await runtimeAt(stateFile, renewalClient(room));
+  const changed = await renewCredential({state: runtime.state, stateFile, client: runtime.client, logger: runtime.logger});
+  return {runtime, changed};
+}
+
+test("ACK-AHEAD-06 renewal_resumes", async (t) => {
+  await t.test("Berlin's owner journal at 3220 resumes and completes with the Room at 3222", async () => {
+    const stateFile = await berlinJournal("renew06");
+    const room = {ack: 3222};
+    const {runtime, changed} = await renew(stateFile, room);
+    assert.equal(changed, true);
+    const saved = await loadState(stateFile);
+    assert.equal(saved.credentialRotation, undefined);
+    assert.equal(saved.credential, room.replacement);
+    assert.equal(saved.cursor, 3222);
+    assert.equal(saved.terminalEvidence["3222"].reason, "room_ack_ahead");
+    assert.deepEqual(saved.terminalEvidence["3221"], ignored(3221));
+    assert.deepEqual(room.calls, ["request", "redeem", "verify", "confirm", "state"]);
+    assert.equal(warnings(runtime).filter((item) => /room_ack_ahead/.test(item.line)).length, 1);
+  });
+  await t.test("a Room behind the journal is still the one conflict", async () => {
+    const stateFile = await berlinJournal("renew06b");
+    await assert.rejects(renew(stateFile, {ack: 3219}), (error) => error instanceof AckFrontierConflict && error.code === "ack_frontier_mismatch");
+    const saved = await loadState(stateFile);
+    assert.equal(saved.cursor, 3220);
+    assert.equal(saved.credentialRotation.phase, "requested");
+  });
+  await t.test("the runtime renews once and then has nothing to retry (no scan failure loop)", async () => {
+    const stateFile = await berlinJournal("renew06c");
+    const room = {ack: 3222};
+    const runtime = await runtimeAt(stateFile, renewalClient(room));
+    assert.equal(await runtime.renewAccess(), true);
+    assert.equal(runtime.state.cursor, 3222);
+    runtime.lastRenewalCheck = 0;
+    assert.equal(await runtime.renewAccess(), false);
+    assert.deepEqual(room.calls, ["request", "redeem", "verify", "confirm", "state", "discover"]);
+  });
+});
+
+test("ACK-AHEAD-07 expired_intent_ends_cleanly", async (t) => {
+  await t.test("an expired owner request closes the journal with its reason", async () => {
+    const stateFile = await berlinJournal("renew07");
+    const room = {ack: 3222, state: "expired"};
+    await assert.rejects(renew(stateFile, room), (error) => error instanceof RenewalClosed && error.reason === "owner_request_expired"
+      && /new owner Renew/.test(error.message));
+    const saved = await loadState(stateFile);
+    assert.equal(saved.credentialRotation, undefined);
+    assert.equal(saved.renewalClosed.reason, "owner_request_expired");
+    assert.equal(saved.renewalClosed.requestId, REQUEST_ID);
+    assert.equal(saved.credential, "expired-base");
+    assert.deepEqual(room.calls, ["request"]);
+  });
+  await t.test("the runtime ends cleanly, says a new owner Renew is needed, and does not retry", async () => {
+    const stateFile = await berlinJournal("renew07b");
+    const room = {ack: 3222, state: "expired", confirmed: true};
+    const runtime = await runtimeAt(stateFile, renewalClient(room));
+    assert.equal(await runtime.renewAccess(), false);
+    assert.ok(warnings(runtime).some((item) => /new owner Renew is needed/.test(item.line)));
+    for (let i = 0; i < 3; i += 1) {
+      runtime.lastRenewalCheck = 0;
+      assert.equal(await runtime.renewAccess(), false);
+    }
+    assert.deepEqual(room.calls, ["request", "discover", "discover", "discover"]);
+  });
+});
+
+// ROOT-CAUSE RULE (r1): every site where a Room acknowledgement meets a local
+// cursor. Local 3220, evidence 3221 (ignored), Room 3222: the same adoption
+// everywhere; Room 3219: the same conflict code everywhere, nothing changes.
+async function scanOnce(runtime) {
+  const controller = new AbortController();
+  runtime.connectorSession = {sessionId: "s"};
+  runtime.renewAccess = async () => false;
+  runtime.maintainPresence = async () => {};
+  runtime.client.readEvents = async () => {
+    controller.abort(new Error("end of test pass"));
+    throw controller.signal.reason;
+  };
+  await assert.rejects(runtime.assignedTurns(controller.signal).next(), /end of test pass/);
+}
+
+const SITES = {
+  live_ack: async (ack) => {
+    const runtime = await runtimeFor(berlinState(), fakeRoom(() => ({acknowledgedSeq: ack})), "m-live");
+    await runtime.ackEvent({id: "ev3221", seq: 3221});
+    return runtime;
+  },
+  reconnect: async (ack) => {
+    const runtime = await runtimeFor(berlinState(), fakeRoom(() => ({acknowledgedSeq: ack})), "m-reconnect");
+    await scanOnce(runtime);
+    return runtime;
+  },
+  renewal_preflight: async (ack) => {
+    const stateFile = await account(berlinExpired(), "m-preflight");
+    const room = {ack, delivered: 3222, loseRequest: true};
+    const runtime = await runtimeAt(stateFile, renewalClient(room));
+    try {
+      await renewCredential({state: runtime.state, stateFile, client: runtime.client, logger: runtime.logger});
+    } catch (error) {
+      if (!/lost reply/.test(error.message)) throw error;
+    }
+    assert.equal(room.calls.at(-1), "request");
+    return runtime;
+  },
+  renewal_active_state: async (ack) => {
+    const stateFile = await berlinJournal("m-active");
+    const {runtime} = await renew(stateFile, {ack: 3220, delivered: 3221, ackAfterConfirm: ack, deliveredAfterConfirm: 3222});
+    return runtime;
+  },
+  stuck_scan: async (ack) => {
+    const runtime = await runtimeFor(berlinState(), fakeRoom(() => ({acknowledgedSeq: ack})), "m-stuck");
+    await runtime.applyStuckEvents();
+    return runtime;
+  },
+  restart_load: async (ack) => {
+    const stateFile = await account(berlinState(), "m-restart");
+    const runtime = await runtimeAt(stateFile, fakeRoom(() => ({acknowledgedSeq: ack})));
+    await runtime.ackEvent({id: "ev3221", seq: 3221});
+    return runtimeAt(stateFile, runtime.client);
+  },
+};
+
+test("P2c-3i site matrix: every site adopts a Room ahead the same way", async (t) => {
+  for (const [site, run] of Object.entries(SITES)) {
+    await t.test(site, async () => {
+      const runtime = await run(3222);
+      const saved = await loadState(runtime.account.stateFile);
+      for (const state of [runtime.state, saved]) {
+        assert.equal(state.cursor, 3222, site);
+        assert.equal(state.terminalEvidence["3222"].reason, "room_ack_ahead", site);
+        assert.deepEqual(state.terminalEvidence["3221"], ignored(3221), site);
+      }
+    });
+  }
+});
+
+test("P2c-3i site matrix: every site reports a Room behind as the one conflict", async (t) => {
+  for (const [site, run] of Object.entries(SITES)) {
+    await t.test(site, async () => {
+      let code = "";
+      let runtime;
+      try {
+        runtime = await run(3219);
+      } catch (error) {
+        code = error?.code ?? "";
+      }
+      if (runtime) code = runtime.logs.some((item) => /ack_frontier_mismatch/.test(item.line)) ? "ack_frontier_mismatch" : code;
+      assert.equal(code, "ack_frontier_mismatch", site);
+    });
+  }
 });
