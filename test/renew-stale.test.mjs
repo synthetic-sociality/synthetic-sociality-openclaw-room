@@ -37,7 +37,7 @@ async function fixture(roomId, phase) {
   return {state, stateFile, journal, runtime, logs, statuses, expected};
 }
 
-test("RENEW-STALE-01", async () => {
+test("RENEW-STALE-01 grant_expired", async () => {
   for (const [roomId, phase] of [["Networks","requested"],["Kabeltracker","prepared"]]) {
     const {state, stateFile, runtime, logs, statuses} = await fixture(roomId, phase);
     runtime.fetchImpl = async url => {
@@ -62,7 +62,7 @@ test("RENEW-STALE-01", async () => {
   }
 });
 
-test("RENEW-STALE-02", async () => {
+test("RENEW-STALE-02 fresh_intent", async () => {
   const {runtime, stateFile, state, expected} = await fixture("Networks","prepared");
   runtime.client = {redeemCredentialRenewal: async () => {throw expired();}};
   await runtime.renewAccess();
@@ -101,7 +101,7 @@ test("RENEW-STALE-02", async () => {
   assert.deepEqual(saved.terminalEvidence["3221"],state.terminalEvidence["3221"]);
 });
 
-test("RENEW-STALE-03", async () => {
+test("RENEW-STALE-03 rejected_or_not_found", async () => {
   for (const [status, code, message, reason] of [
     [404,"not_found","room or object not found","request_not_found"],
     [409,"idempotency_mismatch","credential renewal request was rejected","request_rejected"],
@@ -123,7 +123,7 @@ test("RENEW-STALE-03", async () => {
   }
 });
 
-test("RENEW-STALE-04", async () => {
+test("RENEW-STALE-04 retryable_failure", async () => {
   const {runtime, stateFile, journal, logs, statuses} = await fixture("Networks","prepared");
   const outage = error(503, "internal", "temporary outage", true);
   let attempts = 0;
@@ -133,4 +133,35 @@ test("RENEW-STALE-04", async () => {
   assert.equal(logs.length,1);
   assert.ok(statuses.some(status => status.errorCode === "renewal_retry"));
   assert.deepEqual((await loadState(stateFile)).credentialRotation,journal);
+});
+
+test("legacy missing delivery snapshot and a null discovery still resolve the saved request by ID", async () => {
+  const {runtime, stateFile, journal} = await fixture("Networks", "requested");
+  delete runtime.state.credentialRotation.expected.deliveredSeq;
+  await saveState(stateFile, runtime.state);
+  let probes = 0;
+  runtime.client = {
+    credentialRenewalIntent: async () => ({request: null}),
+    requestCredentialRenewal: async (_, body) => {
+      assert.equal(body.requestId, journal.requestId);
+      probes++;
+      throw expired();
+    }
+  };
+  assert.equal(await runtime.renewAccess(), false);
+  assert.equal(probes, 1);
+  assert.equal((await loadState(stateFile)).renewalClosed.reason, "grant_expired");
+});
+
+test("a lost confirm reply must never roll a swapped credential back to the base", async () => {
+  const {runtime, journal, stateFile} = await fixture("Networks", "prepared");
+  runtime.state.credentialRotation.phase = "swapped";
+  runtime.state.credential = journal.replacementCredential;
+  await saveState(stateFile, runtime.state);
+  runtime.client = {confirmCredentialRenewal: async () => {throw expired();}};
+  await assert.rejects(runtime.renewAccess(), RoomAPIError);
+  const saved = await loadState(stateFile);
+  assert.equal(saved.credential, journal.replacementCredential);
+  assert.equal(saved.credentialRotation.phase, "swapped");
+  assert.equal(saved.renewalClosed, undefined);
 });

@@ -130,6 +130,16 @@ export function roomContact(method, path) {
   return `${method} ${route}${new URLSearchParams(query).has("waitSeconds") ? " (long poll)" : ""}`;
 }
 
+// Room deliberately shares status/code across unrelated renewal refusals. Keep
+// only the recognized reason, never arbitrary response text or credential data.
+function terminalRenewalReason(status, body) {
+  if (body?.retryable !== undefined && body.retryable !== false) return "";
+  if (status === 401 && body?.code === "unauthorized" && body.message === "credential renewal grant expired") return "grant_expired";
+  if (status === 404 && body?.code === "not_found" && body.message === "room or object not found") return "request_not_found";
+  if (status === 409 && body?.code === "idempotency_mismatch" && body.message === "credential renewal request was rejected") return "request_rejected";
+  return "";
+}
+
 export class RoomAPIError extends Error {
   constructor(status, body, {retryAfter = 0} = {}) {
     const code = typeof body?.code === "string" && SAFE_API_CODES.has(body.code) ? body.code : "";
@@ -140,6 +150,7 @@ export class RoomAPIError extends Error {
     this.status = status;
     this.code = code;
     this.fieldPaths = fieldPaths;
+    this.renewalReason = terminalRenewalReason(status, body);
     this.retryable = status === 429 || status >= 500 || body?.retryable === true;
     // Contract P2c-3a: seconds from the response's Retry-After, at most 120.
     // P2c-3e: or the Room's retryAfterSeconds detail, when longer (a proxy may

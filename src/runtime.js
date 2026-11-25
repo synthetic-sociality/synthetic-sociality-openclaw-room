@@ -864,6 +864,7 @@ export class OpenClawRoomRuntime {
     this.pendingActivityFrame = null;
     this.bindingOperation = Promise.resolve();
     this.lastRenewalCheck = 0;
+    this.lastRenewalWarningAt = 0;
     // Claimed cycle attempts held alive while their model run is in flight.
     this.attemptLeases = new Map();
     this.parkedRetryDelay = 0;
@@ -1343,15 +1344,22 @@ export class OpenClawRoomRuntime {
       } catch (error) {
         if (error instanceof RenewalClosed) {
           // ACK-AHEAD-07: the journal is closed with its reason; nothing to retry.
-          this.logger?.warn?.(`Room ${this.state.roomId} renewal journal closed (${error.reason}); a new owner Renew is needed`);
+          this.lastRenewalCheck = 0; // discover a fresh owner request on the next scan
+          const hint = error.reason === "owner_request_expired" ? "; a new owner Renew is needed" : "";
+          this.logger?.warn?.(`Room ${this.state.roomId} renewal journal closed code=${error.code}${hint}`);
           this.reportStatus({errorCode: error.code});
           return false;
         }
         // Old servers may return 200 HTML for an unknown optional route.
         // Discovery alone must not terminate ordinary delivery. Once secrets
         // were journaled, however, no participation may race a partial swap.
-        if (this.state.credentialRotation) throw error;
-        this.logger?.warn?.(`Room renewal discovery unavailable${roomErrorDiagnostic(error)}`);
+        const errorCode = error.code === "credential_revoked" ? "credential_revoked" : "renewal_retry";
+        this.reportStatus({errorCode});
+        if (Date.now() - this.lastRenewalWarningAt >= RENEWAL_INTENT_CHECK_MS) {
+          this.lastRenewalWarningAt = Date.now();
+          this.logger?.warn?.(`Room renewal unavailable code=${errorCode}${roomErrorDiagnostic(error)}`);
+        }
+        if (this.state.credentialRotation || errorCode === "credential_revoked") throw error;
         return false;
       } finally {
         this.renewing = false;

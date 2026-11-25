@@ -1,5 +1,6 @@
 import {createHash, randomBytes} from "node:crypto";
 import {isDeepStrictEqual} from "node:util";
+import {RoomAPIError} from "./room-client.js";
 import {loadState, saveState} from "./state.js";
 import {intentSettled} from "./terminal-states.js";
 import {reconcileRoomAck, roomAckAheadMessage} from "./recovery.js";
@@ -167,42 +168,64 @@ export async function renewCredential({state, stateFile, account, client, signal
   };
   // ACK-AHEAD-07: an expired owner request closes the journal (base credential
   // unchanged), records the reason and is not retried.
-  const close = async (answer, reason) => {
-    if (answer?.requestId !== journal.requestId || answer?.roomId !== state.roomId
-      || (answer.membershipId !== undefined && answer.membershipId !== state.membershipId)
-      || journal.phase !== "requested" || state.credential !== journal.baseCredential) fail();
+  const close = async (reason) => {
+    if (!["requested", "prepared"].includes(journal.phase) || state.credential !== journal.baseCredential) fail();
     const closed = {...state, renewalClosed: {reason, requestId: journal.requestId, closedAt: new Date().toISOString()}};
     delete closed.credentialRotation;
     await persist(closed);
     throw new RenewalClosed(reason);
   };
+  const closeExpiredAnswer = async (answer) => {
+    if (answer.requestId !== journal.requestId || answer.roomId !== state.roomId
+      || (answer.membershipId !== undefined && answer.membershipId !== state.membershipId)) fail();
+    await close("owner_request_expired");
+  };
+  // Only request and redeem own an unactivated journal. A matching refusal on
+  // verify, confirm, ordinary registration or /state cannot undo a replacement.
+  const beforeActivation = async (request) => {
+    try {
+      return await request;
+    } catch (error) {
+      if (error instanceof RoomAPIError && error.renewalReason) await close(error.renewalReason);
+      throw error;
+    }
+  };
   if (journal.phase === "requested") {
     if (!seq(journal.expected.deliveredSeq)) {
-      // Resume an older private preparation through renewal-only authority.
-      // An expired base must never be granted or require ordinary /state.
-      const current = (await client.credentialRenewalIntent(base, signal))?.request;
-      if (current?.state === "expired") await close(current, "owner_request_expired");
-      identity(current, journal.expected);
-      if (current.requestId !== journal.requestId || current.baseCredentialGeneration !== journal.baseCredentialGeneration) fail();
-      await reconcile(current, "renewal preflight");
-      await update({expected: {...journal.expected, deliveredSeq: current.deliveredSeq, acknowledgedSeq: state.cursor}});
+      // A legacy journal lacks a delivery snapshot. Discovery only shows the
+      // current owner request. If absent or newer, query our exact request
+      // below before deciding that our journal is terminal.
+      const discovery = await client.credentialRenewalIntent(base, signal);
+      if (!discovery || !Object.hasOwn(discovery, "request")) fail();
+      const current = discovery.request;
+      if (current !== null && current?.requestId === journal.requestId) {
+        if (current.state === "expired") await closeExpiredAnswer(current);
+        identity(current, journal.expected);
+        if (current.baseCredentialGeneration !== journal.baseCredentialGeneration) fail();
+        await reconcile(current, "renewal preflight");
+        await update({expected: {...journal.expected, deliveredSeq: current.deliveredSeq, acknowledgedSeq: state.cursor}});
+      }
     }
-    const requested = await client.requestCredentialRenewal(base, {
+    const requested = await beforeActivation(client.requestCredentialRenewal(base, {
       requestId: journal.requestId,
       grantSecretHash: createHash("sha256").update(journal.grantSecret).digest("hex"),
       clientInstanceId: state.clientInstanceId,
-    }, signal);
-    if (requested?.state === "expired") await close(requested, "owner_request_expired");
-    await reconcile(requested, "renewal request");
-    delivery(requested, journal.expected);
+    }, signal));
+    if (requested?.state === "expired") await closeExpiredAnswer(requested);
+    identity(requested, journal.expected);
     if (requested.requestId !== journal.requestId || requested.baseCredentialGeneration !== journal.baseCredentialGeneration
       || !["issued", "redeemed"].includes(requested.state) || !requested.grantId) fail();
+    await reconcile(requested, "renewal request");
+    if (!seq(journal.expected.deliveredSeq)) {
+      await update({expected: {...journal.expected, deliveredSeq: requested.deliveredSeq, acknowledgedSeq: state.cursor}});
+    }
+    delivery(requested, journal.expected);
     await update({phase: "prepared", grantId: requested.grantId});
   }
   if (journal.phase === "prepared") {
-    const redeemed = await client.redeemCredentialRenewal(base, journal.grantId, {
+    const redeemed = await beforeActivation(client.redeemCredentialRenewal(base, journal.grantId, {
       grantSecret: journal.grantSecret, replacementCredential: journal.replacementCredential,
-    }, signal);
+    }, signal));
     await reconcile(redeemed, "renewal redeem");
     delivery(redeemed, journal.expected);
     if (redeemed.grantId !== journal.grantId) fail();
