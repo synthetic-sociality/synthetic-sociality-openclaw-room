@@ -18,6 +18,7 @@ import {isDeepStrictEqual} from "node:util";
 import {loadState} from "./state.js";
 import {RoomAPIError, RoomResponseError} from "./room-client.js";
 import {resolveOpenClawBinary} from "./activation.js";
+import {intentSettled} from "./terminal-states.js";
 
 export const CONTROL_CAPABILITY = "connector.control.v1";
 // OpenClaw 2026.7.1-2: `openclaw gateway restart --safe` asks the running
@@ -39,8 +40,6 @@ const INSTALLATION_ID = /^openclaw-inst-[0-9a-f]{32}$/;
 const COMMAND_ID = /^[A-Za-z0-9_-]{1,128}$/;
 const ACTIONS = new Set(["reconnect", "restart"]);
 const OFFERED_STATES = new Set(["requested", "claimed", "reconnecting", "restarting"]);
-// A delivery intent that is no longer work: terminal, or plainly quarantined.
-const SETTLED_INTENTS = new Set(["posted", "superseded", "skipped", "quarantined"]);
 
 const DEFAULTS = Object.freeze({
   accounts: null,
@@ -132,7 +131,9 @@ export function installationIdFor(directory) {
 }
 
 export function deliveryIntentUnfinished(intent) {
-  return !SETTLED_INTENTS.has(intent?.status) || ["pending", "blocked"].includes(intent?.lifecycleState);
+  // A delivery intent that is no longer work: terminal, or plainly quarantined
+  // (contract P2c-3h: the shared settled set).
+  return !intentSettled(intent);
 }
 
 // P17-4: the stored inventory of one binding. Ids, codes, counts and seqs

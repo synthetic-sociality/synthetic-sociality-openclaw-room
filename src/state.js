@@ -8,13 +8,13 @@ import {homedir} from "node:os";
 import {validateRenewalJournal} from "./credential-renewal.js";
 import {rememberSecrets} from "./secret-isolation.js";
 import {pruneTerminalIntents} from "./recovery.js";
+import {LEDGER_STATUSES, STUCK_TRIGGERS, isTerminalEvidenceStatus, parseStuckReason} from "./terminal-states.js";
 import {validGivenMemory} from "./documents.js";
 
 // Contract P3-1: the state revision that carries the receive ledger. The file
 // format `version` stays 1, so OpenClaw Room 0.2.60 still loads a migrated
 // file (it accepts unknown top-level fields and ignores them).
 export const STATE_REVISION = 2;
-const LEDGER_STATUSES = new Set(["received", "quarantined", "posted", "skipped", "failed", "cancelled", "superseded", "ignored"]);
 
 // Contract P3-1: upgrade an account state once, in place. The original bytes
 // are kept first as <file>.pre-0.2.61-<UTC>.bak (0600; not *.json, so account
@@ -219,7 +219,7 @@ export function validateState(value) {
   if (value.receiveLedger !== undefined && (
     !value.receiveLedger || typeof value.receiveLedger !== "object" || Array.isArray(value.receiveLedger)
     || Object.entries(value.receiveLedger).some(([seq, entry]) => !/^[1-9]\d*$/.test(seq) || !entry || typeof entry !== "object"
-      || typeof entry.eventId !== "string" || !entry.eventId || entry.eventId.length > 128 || !LEDGER_STATUSES.has(entry.status))
+      || typeof entry.eventId !== "string" || !entry.eventId || entry.eventId.length > 128 || !LEDGER_STATUSES.includes(entry.status))
   )) throw new Error("Room receive ledger is invalid");
   if (value.appliedRecoveryClosures !== undefined && (
     !value.appliedRecoveryClosures || typeof value.appliedRecoveryClosures !== "object" || Array.isArray(value.appliedRecoveryClosures)
@@ -249,13 +249,32 @@ export function validateState(value) {
     if (!Number.isSafeInteger(seq) || seq < 1 || !evidence || evidence.sourceSeq !== seq || !String(evidence.sourceEventId ?? "")) {
       throw new Error("Room terminal evidence entry is invalid");
     }
-    if (!["posted", "skipped", "failed", "cancelled", "superseded", "ignored"].includes(evidence.status)) {
+    if (!isTerminalEvidenceStatus(evidence.status)) {
       throw new Error("Room terminal evidence status is invalid");
     }
     if (evidence.status === "posted" ? !String(evidence.canonicalEventId ?? "") : !String(evidence.reason ?? "")) {
       throw new Error("Room terminal evidence proof is invalid");
     }
+    // Contract P2c-3h: the closed stuck reason grammar.
+    if (evidence.status === "stuck" && !parseStuckReason(evidence.reason)) {
+      throw new Error("Room terminal evidence proof is invalid");
+    }
   }
+  // Contract P2c-3h: the stuck events of this binding, for the local status.
+  if (value.stuckEvents !== undefined && !validStuckEvents(value.stuckEvents)) throw new Error("Room stuck events are invalid");
+}
+
+export const STUCK_RECENT_LIMIT = 32;
+
+function validStuckEvents(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  if (!Number.isSafeInteger(value.count) || value.count < 0 || !Number.isSafeInteger(value.lastSeq) || value.lastSeq < 0) return false;
+  const counts = value.counts ?? {};
+  if (!counts || typeof counts !== "object" || Array.isArray(counts)
+    || Object.entries(counts).some(([trigger, count]) => !STUCK_TRIGGERS.includes(trigger) || !Number.isSafeInteger(count) || count < 0)) return false;
+  return Array.isArray(value.recent) && value.recent.length <= STUCK_RECENT_LIMIT && value.recent.every((item) => item
+    && Number.isSafeInteger(item.seq) && item.seq > 0 && typeof item.eventId === "string" && item.eventId && item.eventId.length <= 128
+    && parseStuckReason(item.reason) && validCanonicalTimestamp(item.stuckAt));
 }
 
 function validCanonicalTimestamp(value) {
@@ -416,6 +435,10 @@ function validateDeliveryIntent(key, intent, state) {
   )) throw new Error("posted Room delivery intent requires a complete canonical receipt");
   if (intent.lifecycleState !== undefined && !["not_started", "pending", "complete", "not_required", "blocked"].includes(intent.lifecycleState)) {
     throw new Error("Room lifecycle state is invalid");
+  }
+  // Contract P2c-3h: when the intent was quarantined (the age clock).
+  if (intent.quarantinedAt !== undefined && !validCanonicalTimestamp(intent.quarantinedAt)) {
+    throw new Error("Room delivery quarantine time is invalid");
   }
   if (intent.lifecycleAttempts !== undefined && (!Number.isSafeInteger(intent.lifecycleAttempts) || intent.lifecycleAttempts < 0 || intent.lifecycleAttempts > 3)) {
     throw new Error("Room lifecycle attempt count is invalid");

@@ -241,7 +241,7 @@ export class LocalStatus {
   // Update one membership's entry and its Room summary; write only when
   // something changed.
   room(roomId, membershipId = "", {connection, errorCode, connected = false, registered = false, inactive,
-    gateWaitSeconds, gateWaitReason, ledger} = {}) {
+    gateWaitSeconds, gateWaitReason, ledger, stuck} = {}) {
     if (!roomId) return;
     const roomKey = String(roomId);
     if (membershipId && this.retired.has(JSON.stringify([roomKey, String(membershipId)]))) return;
@@ -316,6 +316,19 @@ export class LocalStatus {
       entry.holeSeqs = (ledger.holeSeqs ?? []).map(Number).slice(0, 32);
       entry.quarantinedSeqs = (ledger.quarantinedSeqs ?? []).map(Number).slice(0, 32);
       entry.ledgerCode = code(ledger.ledgerCode ?? "");
+    }
+    if (stuck) {
+      // Contract P2c-3h: stuck seqs with reasons and counts, and the execution
+      // failure events_stuck; seqs, codes and counts only.
+      entry.stuckSeqs = (stuck.stuckSeqs ?? []).map(Number).slice(-32);
+      entry.stuckReasons = Object.fromEntries(Object.entries(stuck.stuckReasons ?? {}).slice(-32)
+        .map(([seq, reason]) => [String(Number(seq)), /^stuck:[a-z_]+:[A-Za-z0-9_.-]{1,64}$/.test(String(reason)) ? String(reason) : "unknown_error"]));
+      entry.stuckCount = Number(stuck.stuckCount) || 0;
+      entry.stuckCounts = Object.fromEntries(Object.entries(stuck.stuckCounts ?? {}).map(([trigger, count]) => [code(trigger), Number(count) || 0]));
+      entry.lastStuckSeq = Number(stuck.lastStuckSeq) || 0;
+      entry.executionFailure = stuck.executionFailure
+        ? {layer: "runtime", code: "events_stuck", count: Number(stuck.executionFailure.count) || 0, lastSeq: Number(stuck.executionFailure.lastSeq) || 0}
+        : null;
     }
     if (gateWaitSeconds !== undefined) {
       entry.lastGateWaitSeconds = Math.round(Math.max(0, Number(gateWaitSeconds) || 0) * 10) / 10;

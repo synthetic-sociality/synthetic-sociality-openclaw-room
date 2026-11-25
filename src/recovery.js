@@ -12,6 +12,10 @@
 // is applied (contract P3-4) and on the store fence that keeps agents out.
 import {createHash} from "node:crypto";
 import {closeSync, fchmodSync, fsyncSync, openSync, readFileSync, statSync, writeSync, constants as fs} from "node:fs";
+import {isQuarantinedIntent, isTerminalIntent} from "./terminal-states.js";
+
+// Contract P2c-3h: one terminal-state set per connector (terminal-states.js).
+export {isQuarantinedIntent, isTerminalIntent};
 
 export const REASONS = Object.freeze(["cycle_terminal", "cycle_superseded", "epoch_closed"]);
 export const TERMINAL_CYCLE_STATES = new Set(["completed", "interrupted", "timed_out", "failed"]);
@@ -56,11 +60,6 @@ function ledgerKeys(state) {
   return keys;
 }
 
-export function isQuarantinedIntent(intent) {
-  return intent?.status === "quarantined"
-    && (intent.deliveryState === "quarantined" || (intent.version === 1 && intent.deliveryState === undefined));
-}
-
 // Holes and quarantines above the acknowledgement (contract P3-3).
 export function ledgerReport(state) {
   const ack = Number(state.cursor) || 0;
@@ -73,14 +72,6 @@ export function ledgerReport(state) {
     .map(([seq]) => Number(seq)).sort((a, b) => a - b).slice(0, REPORT_LIMIT);
   const code = holes.length ? "ack_hole" : (quarantined.length && quarantined[0] === ack + 1 ? "quarantine_held" : "");
   return {acknowledgedSeq: ack, deliveredSeq: delivered, holeSeqs: holes, quarantinedSeqs: quarantined, ledgerCode: code};
-}
-
-// Posted with its lifecycle done, superseded or skipped (contract P3-2).
-export function isTerminalIntent(intent) {
-  if (!intent || typeof intent !== "object" || isQuarantinedIntent(intent)) return false;
-  if (intent.deliveryState === "posted" && ["complete", "not_required"].includes(intent.lifecycleState)
-    && ["posted", undefined].includes(intent.status)) return true;
-  return ["superseded", "skipped"].includes(intent.deliveryState) && [intent.deliveryState, undefined].includes(intent.status);
 }
 
 // Drop terminal intents beyond the newest `keep` (insertion order).
@@ -127,10 +118,10 @@ export function priorState(state, seq) {
 
 // --- server proof (read-only, the member's own credential) ------------------
 
-// `room` answers listEpochs(), epochEvents(after, epochId), roomState() and
-// getDiscussionCycle(cycleId) for this member.
-export async function serverProof(room, membershipId, seq, reason, evidenceRef) {
-  if (!REASONS.includes(reason)) throw new RecoveryRefused("unknown_reason", `reason must be one of ${REASONS.join(", ")}`);
+// The Room's facts about the event at `seq`: its epoch, the event itself and
+// the active epoch. `room` answers listEpochs(), epochEvents(after, epochId),
+// roomState() and getDiscussionCycle(cycleId) for this member.
+async function readProof(room, seq) {
   const listing = await room.listEpochs();
   const epochs = (Array.isArray(listing) ? listing : listing?.epochs ?? [])
     .filter((item) => item && Number.isSafeInteger(item.startsAtSeq)).sort((a, b) => a.startsAtSeq - b.startsAtSeq);
@@ -151,33 +142,80 @@ export async function serverProof(room, membershipId, seq, reason, evidenceRef) 
     deliveredSeq: Number(page?.deliveredSeq) || 0, fetchedAt: now(),
   };
   const facts = {eventId: String(event.id ?? ""), eventType: String(event.type ?? ""), eventEpochId: epochId};
-  if (reason === "epoch_closed") {
-    if (evidenceRef !== `epoch:${epochId}`) throw new RecoveryRefused("evidence_mismatch", `evidence must be epoch:${epochId}`);
-    if (!epochId || epochId === activeEpochId || proof.eventEpochStatus === "active") {
-      throw new RecoveryRefused("not_proven", `epoch ${epochId || "?"} is still active`);
-    }
-    return {...facts, proof};
+  return {facts, proof, payload, eventTs: String(event.ts ?? "")};
+}
+
+const epochClosed = ({facts, proof}) => Boolean(facts.eventEpochId) && facts.eventEpochId !== proof.activeEpochId
+  && proof.eventEpochStatus !== "active";
+
+// The cycle the event names, read into the proof; "" when it names none or is
+// another member's attempt. With an evidence reference (a closure) those, and
+// a reference to another cycle, are refusals instead.
+async function readCycle(room, membershipId, seq, read, evidenceRef = null) {
+  const refuse = evidenceRef !== null;
+  const cycleId = String(read.payload.cycleId ?? "");
+  if (!cycleId) {
+    if (refuse) throw new RecoveryRefused("not_proven", `seq ${seq} (${read.facts.eventType}) names no cycle`);
+    return "";
   }
-  const cycleId = String(payload.cycleId ?? "");
-  if (!cycleId) throw new RecoveryRefused("not_proven", `seq ${seq} (${facts.eventType}) names no cycle`);
-  if (evidenceRef !== `cycle:${cycleId}`) throw new RecoveryRefused("evidence_mismatch", `evidence must be cycle:${cycleId}`);
-  const target = String(payload.membershipId ?? "");
-  if (facts.eventType === "discussion.cycle_attempt_ready" && target && target !== membershipId) {
-    throw new RecoveryRefused("not_for_member", `seq ${seq} is another member's attempt`);
+  if (refuse && evidenceRef !== `cycle:${cycleId}`) throw new RecoveryRefused("evidence_mismatch", `evidence must be cycle:${cycleId}`);
+  const target = String(read.payload.membershipId ?? "");
+  if (read.facts.eventType === "discussion.cycle_attempt_ready" && target && target !== membershipId) {
+    if (refuse) throw new RecoveryRefused("not_for_member", `seq ${seq} is another member's attempt`);
+    return "";
   }
   let cycle = await room.getDiscussionCycle(cycleId) ?? {};
   if (cycle.cycle && typeof cycle.cycle === "object") cycle = cycle.cycle;
-  Object.assign(proof, {
+  Object.assign(read.proof, {
     cycleId, cycleState: String(cycle.state ?? ""),
-    cycleGeneration: Number(cycle.generation) || 0, eventGeneration: Number(payload.generation) || 0,
+    cycleGeneration: Number(cycle.generation) || 0, eventGeneration: Number(read.payload.generation) || 0,
   });
-  if (reason === "cycle_terminal" && !TERMINAL_CYCLE_STATES.has(proof.cycleState)) {
+  return cycleId;
+}
+
+const cycleTerminal = ({proof}) => TERMINAL_CYCLE_STATES.has(proof.cycleState);
+const cycleSuperseded = ({proof}) => Boolean(proof.eventGeneration && proof.cycleGeneration > proof.eventGeneration);
+
+export async function serverProof(room, membershipId, seq, reason, evidenceRef) {
+  if (!REASONS.includes(reason)) throw new RecoveryRefused("unknown_reason", `reason must be one of ${REASONS.join(", ")}`);
+  const read = await readProof(room, seq);
+  const {facts, proof} = read;
+  const epochId = facts.eventEpochId;
+  if (reason === "epoch_closed") {
+    if (evidenceRef !== `epoch:${epochId}`) throw new RecoveryRefused("evidence_mismatch", `evidence must be epoch:${epochId}`);
+    if (!epochClosed(read)) throw new RecoveryRefused("not_proven", `epoch ${epochId || "?"} is still active`);
+    return {...facts, proof};
+  }
+  const cycleId = await readCycle(room, membershipId, seq, read, evidenceRef);
+  if (reason === "cycle_terminal" && !cycleTerminal(read)) {
     throw new RecoveryRefused("not_proven", `cycle ${cycleId} is ${proof.cycleState || "unknown"}, not terminal`);
   }
-  if (reason === "cycle_superseded" && !(proof.eventGeneration && proof.cycleGeneration > proof.eventGeneration)) {
+  if (reason === "cycle_superseded" && !cycleSuperseded(read)) {
     throw new RecoveryRefused("not_proven", `cycle ${cycleId} has no newer generation than the event`);
   }
   return {...facts, proof};
+}
+
+// Contract P2c-3h: what the Room proves about the event at `seq`, with the
+// reads and the proof shape of a closure (P3-4): the trigger epoch_closed (or
+// hole_epoch_closed for a hole, which only an epoch-closed proof frees),
+// cycle_terminal or cycle_superseded, else "". Also the Room's event time.
+// Null when the Room has no such event.
+export async function stuckProof(room, membershipId, seq, {hole = false} = {}) {
+  let read;
+  try {
+    read = await readProof(room, seq);
+  } catch (error) {
+    if (error instanceof RecoveryRefused) return null;
+    throw error;
+  }
+  const result = (trigger, evidenceRef = "") => ({...read.facts, trigger, evidenceRef, proof: read.proof, eventTs: read.eventTs});
+  if (epochClosed(read)) return result(hole ? "hole_epoch_closed" : "epoch_closed", `epoch:${read.facts.eventEpochId}`);
+  if (hole) return result("");
+  const cycleId = await readCycle(room, membershipId, seq, read);
+  if (cycleId && cycleTerminal(read)) return result("cycle_terminal", `cycle:${cycleId}`);
+  if (cycleId && cycleSuperseded(read)) return result("cycle_superseded", `cycle:${cycleId}`);
+  return result("");
 }
 
 // A Room adapter over the connector's RoomClient for one account state.

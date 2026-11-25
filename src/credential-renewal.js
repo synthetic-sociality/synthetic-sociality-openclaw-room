@@ -1,6 +1,7 @@
 import {createHash, randomBytes} from "node:crypto";
 import {isDeepStrictEqual} from "node:util";
 import {loadState, saveState} from "./state.js";
+import {intentSettled} from "./terminal-states.js";
 
 const secret = () => randomBytes(32).toString("base64url");
 const phases = ["requested", "prepared", "redeemed", "swapped", "confirmed"];
@@ -11,9 +12,9 @@ const seq = (n) => Number.isSafeInteger(n) && n >= 0;
 export function renewalBlocked(state, account = {}) {
   return account.enabled === false || state.enabled === false || state.revoked === true
     // Quarantine, skipped replies and completed evidence behind an acknowledgement
-    // gap are inert journals, not active writers. Preserve them across the exchange.
-    || Object.values(state.deliveryIntents ?? {}).some((intent) => !["posted", "superseded", "quarantined", "skipped"].includes(intent.status)
-      || ["pending", "blocked"].includes(intent.lifecycleState));
+    // gap are inert journals, not active writers. Preserve them across the exchange
+    // (contract P2c-3h: the shared settled set).
+    || Object.values(state.deliveryIntents ?? {}).some((intent) => !intentSettled(intent));
 }
 
 function identity(value, expected) {

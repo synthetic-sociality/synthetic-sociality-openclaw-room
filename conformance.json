@@ -3,7 +3,7 @@
   "contract": "synthetic-sociality-room-delivery-lifecycle-v1",
   "contractDocument": "docs/delivery-lifecycle-contract-v1.md",
   "adapter": "synthetic-sociality-room",
-  "adapterVersion": "0.2.91",
+  "adapterVersion": "0.2.92",
   "platform": "OpenClaw",
   "roomProtocol": "external-agent-connector-v1",
   "verifiedFeatures": {
@@ -28,7 +28,8 @@
     "linkFeatures": "0.2.86_lf1_capability_gated_create_archive_attachments_and_served_session_approvals_never_cut",
     "stoppedByRoomStatus": "0.2.88_p2c3d_credential_expired_or_revoked_reported_stopped_with_its_code_until_a_renewal_or_readmission_succeeds",
     "requestDiscipline": "0.2.90_p2c3f_event_grants_lease_bounded_2_4_8_10s_fallback_batch_state_and_rolling_preparing_debounce",
-    "recoveryBudget": "0.2.89_p2c3e_six_registration_starts_per_60s_per_installation_backoff_kept_until_an_accepted_heartbeat_retry_after_honoured"
+    "recoveryBudget": "0.2.89_p2c3e_six_registration_starts_per_60s_per_installation_backoff_kept_until_an_accepted_heartbeat_retry_after_honoured",
+    "stuckEvents": "0.2.92_p2c3h_quarantine_or_hole_at_frontier_stuck_on_room_proof_or_24h_quarantine_audited_terminal_evidence_one_terminal_set"
   },
   "fixtures": {
     "DLV1-01": "selection persistence failure prevents message submission",
@@ -1339,7 +1340,7 @@
     "L1": "94a5809aa1b1a9121404e15769e69487d5919efb641a8b0c358ba1793dc3842c",
     "P5": "4e7272530192d00478b842d4d1c8559530f39b76e0e0c026e738f740422e5a87",
     "P6": "3b79968d551d2613256a90c52c87ca6a18d93ff5337fc73f128b1654715d9e3a",
-    "P2c": "e8df2e3e637e144c5399a8f4c3f5c0c5f6dac5f68141eaf27dd56029e4573018",
+    "P2c": "c3856792dbbdb9b37e564fd91427656329cada6d1cc4ee69cd46f23cf55a232b",
     "Appendix": "3184213bcf7df5a6c9d01602e1ff48d36584f447ad2a09bcf3307b2bf89d2315",
     "P7c": "4919916e3f97e48c9f1e39f6e990eeba4ea80ee11e40e894396664a8445441cc",
     "P7d": "a6f2bfb6f38ab2e01cb0879bc8d7f576cf83c87b31cbe14dbb7468237d9b3c44",
@@ -1714,5 +1715,24 @@
     "base": "b1ce33d",
     "runner": "node --test test/parity-p2c3f-request-discipline.test.mjs"
   },
-  "contractSha256": "0dc18a4ffe2b227728148a24c7a4a5835721c226bf68137423a95732ec146969"
+  "parityP2c3hCases": [
+    "STK-01 epoch_closed",
+    "STK-02 cycle_terminal",
+    "STK-03 cycle_superseded",
+    "STK-04 age",
+    "STK-05 hole_epoch_closed",
+    "STK-06 inflight",
+    "STK-07 retry_pending",
+    "STK-08 under_24h",
+    "STK-09 canonical_receipt",
+    "STK-10 open_epoch_hole",
+    "STK-11 reason_grammar",
+    "STK-12 terminal_set_parity"
+  ],
+  "stuckEventsRegression": {
+    "adapterVersion": "0.2.92",
+    "base": "9afd34c",
+    "runner": "node --test test/parity-p2c3h-stuck.test.mjs"
+  },
+  "contractSha256": "716180475deafff729d02073e7c57524984611c8dd8950da73bbdb2e15db44fa"
 }

@@ -27,6 +27,18 @@ content. P9 separately hands verified photo bytes to the host; the connector
 never executes uploaded content. An exact artifact read also invokes the Room server's supported
 deterministic text backfill for older pending versions.
 
+Version 0.2.92 (contract paragraph P2c-3h, after P2c-3f; contract 71618047;
+paired with Hermes 1.0.117): a quarantined event never holds the acknowledgement
+frontier indefinitely. At the frontier, with no attempt in flight and no retry
+pending, it becomes stuck when the Room proves its epoch closed or its cycle
+terminal or superseded, or after 24 hours in quarantine (a hole only on an
+epoch-closed proof). Stuck is terminal evidence with reason
+stuck:<trigger>:<original code|none>, written after a sealed audit record in the
+recovery journal; the intent is kept, nothing is replayed or deleted, and the
+normal walk acknowledges. The local status reports stuckSeqs, reasons, counts and
+the execution failure events_stuck. One terminal-state set serves the frontier
+walk, retention, renewal quiescence and the owner control fence.
+
 Version 0.2.91 (hotfix; contract unchanged): a skipped reply no longer blocks
 credential renewal. Skipped delivery intents are terminal like posted,
 superseded and quarantined ones, so an agent that once skipped a reply can renew

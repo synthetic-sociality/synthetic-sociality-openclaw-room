@@ -7,7 +7,7 @@ import {open as openFile, readdir, readFile} from "node:fs/promises";
 import {constants as fsConstants} from "node:fs";
 import {dirname, join, resolve} from "node:path";
 import {RETRY_AFTER_MAXIMUM_SECONDS, RoomAPIError, RoomClient, RoomRequestError, RoomResponseError, RoomTransportError, roomErrorDiagnostic} from "./room-client.js";
-import {loadState, migrateStateFile, saveNewState, saveState} from "./state.js";
+import {STUCK_RECENT_LIMIT, loadState, migrateStateFile, saveNewState, saveState} from "./state.js";
 import {activateRoomChannel} from "./activation.js";
 import {ParticipationGate} from "./participation.js";
 import {abandonRevokedPendingWork, abandonableEntries, staleInertState} from "./readmission.js";
@@ -21,9 +21,10 @@ import {
 } from "./documents.js";
 import {readRotationRequest, removeRotationRequest} from "./epoch-rotation.js";
 import {
-  CLOSURE_EVIDENCE_PREFIX, RecoveryRefused, closuresFor, journalPath, ledgerReport, priorState,
-  pruneTerminalIntents, readRecordsCached, roomForState, serverProof,
+  CLOSURE_EVIDENCE_PREFIX, RecoveryRefused, appendRecord, canonical, closuresFor, journalPath, ledgerReport, priorState,
+  pruneTerminalIntents, readRecordsCached, roomForState, seal, serverProof, stuckProof,
 } from "./recovery.js";
+import {isQuarantinedIntent, isTerminalEvidenceStatus, isTerminalIntent, parseStuckReason, stuckReason} from "./terminal-states.js";
 
 export const OPEN_EXCHANGE_PREAMBLE_VERSION = "Open Exchange – Room Behaviour Preamble v1";
 // Delivery contract P1a: the connector holds no behavioural text. A Room may
@@ -525,9 +526,11 @@ function repairIntentBoundToState(deliveryKey, intent, state) {
   return deliveryKey === `${intent.identity.sourceEventId}:final` && intent.status === "selected";
 }
 
+// Contract P2c-3h: the frontier walk passes exactly the shared terminal set.
 function validTerminalEvidence(evidence) {
-  if (!evidence || !["posted", "skipped", "failed", "cancelled", "superseded", "ignored"].includes(evidence.status)) return false;
+  if (!evidence || !isTerminalEvidenceStatus(evidence.status)) return false;
   if (!Number.isSafeInteger(evidence.sourceSeq) || evidence.sourceSeq < 1 || !String(evidence.sourceEventId ?? "")) return false;
+  if (evidence.status === "stuck") return Boolean(parseStuckReason(evidence.reason));
   return evidence.status === "posted"
     ? Boolean(
       typeof evidence.canonicalEventId === "string" && evidence.canonicalEventId
@@ -536,6 +539,16 @@ function validTerminalEvidence(evidence) {
     )
     : Boolean(String(evidence.reason ?? ""));
 }
+
+// Contract P2c-3h: a quarantined event at the frontier is stuck after this
+// long with no retry pending; the Room is asked again for proof about the same
+// frontier seq at most this often (request discipline, P2c-3f).
+export const STUCK_AGE_MS = 24 * 3_600_000;
+export const STUCK_PROBE_INTERVAL_MS = 5 * 60_000;
+// At most this many frontier seqs become stuck in one scan.
+const STUCK_PASS_LIMIT = 32;
+const sha256Hex = (text) => createHash("sha256").update(text, "utf8").digest("hex");
+const isoSeconds = (ms) => new Date(ms).toISOString().replace(/\.\d{3}Z$/, "Z");
 
 function acceptedActivitySequence(receipt, expected) {
   if (!Number.isSafeInteger(receipt?.acceptedStreamSeq) || receipt.acceptedStreamSeq !== expected) {
@@ -1395,6 +1408,7 @@ export class OpenClawRoomRuntime {
       await this.controlFence(signal);
       await this.renewAccess(signal);
       await this.applyRecoveryClosures(signal);
+      await this.applyStuckEvents(signal);
       const page = await this.readEventsResilient(Math.max(scanCursor, this.state.cursor), signal);
       // P2c-3f: this lazy answer belongs only to this received page. Pass it
       // explicitly so concurrent posts and lease renewals always read fresh authority.
@@ -1618,8 +1632,7 @@ export class OpenClawRoomRuntime {
 
   isQuarantinedEvent(event) {
     return Object.values(this.state.deliveryIntents ?? {}).some((intent) =>
-      intent.status === "quarantined"
-      && (intent.deliveryState === "quarantined" || (intent.version === 1 && intent.deliveryState === undefined))
+      isQuarantinedIntent(intent)
       && intent.identity?.sourceEventId === event.id
       && intent.identity?.roomId === this.state.roomId
       // Supported v1 state may lack a binding snapshot or retain a stale one.
@@ -2843,8 +2856,184 @@ export class OpenClawRoomRuntime {
       this.loggedHoles.add(seq);
       this.logger?.warn?.(`Room ${this.state.roomId} ack_hole seq ${seq}: no ledger entry and no evidence above the acknowledgement ${report.acknowledgedSeq}; only an audited recovery close can close it`);
     }
-    this.reportStatus({ledger: report});
+    this.reportStatus({ledger: report, stuck: this.stuckSummary()});
     return report;
+  }
+
+  // Contract P2c-3h: stuckSeqs with reasons and counts, and the execution
+  // failure events_stuck (count, last stuck seq); null while none is stuck.
+  stuckSummary() {
+    const stuck = this.state?.stuckEvents;
+    if (!stuck?.count) return null;
+    return {
+      stuckSeqs: stuck.recent.map((item) => item.seq),
+      stuckReasons: Object.fromEntries(stuck.recent.map((item) => [String(item.seq), item.reason])),
+      stuckCount: stuck.count,
+      stuckCounts: {...stuck.counts},
+      lastStuckSeq: stuck.lastSeq,
+      executionFailure: this.stuckExecutionFailure(),
+    };
+  }
+
+  stuckExecutionFailure() {
+    const stuck = this.state?.stuckEvents;
+    return stuck?.count ? {layer: "runtime", code: "events_stuck", count: stuck.count, lastSeq: stuck.lastSeq} : null;
+  }
+
+  // Contract P2c-3h: a quarantined event (or a hole) at the frontier never
+  // holds it indefinitely. Each scan, the frontier seq becomes stuck when the
+  // Room proves its epoch closed or its cycle terminal or superseded, or (a
+  // quarantine only) it has been quarantined for 24 hours with no retry
+  // pending. Stuck is terminal evidence written through the normal evidence
+  // path, after a sealed audit record in the recovery journal; the intent is
+  // kept unchanged, nothing is replayed or deleted, and the normal contiguous
+  // walk acknowledges. A failure is logged once and retried next scan.
+  async applyStuckEvents(signal) {
+    if (!this.account?.stateFile || !this.state) return;
+    this.stuckProbes ??= new Map();
+    this.stuckNotices ??= new Set();
+    let freed = 0;
+    for (let pass = 0; pass < STUCK_PASS_LIMIT && !signal?.aborted && !this.closed; pass += 1) {
+      const seq = this.state.cursor + 1;
+      const candidate = this.stuckCandidate(seq);
+      if (!candidate) break;
+      try {
+        if (!(await this.freeStuck(seq, candidate, signal))) break;
+        freed += 1;
+      } catch (error) {
+        if (signal?.aborted) throw error;
+        this.stuckNotice(`${seq}:failed`, `Room stuck check for seq ${seq} not applied yet (retrying): ${error instanceof RecoveryRefused ? error.code : statusErrorCode(error)}`);
+        break;
+      }
+    }
+    for (const seq of this.stuckProbes.keys()) if (seq <= this.state.cursor) this.stuckProbes.delete(seq);
+    if (freed) this.reportLedger();
+  }
+
+  stuckNotice(key, line) {
+    if (this.stuckNotices.has(key)) return;
+    this.stuckNotices.add(key);
+    this.logger?.warn?.(line);
+  }
+
+  // The frontier seq when it is a stuck candidate: a quarantined event with no
+  // attempt in flight, no canonical receipt and no retry pending, or a hole
+  // (nothing local at the seq while something above it is known).
+  stuckCandidate(seq) {
+    const key = String(seq);
+    if (validTerminalEvidence(this.state.terminalEvidence?.[key])) return null;
+    if ([this.inflightEvent, this.pendingEvent].some((event) => event && Number(event.seq) === seq)) return null;
+    const entry = this.state.receiveLedger?.[key];
+    if (entry?.status === "quarantined") {
+      const eventId = entry.eventId;
+      if (!this.isQuarantinedEvent({id: eventId}) || this.attemptLeases.has(eventId)
+        || [this.inflightEvent, this.pendingEvent].some((event) => event?.id === eventId)) return null;
+      const sources = Object.entries(this.state.deliveryIntents ?? {}).filter(([, intent]) => intent?.identity?.sourceEventId === eventId);
+      // A delivery with a complete canonical receipt is never stuck.
+      if (sources.some(([, intent]) => validCanonicalMessage(intent.canonicalMessage))) return null;
+      // Retry pending: another unfinished delivery of this source.
+      if (sources.some(([, intent]) => !isQuarantinedIntent(intent) && !isTerminalIntent(intent))) return null;
+      if (this.stuckClosurePending(seq)) return null;
+      const [intentKey, intent] = sources.find(([candidateKey, item]) => candidateKey === `${eventId}:final` && isQuarantinedIntent(item))
+        ?? sources.find(([, item]) => isQuarantinedIntent(item));
+      return {kind: "quarantine", eventId, intentKey, intent, lastErrorCode: String(intent.deliveryErrorCode ?? "")};
+    }
+    if (entry) return null;
+    const known = [this.state.receiveLedger, this.state.terminalEvidence]
+      .flatMap((mapping) => Object.keys(mapping ?? {})).filter((item) => /^\d+$/.test(item)).map(Number);
+    const top = Math.max(Number(this.state.deliveredCursor) || 0, ...known, 0);
+    if (seq >= top || this.stuckClosurePending(seq)) return null;
+    return {kind: "hole", eventId: "", intentKey: "", intent: null, lastErrorCode: ""};
+  }
+
+  // Retry pending: a sealed recovery closure for the seq that the closure path
+  // (P3-4) has neither applied nor refused. An unreadable journal counts too.
+  stuckClosurePending(seq) {
+    let records;
+    try {
+      records = closuresFor(readRecordsCached(journalPath(this.account.stateFile)), this.state.roomId, this.state.membershipId, this.state.clientInstanceId);
+    } catch {
+      return true;
+    }
+    const record = records.get(seq);
+    return Boolean(record) && !this.refusedClosures?.has(`${seq}:${record.recordDigest}`);
+  }
+
+  async freeStuck(seq, candidate, signal) {
+    const now = Date.now();
+    const hole = candidate.kind === "hole";
+    let probe = this.stuckProbes.get(seq);
+    if (!probe || probe.eventId !== candidate.eventId || now - probe.at >= STUCK_PROBE_INTERVAL_MS) {
+      // Recorded first: a failed read is not repeated inside the interval.
+      probe = {at: now, eventId: candidate.eventId, answered: false, proven: null};
+      this.stuckProbes.set(seq, probe);
+      try {
+        probe.proven = await stuckProof(roomForState(this.client, this.state, signal), this.state.membershipId, seq, {hole});
+        probe.answered = true;
+      } catch (error) {
+        if (signal?.aborted) throw error;
+        this.stuckNotice(`${seq}:probe:${statusErrorCode(error)}`, `Room stuck proof for seq ${seq} not read yet: ${statusErrorCode(error)}`);
+      }
+    }
+    const proven = probe.proven;
+    // The wrong-seq guard: the Room's event at the frontier must be the quarantined source.
+    if (proven && !hole && proven.eventId !== candidate.eventId) {
+      this.stuckNotice(`${seq}:mismatch:${proven.eventId}`, `Room stuck check for seq ${seq} refused: evidence_mismatch (the Room's event differs from the quarantined source)`);
+      return false;
+    }
+    let trigger = proven?.trigger ?? "";
+    let quarantinedAt = "";
+    let ageSource = "";
+    if (!hole) {
+      if (validCanonicalTimestamp(candidate.intent.quarantinedAt)) {
+        [quarantinedAt, ageSource] = [candidate.intent.quarantinedAt, "intent"];
+      } else if (validCanonicalTimestamp(proven?.eventTs)) {
+        // A quarantine before 0.2.92 carries no stamp: it is no older than the Room's event.
+        [quarantinedAt, ageSource] = [proven.eventTs, "room_event"];
+      } else if (probe.answered) {
+        // Neither: the age clock starts now (migration; the only change to the intent).
+        candidate.intent.quarantinedAt = isoSeconds(now);
+        await this.persistState();
+        return false;
+      }
+      if (!trigger) {
+        if (!quarantinedAt || now - Date.parse(quarantinedAt) < STUCK_AGE_MS) return false;
+        trigger = "age";
+      }
+    } else if (trigger !== "hole_epoch_closed") {
+      return false;
+    }
+    const eventId = hole ? proven.eventId : candidate.eventId;
+    const reason = stuckReason(trigger, candidate.lastErrorCode);
+    const proof = proven ? {...proven.proof} : null;
+    const record = seal({
+      version: 1, verb: "stuck", connector: `openclaw/${String(this.releaseProvenance?.version ?? "")}`,
+      room: this.state.roomId, membership: this.state.membershipId, clientInstanceId: this.state.clientInstanceId,
+      seq, eventId, eventType: proven?.eventType ?? "", eventEpochId: proven?.eventEpochId ?? "",
+      reason, trigger, evidenceRef: trigger === "age" ? `intent:${candidate.intentKey}` : proven.evidenceRef,
+      // For a hole these proof bytes are the only evidence (no local bytes exist).
+      proof, proofSha256: proof ? sha256Hex(canonical(proof)) : "",
+      priorState: {kind: candidate.kind, intentKey: candidate.intentKey, lastErrorCode: candidate.lastErrorCode},
+      intentSha256: candidate.intent ? sha256Hex(canonical(candidate.intent)) : "",
+      quarantinedAt, ageSource, recordedAt: "", recordDigest: "",
+    });
+    appendRecord(journalPath(this.account.stateFile), record);
+    const previous = this.state.stuckEvents;
+    const stuck = previous ?? {count: 0, lastSeq: 0, counts: {}, recent: []};
+    this.state.stuckEvents = {
+      count: stuck.count + 1, lastSeq: seq, counts: {...stuck.counts, [trigger]: (stuck.counts?.[trigger] ?? 0) + 1},
+      recent: [...stuck.recent, {seq, eventId, reason, stuckAt: record.recordedAt}].slice(-STUCK_RECENT_LIMIT),
+    };
+    try {
+      await this.recordTerminalEvidence({id: eventId, seq}, "stuck", {reason});
+    } catch (error) {
+      if (previous === undefined) delete this.state.stuckEvents;
+      else this.state.stuckEvents = previous;
+      throw error;
+    }
+    this.logger?.warn?.(`Room ${this.state.roomId} events_stuck seq ${seq}: ${reason} (count ${this.state.stuckEvents.count}, last seq ${seq}); intent kept, nothing replayed`);
+    await this.ackEvent({id: eventId, seq});
+    return true;
   }
 
   // Contract P3-4: apply sealed audit records through the normal ack path,
@@ -3254,6 +3443,9 @@ export class OpenClawRoomRuntime {
           intent.deliveryState = quarantined ? "quarantined" : "delivery_pending";
           intent.status = intent.deliveryState;
           intent.lifecycleState = "not_started";
+          // Contract P2c-3h: the age clock of the stuck rule.
+          if (quarantined) intent.quarantinedAt = isoSeconds(Date.now());
+          else delete intent.quarantinedAt;
           intent.deliveryErrorCode = error instanceof RoomAPIError ? error.code : "";
           intent.deliveryError = String(error?.message ?? error).slice(0, 1000);
           await this.persistState();
@@ -3317,6 +3509,7 @@ export class OpenClawRoomRuntime {
         }
         delete intent.deliveryError;
         delete intent.deliveryErrorCode;
+        delete intent.quarantinedAt;
         if (intent.identity.sourceEventId && this.pendingEvent) {
           const source = this.pendingEvent;
           if (source.id !== intent.identity.sourceEventId) {
