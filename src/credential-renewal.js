@@ -113,9 +113,11 @@ export function validateRenewalJournal(journal, state) {
  * Every secret exists in durable private state before it is used on the wire.
  * Only a confirmed replacement may erase the recovery journal.
  */
-export async function renewCredential({state, stateFile, account, client, signal, logger, refusedByRoom = false}) {
+export async function renewCredential({state, stateFile, account, client, signal, logger, refusedByRoom = false, settlementOnly = false}) {
   const baseExpired = baseCredentialExpired(state, {refusedByRoom});
-  if (renewalBlocked(state, account, {baseExpired})) return false;
+  if (account?.enabled === false || state.enabled === false || state.revoked === true) return false;
+  const busy = settlementOnly || renewalBlocked(state, account, {baseExpired});
+  if (busy && !["requested", "prepared"].includes(state.credentialRotation?.phase)) return false;
   const persist = async (next) => {
     // Refuse a concurrent external writer instead of overwriting its cursors.
     if (!isDeepStrictEqual(await loadState(stateFile), state)) fail();
@@ -190,6 +192,17 @@ export async function renewCredential({state, stateFile, account, client, signal
       throw error;
     }
   };
+  if (busy) {
+    // An uncertain post blocks any credential exchange. Reading the exact
+    // request can still retire a dead journal and unblock that post's replay.
+    const answer = await beforeActivation(client.credentialRenewalRequest(base, journal.requestId, signal));
+    identity(answer, journal.expected);
+    if (answer.requestId !== journal.requestId || answer.baseCredentialGeneration !== journal.baseCredentialGeneration
+      || (journal.grantId && answer.grantId !== journal.grantId)) fail();
+    if (answer.state === "expired") await close("grant_expired");
+    if (answer.state === "rejected") await close("request_rejected");
+    return false;
+  }
   if (journal.phase === "requested") {
     if (!seq(journal.expected.deliveredSeq)) {
       // A legacy journal lacks a delivery snapshot. Discovery only shows the

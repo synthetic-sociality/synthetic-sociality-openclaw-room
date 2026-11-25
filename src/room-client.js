@@ -379,6 +379,12 @@ export class RoomClient {
     });
   }
 
+  credentialRenewalRequest(session, requestId, signal) {
+    return this.request(`/rooms/${encodeURIComponent(session.roomId)}/credential-renewal-requests/${encodeURIComponent(requestId)}`, {
+      background: true, credential: session.credential, signal,
+    });
+  }
+
   requestCredentialRenewal(session, request, signal) {
     return this.request(`/rooms/${encodeURIComponent(session.roomId)}/credential-renewal-requests`, {background: true, 
       method: "POST", body: request, credential: session.credential, signal, expected: [200, 201],

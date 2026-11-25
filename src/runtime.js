@@ -12,7 +12,7 @@ import {activateRoomChannel} from "./activation.js";
 import {ParticipationGate} from "./participation.js";
 import {abandonRevokedPendingWork, abandonableEntries, staleInertState} from "./readmission.js";
 import {ROOM_CONNECTOR_PROVENANCE} from "./release-provenance.js";
-import {RenewalClosed, renewCredential} from "./credential-renewal.js";
+import {baseCredentialExpired, RenewalClosed, renewalBlocked, renewCredential} from "./credential-renewal.js";
 import {speakerLabel, speakerName} from "./speaker.js";
 import {rememberSecrets} from "./secret-isolation.js";
 import {CONTROL_CAPABILITY, connectorControl, installationIdFor, roomStateDirectory, storedWorkInProgress, untilSignal} from "./connector-control.js";
@@ -1320,10 +1320,18 @@ export class OpenClawRoomRuntime {
       // Do not rotate while the channel owns a delivered model turn or while
       // durable outbound/lifecycle work needs its original credential.
       if (this.closed) return false;
-      if (this.grantWaiters.size) return false;
-      if (this.pendingEvent) {
-        if (!this.isQuarantinedEvent(this.pendingEvent)) return false;
-        this.pendingEvent = null;
+      const pending = this.pendingEvent && !this.isQuarantinedEvent(this.pendingEvent);
+      const settlementOnly = Boolean(this.grantWaiters.size || pending) || renewalBlocked(this.state, this.account, {
+        baseExpired: baseCredentialExpired(this.state, {refusedByRoom: this.credentialExpired}),
+      });
+      if (settlementOnly && !this.state.credentialRotation) return false;
+      if (this.pendingEvent && !this.grantWaiters.size && !pending) this.pendingEvent = null;
+      if (settlementOnly) {
+        const id = this.state.credentialRotation.requestId;
+        if (this.renewalProbeId === id && Date.now() - this.lastRenewalCheck < RENEWAL_INTENT_CHECK_MS) return false;
+        this.renewalProbeId = id;
+      } else {
+        this.renewalProbeId = null;
       }
       // Contract P17-3: no renewal starts under the control fence.
       if (connectorControl.fenced() && !this.state.credentialRotation) return false;
@@ -1335,7 +1343,7 @@ export class OpenClawRoomRuntime {
       try {
         const changed = await renewCredential({state: this.state, stateFile: this.account.stateFile,
           account: this.account, client: this.client, signal: renewalSignal, logger: this.logger,
-          refusedByRoom: this.credentialExpired});
+          refusedByRoom: this.credentialExpired, settlementOnly});
         this.lastRenewalError = null;
         if (changed) {
           this.client.credential = this.state.credential;

@@ -197,6 +197,9 @@ test("stale renewal settles despite a frozen post, then normal delivery recovers
     };
     assert.equal(await runtime.renewAccess(),false);
     assert.deepEqual((await loadState(stateFile)).credentialRotation,journal,"an active grant must not swap under a pending post");
+    await runtime.renewAccess();
+    assert.equal(reads,1,"a busy active journal only probes on the maintenance cadence");
+    runtime.lastRenewalCheck = 0;
     answer = terminalState;
     await runtime.renewAccess();
     const settled = await loadState(stateFile);
