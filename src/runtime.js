@@ -865,6 +865,7 @@ export class OpenClawRoomRuntime {
     this.bindingOperation = Promise.resolve();
     this.lastRenewalCheck = 0;
     this.lastRenewalWarningAt = 0;
+    this.lastRenewalError = null;
     // Claimed cycle attempts held alive while their model run is in flight.
     this.attemptLeases = new Map();
     this.parkedRetryDelay = 0;
@@ -931,8 +932,9 @@ export class OpenClawRoomRuntime {
       } catch (error) {
         this.failClosedOnRequestError(error);
         if (signal?.aborted || this.closed || !transientRoomFailure(error)) throw error;
-        if (step === 0) this.logger?.warn?.(`Room start failed${roomErrorDiagnostic(error)}; retrying inside the connector`);
-        this.reportStatus({connection: "reconnecting", errorCode: statusErrorCode(error)});
+        const renewalFailed = error === this.lastRenewalError;
+        if (step === 0 && !renewalFailed) this.logger?.warn?.(`Room start failed${roomErrorDiagnostic(error)}; retrying inside the connector`);
+        this.reportStatus({connection: "reconnecting", errorCode: renewalFailed ? "renewal_retry" : statusErrorCode(error)});
         await sleep(this.recoveryDelay(error), signal);
       }
     }
@@ -1334,6 +1336,7 @@ export class OpenClawRoomRuntime {
         const changed = await renewCredential({state: this.state, stateFile: this.account.stateFile,
           account: this.account, client: this.client, signal: renewalSignal, logger: this.logger,
           refusedByRoom: this.credentialExpired});
+        this.lastRenewalError = null;
         if (changed) {
           this.client.credential = this.state.credential;
           // Contract P2c-1: the renewed credential is scrubbed too.
@@ -1353,7 +1356,8 @@ export class OpenClawRoomRuntime {
         // Old servers may return 200 HTML for an unknown optional route.
         // Discovery alone must not terminate ordinary delivery. Once secrets
         // were journaled, however, no participation may race a partial swap.
-        const errorCode = error.code === "credential_revoked" ? "credential_revoked" : "renewal_retry";
+        this.lastRenewalError = error;
+        const errorCode = error?.code === "credential_revoked" ? "credential_revoked" : "renewal_retry";
         this.reportStatus({errorCode});
         if (Date.now() - this.lastRenewalWarningAt >= RENEWAL_INTENT_CHECK_MS) {
           this.lastRenewalWarningAt = Date.now();
@@ -1409,8 +1413,9 @@ export class OpenClawRoomRuntime {
           || (failed.contact && (this.client?.contactSucceeded?.(failed.contact) ?? 0) > failed.successes))) step = 0;
         const contact = typeof error?.roomContact === "string" ? error.roomContact : "";
         failed = {contact, successes: contact ? this.client?.contactSucceeded?.(contact) ?? 0 : 0, passes: this.scanPasses};
-        this.logger?.warn?.(`Room event processing interrupted${roomErrorDiagnostic(error)}${error instanceof InvalidEventPage ? " (invalid event page)" : ""}; resuming from the acknowledged position`);
-        this.reportStatus({connection: "reconnecting", errorCode: statusErrorCode(error)});
+        const renewalFailed = error === this.lastRenewalError;
+        if (!renewalFailed) this.logger?.warn?.(`Room event processing interrupted${roomErrorDiagnostic(error)}${error instanceof InvalidEventPage ? " (invalid event page)" : ""}; resuming from the acknowledged position`);
+        this.reportStatus({connection: "reconnecting", errorCode: renewalFailed ? "renewal_retry" : statusErrorCode(error)});
         this.pendingEvent = null;
         await sleep(recovering ? this.recoveryDelay(error) : this.retryDelay(step, error), signal);
         step += 1;
