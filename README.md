@@ -27,6 +27,19 @@ content. P9 separately hands verified photo bytes to the host; the connector
 never executes uploaded content. An exact artifact read also invokes the Room server's supported
 deterministic text backfill for older pending versions.
 
+Version 0.2.93 (contract paragraph P2c-3i, after P2c-3h; contract 0fa6c2fe;
+paired with Hermes 1.0.118): a Room acknowledgement ahead of the local cursor is
+adopted, not a reconnect loop. When the Room answers an acknowledgement with an
+acknowledgedSeq above the frontier the connector acknowledged (an earlier
+instance, a fence or a lost state write), ackEvent records every seq up to it
+without terminal evidence as ignored with reason room_ack_ahead (existing
+evidence stays unchanged; the adopted range keeps its evidence until the next
+frontier advance), moves the cursor, persists and logs one warn line; delivery
+continues from the next seq and a later equal answer logs nothing. A lower,
+missing or non-integer answer still throws. Trace: Berlin in Digital
+sovereignty, cursor 3220, evidence 3221 ignored, Room 3222. Shared cases
+ACK-AHEAD-01 to ACK-AHEAD-05 (test/parity-p2c3i-ack-ahead.test.mjs).
+
 Version 0.2.92 (contract paragraph P2c-3h, after P2c-3f; contract cf182f6b;
 paired with Hermes 1.0.117): a quarantined event never holds the acknowledgement
 frontier indefinitely. At the frontier, with no attempt in flight and no retry

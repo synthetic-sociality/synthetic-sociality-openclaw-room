@@ -1306,7 +1306,9 @@ test("legacy posted evidence without full receipt loads but cannot acknowledge",
 });
 
 test("acknowledgement requires an exact explicit server frontier", async () => {
-  for (const response of [{}, {acknowledgedSeq: 9}]) {
+  // A Room answer above the frontier is adopted since 0.2.93 (contract P2c-3i,
+  // test/parity-p2c3i-ack-ahead.test.mjs); a missing or lower one still throws.
+  for (const response of [{}, {acknowledgedSeq: 4}]) {
     const runtime = deliveryLifecycleRuntime();
     runtime.state.terminalEvidence = {
       "5": {status: "ignored", sourceEventId: "source-5", sourceSeq: 5, canonicalEventId: "", canonicalSeq: 0, canonicalTs: "", reason: "test"},

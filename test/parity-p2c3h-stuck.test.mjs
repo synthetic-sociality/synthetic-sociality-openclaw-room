@@ -187,7 +187,7 @@ test("P2c-3h conformance: shared case names, verified feature and the exact cont
   const contract = await readFile(new URL("../docs/delivery-lifecycle-contract-v1.md", import.meta.url), "utf8");
   // The block's exact bytes, markers included, directly after P2c-3f (P2c-3g
   // is reserved by the batch-acks lane), byte-identical to the Hermes contract.
-  assert.ok(contract.includes(`re-admission rules permit it.\n\n<<<P2c-3h\n${P2C3H}\nP2c-3h>>>\n\nP2c-4 Local status.`));
+  assert.ok(contract.includes(`re-admission rules permit it.\n\n<<<P2c-3h\n${P2C3H}\nP2c-3h>>>\n\n<<<P2c-3i\n`));
   assert.equal(createHash("sha256").update(contract).digest("hex"), conformance.contractSha256);
 });
 

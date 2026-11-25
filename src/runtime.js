@@ -2797,12 +2797,19 @@ export class OpenClawRoomRuntime {
     // retried on the schedule while the Room has not answered.
     const response = await this.retryContact("acknowledgement", () => this.client.acknowledge(this.state, frontier));
     const authoritative = response?.acknowledgedSeq;
-    if (!Number.isSafeInteger(authoritative) || authoritative !== frontier) {
+    // Contract P2c-3i: the Room already holds a higher acknowledgement
+    // (earlier instance, fence, lost state write); it is adopted as a fence.
+    const ahead = Number.isSafeInteger(authoritative) && authoritative > frontier;
+    if (!ahead && (!Number.isSafeInteger(authoritative) || authoritative !== frontier)) {
       throw new Error("Room acknowledgement exceeded the locally proven contiguous frontier");
     }
+    const previous = this.state.cursor;
+    if (ahead) this.adoptRoomAckAhead(frontier, authoritative);
     this.state.cursor = authoritative;
+    // The adopted range keeps its evidence until the next frontier advance.
+    const kept = ahead ? previous : authoritative;
     this.state.terminalEvidence = Object.fromEntries(
-      Object.entries(this.state.terminalEvidence ?? {}).filter(([seq]) => Number(seq) > authoritative),
+      Object.entries(this.state.terminalEvidence ?? {}).filter(([seq]) => Number(seq) > kept),
     );
     this.state.receiveLedger = Object.fromEntries(
       Object.entries(this.state.receiveLedger ?? {}).filter(([seq]) => Number(seq) > authoritative),
@@ -2812,6 +2819,29 @@ export class OpenClawRoomRuntime {
     if (pruned.length) this.logger?.info?.(`Room pruned ${pruned.length} terminal delivery intents`);
     await saveState(this.account.stateFile, this.state);
     if (this.pendingEvent && (this.pendingEvent.seq <= authoritative || this.pendingEvent.id === event.id)) this.pendingEvent = null;
+  }
+
+  // Contract P2c-3i: every seq up to the Room's acknowledgement without
+  // terminal evidence becomes "ignored" with reason room_ack_ahead; existing
+  // evidence is kept. One warn line per adoption.
+  adoptRoomAckAhead(frontier, authoritative) {
+    this.state.terminalEvidence ??= {};
+    for (let seq = this.state.cursor + 1; seq <= authoritative; seq += 1) {
+      const key = String(seq);
+      if (validTerminalEvidence(this.state.terminalEvidence[key]) && this.state.terminalEvidence[key].sourceSeq === seq) continue;
+      const known = this.state.receiveLedger?.[key]?.eventId
+        || (this.pendingEvent?.seq === seq ? this.pendingEvent.id : "");
+      this.state.terminalEvidence[key] = {
+        status: "ignored",
+        sourceEventId: String(known || `room_ack_ahead:${seq}`),
+        sourceSeq: seq,
+        canonicalEventId: "",
+        canonicalSeq: 0,
+        canonicalTs: "",
+        reason: "room_ack_ahead",
+      };
+    }
+    this.logger?.warn?.(`Room ${this.state.roomId} acknowledgement ahead of the local cursor adopted: frontier ${frontier}, Room ${authoritative}, seqs ${frontier + 1}-${authoritative} ignored with reason room_ack_ahead where no terminal evidence existed`);
   }
 
   // Contract P3-1: ledger entries for a page, persisted before processing.

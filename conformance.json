@@ -3,7 +3,7 @@
   "contract": "synthetic-sociality-room-delivery-lifecycle-v1",
   "contractDocument": "docs/delivery-lifecycle-contract-v1.md",
   "adapter": "synthetic-sociality-room",
-  "adapterVersion": "0.2.92",
+  "adapterVersion": "0.2.93",
   "platform": "OpenClaw",
   "roomProtocol": "external-agent-connector-v1",
   "verifiedFeatures": {
@@ -29,7 +29,8 @@
     "stoppedByRoomStatus": "0.2.88_p2c3d_credential_expired_or_revoked_reported_stopped_with_its_code_until_a_renewal_or_readmission_succeeds",
     "requestDiscipline": "0.2.90_p2c3f_event_grants_lease_bounded_2_4_8_10s_fallback_batch_state_and_rolling_preparing_debounce",
     "recoveryBudget": "0.2.89_p2c3e_six_registration_starts_per_60s_per_installation_backoff_kept_until_an_accepted_heartbeat_retry_after_honoured",
-    "stuckEvents": "0.2.92_p2c3h_quarantine_or_hole_at_frontier_stuck_on_room_proof_or_24h_quarantine_audited_terminal_evidence_one_terminal_set"
+    "stuckEvents": "0.2.92_p2c3h_quarantine_or_hole_at_frontier_stuck_on_room_proof_or_24h_quarantine_audited_terminal_evidence_one_terminal_set",
+    "ackAhead": "0.2.93_p2c3i_room_ack_ahead_of_frontier_adopted_as_fence_missing_evidence_ignored_room_ack_ahead_one_warning_persisted"
   },
   "fixtures": {
     "DLV1-01": "selection persistence failure prevents message submission",
@@ -1340,7 +1341,7 @@
     "L1": "94a5809aa1b1a9121404e15769e69487d5919efb641a8b0c358ba1793dc3842c",
     "P5": "4e7272530192d00478b842d4d1c8559530f39b76e0e0c026e738f740422e5a87",
     "P6": "3b79968d551d2613256a90c52c87ca6a18d93ff5337fc73f128b1654715d9e3a",
-    "P2c": "e3315762bfda42f3601d0b47deb1f78363a8d7377e7a6eff49d184851972f0a6",
+    "P2c": "0befba0977b5b3a9b636a00d79343b8409b57acc3489b32de6c9074f5bc8c3fa",
     "Appendix": "3184213bcf7df5a6c9d01602e1ff48d36584f447ad2a09bcf3307b2bf89d2315",
     "P7c": "4919916e3f97e48c9f1e39f6e990eeba4ea80ee11e40e894396664a8445441cc",
     "P7d": "a6f2bfb6f38ab2e01cb0879bc8d7f576cf83c87b31cbe14dbb7468237d9b3c44",
@@ -1729,10 +1730,22 @@
     "STK-11 reason_grammar",
     "STK-12 terminal_set_parity"
   ],
+  "parityP2c3iCases": [
+    "ACK-AHEAD-01 adopt",
+    "ACK-AHEAD-02 one_warning",
+    "ACK-AHEAD-03 behind_errors",
+    "ACK-AHEAD-04 non_int_errors",
+    "ACK-AHEAD-05 restart_keeps_cursor"
+  ],
   "stuckEventsRegression": {
     "adapterVersion": "0.2.92",
     "base": "9afd34c",
     "runner": "node --test test/parity-p2c3h-stuck.test.mjs"
   },
-  "contractSha256": "cf182f6b96bc922f70ca169024f6a62a392a2ed4e7f6a4ba3b6c89b87e2bc694"
+  "ackAheadRegression": {
+    "adapterVersion": "0.2.93",
+    "base": "6796bb7",
+    "runner": "node --test test/parity-p2c3i-ack-ahead.test.mjs"
+  },
+  "contractSha256": "0fa6c2fe86da3b925414862ba47edc4d151f5c9939bc248a94b91a66ce637c56"
 }
