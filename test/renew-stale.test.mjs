@@ -165,3 +165,63 @@ test("a lost confirm reply must never roll a swapped credential back to the base
   assert.equal(saved.credentialRotation.phase, "swapped");
   assert.equal(saved.renewalClosed, undefined);
 });
+
+test("stale renewal settles despite a frozen post, then normal delivery recovers its original receipt", async () => {
+  const sibling = await fixture("neighbour", "requested");
+  delete sibling.runtime.state.credentialRotation;
+  await saveState(sibling.stateFile, sibling.runtime.state);
+  const healthyBefore = await loadState(sibling.stateFile);
+  for (const [roomId, phase, terminalState] of [["Networks", "requested", "expired"], ["Kabeltracker", "prepared", "rejected"]]) {
+    const {runtime, stateFile, journal, expected, state} = await fixture(roomId, phase);
+    const event = {id:"old-source", seq:3224};
+    const key = "old-source:final";
+    const post = {observedSeq:3224, idempotencyKey:"old-message-key", logicalContributionId:"old-logical-id",
+      observedEpochId:"epoch-1", contributionType:"claim", body:"Frozen answer"};
+    const intent = {version:2, status:"delivery_pending", deliveryState:"delivery_pending", lifecycleState:"not_started",
+      identity:{roomId, body:post.body, replyToId:"", sourceEventId:event.id, sourceEpochId:"epoch-1",
+        coordinationMode:"open", nextRecipient:"", initialObservedSeq:3224, postObservedSeq:3224, postObservedEpochId:"epoch-1", initialEpochId:"epoch-1", cycle:null},
+      binding:{roomId, membershipId:state.membershipId, clientInstanceId:state.clientInstanceId},
+      messagePayloadDialect:"v2", messageIdempotencyKey:post.idempotencyKey, logicalContributionId:post.logicalContributionId, post};
+    runtime.state.deliveryIntents[key] = intent;
+    await saveState(stateFile, runtime.state);
+    runtime.state = await loadState(stateFile);
+    const before = structuredClone(runtime.state.deliveryIntents);
+    let answer = "issued", reads = 0;
+    runtime.client = {
+      credentialRenewalRequest: async (session, id) => {
+        reads++;
+        assert.equal(session.credential,journal.baseCredential);
+        assert.equal(id,journal.requestId);
+        return {...expected,requestId:id,grantId:journal.grantId,state:answer,baseCredentialGeneration:3};
+      },
+    };
+    assert.equal(await runtime.renewAccess(),false);
+    assert.deepEqual((await loadState(stateFile)).credentialRotation,journal,"an active grant must not swap under a pending post");
+    answer = terminalState;
+    await runtime.renewAccess();
+    const settled = await loadState(stateFile);
+    assert.equal(reads,2);
+    assert.equal(settled.credentialRotation,undefined);
+    assert.deepEqual(settled.deliveryIntents,before);
+    assert.equal(settled.membershipId,state.membershipId);
+    assert.equal(settled.credential,state.credential);
+    const resumed = new OpenClawRoomRuntime(runtime.account);
+    resumed.state = settled;
+    const existing = {id:"existing-post",seq:3225,ts:"2026-08-17T00:00:00Z"};
+    let requests = 0;
+    resumed.client = {
+      roomState: async () => ({headSeq:3225,activeEpoch:{id:"epoch-1"}}),
+      postMessage: async (_, payload) => {
+        requests++;
+        assert.deepEqual(payload,post);
+        return existing; // server returns the canonical receipt for this key
+      },
+    };
+    assert.equal(await resumed.recoverPendingDelivery(event),true);
+    assert.equal(requests,1);
+    assert.equal((await loadState(stateFile)).deliveryIntents[key].canonicalMessage.id,existing.id);
+    await resumed.recoverPendingDelivery(event);
+    assert.equal(requests,1,"a recorded receipt never re-posts");
+  }
+  assert.deepEqual(await loadState(sibling.stateFile),healthyBefore);
+});
